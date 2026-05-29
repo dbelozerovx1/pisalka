@@ -1,4 +1,12 @@
-use std::{pin::Pin, sync::Arc, time::Instant};
+use std::{
+    collections::VecDeque,
+    pin::Pin,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Instant,
+};
 
 use arrow_array::RecordBatch;
 use arrow_flight::{
@@ -17,6 +25,7 @@ use parquet::{
     file::properties::WriterProperties,
 };
 use serde::{Deserialize, Serialize};
+use tokio::task::JoinHandle;
 use tokio::{sync::mpsc, time::Instant as TokioInstant};
 use tonic::{Request, Response, Status, Streaming};
 use tracing::{error, info};
@@ -45,10 +54,12 @@ struct PutSummary {
     batches: usize,
     parts: usize,
     put_parallelism: usize,
-    arrow_memory_bytes: u64,
+    flight_stream_bytes: u64,
+    arrow_memory_bytes_estimate: u64,
     parquet_object_bytes: Option<u64>,
     manifest_key: Option<String>,
     manifest_object_bytes: Option<u64>,
+    target_file_size: Option<usize>,
     elapsed_ms: u128,
     compression: String,
     multipart_part_size: usize,
@@ -58,10 +69,14 @@ struct PutSummary {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct DatasetPart {
     key: String,
-    worker: usize,
+    #[serde(alias = "worker")]
+    part_index: usize,
     rows: usize,
     batches: usize,
-    arrow_memory_bytes: u64,
+    #[serde(default)]
+    flight_stream_bytes: u64,
+    #[serde(alias = "arrow_memory_bytes")]
+    arrow_memory_bytes_estimate: u64,
     parquet_object_bytes: u64,
 }
 
@@ -71,11 +86,27 @@ struct DatasetManifest {
     logical_key: String,
     ordered: bool,
     compression: String,
+    #[serde(default)]
+    target_file_size: Option<usize>,
     rows: usize,
     batches: usize,
-    arrow_memory_bytes: u64,
+    #[serde(default)]
+    flight_stream_bytes: u64,
+    #[serde(alias = "arrow_memory_bytes")]
+    arrow_memory_bytes_estimate: u64,
     parquet_object_bytes: u64,
     parts: Vec<DatasetPart>,
+}
+
+#[derive(Debug, Default, Deserialize, Serialize)]
+struct PutOptions {
+    target_file_size: Option<usize>,
+    input_file_bytes: Option<u64>,
+}
+
+struct PartBatch {
+    batch: RecordBatch,
+    flight_stream_bytes: u64,
 }
 
 impl S3FlightService {
@@ -97,11 +128,20 @@ impl S3FlightService {
             .ok_or_else(|| Status::invalid_argument("DoPut stream was empty"))?;
 
         let key = descriptor_to_object_key(first.flight_descriptor.as_ref());
+        let put_options = parse_put_options(&first.app_metadata)?;
         let path = path_from_key(&key);
+        let flight_stream_bytes = Arc::new(AtomicU64::new(0));
 
         let first_stream = stream::once(async move { Ok(first) });
-        let flight_stream =
-            first_stream.chain(incoming.map(|item| item.map_err(FlightError::from)));
+        let stream_bytes = flight_stream_bytes.clone();
+        let flight_stream = first_stream
+            .chain(incoming.map(|item| item.map_err(FlightError::from)))
+            .map(move |item| {
+                item.map(|data| {
+                    stream_bytes.fetch_add(flight_data_size(&data), Ordering::Relaxed);
+                    data
+                })
+            });
         let mut batches =
             arrow_flight::decode::FlightRecordBatchStream::new_from_flight_data(flight_stream);
 
@@ -112,14 +152,22 @@ impl S3FlightService {
             .ok_or_else(|| {
                 Status::invalid_argument("DoPut stream did not contain record batches")
             })?;
+        let first_batch_flight_bytes = flight_stream_bytes.load(Ordering::Relaxed);
 
-        if self.config.parquet.put_parallelism > 1 {
+        if let Some(target_file_size) = put_options.target_file_size {
             return self
-                .write_parallel_dataset(key, first_batch, &mut batches)
+                .write_sized_dataset(
+                    key,
+                    target_file_size,
+                    first_batch,
+                    first_batch_flight_bytes,
+                    &mut batches,
+                    &flight_stream_bytes,
+                )
                 .await;
         }
 
-        self.write_single_file(key, path, first_batch, &mut batches)
+        self.write_single_file(key, path, first_batch, &mut batches, &flight_stream_bytes)
             .await
     }
 
@@ -129,6 +177,7 @@ impl S3FlightService {
         path: Path,
         first_batch: RecordBatch,
         batches: &mut S,
+        flight_stream_bytes: &AtomicU64,
     ) -> Result<PutSummary, Status>
     where
         S: Stream<Item = Result<RecordBatch, FlightError>> + Unpin,
@@ -143,7 +192,7 @@ impl S3FlightService {
         let start = Instant::now();
         let mut batches_written = 0usize;
         let mut rows_written = 0usize;
-        let mut arrow_memory_bytes = 0u64;
+        let mut arrow_memory_bytes_estimate = 0u64;
 
         write_batch(
             &mut writer,
@@ -151,7 +200,7 @@ impl S3FlightService {
             &self.config.parquet,
             &mut batches_written,
             &mut rows_written,
-            &mut arrow_memory_bytes,
+            &mut arrow_memory_bytes_estimate,
         )
         .await?;
 
@@ -162,13 +211,14 @@ impl S3FlightService {
                 &self.config.parquet,
                 &mut batches_written,
                 &mut rows_written,
-                &mut arrow_memory_bytes,
+                &mut arrow_memory_bytes_estimate,
             )
             .await?;
         }
 
         writer.close().await.map_err(status_from_anyhow)?;
         let object_meta = self.store.head(&path).await.ok();
+        let flight_stream_bytes = flight_stream_bytes.load(Ordering::Relaxed);
         let summary = PutSummary {
             key,
             mode: "single".to_owned(),
@@ -176,10 +226,12 @@ impl S3FlightService {
             batches: batches_written,
             parts: 1,
             put_parallelism: 1,
-            arrow_memory_bytes,
+            flight_stream_bytes,
+            arrow_memory_bytes_estimate,
             parquet_object_bytes: object_meta.map(|meta| meta.size),
             manifest_key: None,
             manifest_object_bytes: None,
+            target_file_size: None,
             elapsed_ms: start.elapsed().as_millis(),
             compression: self.config.parquet.compression_name.clone(),
             multipart_part_size: self.config.parquet.multipart_part_size,
@@ -199,58 +251,91 @@ impl S3FlightService {
         Ok(summary)
     }
 
-    async fn write_parallel_dataset<S>(
+    async fn write_sized_dataset<S>(
         &self,
         key: String,
+        target_file_size: usize,
         first_batch: RecordBatch,
+        first_batch_flight_bytes: u64,
         batches: &mut S,
+        flight_stream_bytes: &AtomicU64,
     ) -> Result<PutSummary, Status>
     where
         S: Stream<Item = Result<RecordBatch, FlightError>> + Unpin,
     {
         let start = Instant::now();
-        let parallelism = self.config.parquet.put_parallelism;
-        let mut senders = Vec::with_capacity(parallelism);
-        let mut handles = Vec::with_capacity(parallelism);
+        let max_part_writers = self.config.parquet.put_parallelism.max(1);
+        let mut active_writers = VecDeque::new();
+        let mut parts = Vec::new();
+        let mut current_sender = None;
+        let mut current_part_flight_bytes = 0u64;
+        let mut next_part = 0usize;
+        let mut last_seen_flight_bytes = first_batch_flight_bytes;
 
-        for worker in 0..parallelism {
-            let (sender, receiver) = mpsc::channel(self.config.parquet.put_queue_depth);
-            let store = self.store.clone();
-            let tuning = self.config.parquet.clone();
-            let part_key = dataset_part_key(&key, worker);
-            let handle = tokio::spawn(async move {
-                write_dataset_part(store, tuning, part_key, worker, receiver).await
-            });
+        ensure_part_writer(
+            &mut current_sender,
+            &mut active_writers,
+            &mut parts,
+            max_part_writers,
+            self.store.clone(),
+            self.config.parquet.clone(),
+            &key,
+            &mut next_part,
+        )
+        .await?;
 
-            senders.push(sender);
-            handles.push(handle);
+        send_part_batch(
+            current_sender.as_ref(),
+            PartBatch {
+                batch: first_batch,
+                flight_stream_bytes: first_batch_flight_bytes,
+            },
+        )
+        .await?;
+        current_part_flight_bytes += first_batch_flight_bytes;
+
+        if current_part_flight_bytes >= target_file_size as u64 {
+            current_sender.take();
+            current_part_flight_bytes = 0;
         }
-
-        let mut next_worker = 0usize;
-        senders[next_worker]
-            .send(first_batch)
-            .await
-            .map_err(|_| Status::internal("parallel writer task stopped before first batch"))?;
-        next_worker = (next_worker + 1) % parallelism;
 
         while let Some(batch) = batches.try_next().await.map_err(status_from_flight_error)? {
-            senders[next_worker]
-                .send(batch)
-                .await
-                .map_err(|_| Status::internal("parallel writer task stopped during DoPut"))?;
-            next_worker = (next_worker + 1) % parallelism;
+            let seen = flight_stream_bytes.load(Ordering::Relaxed);
+            let batch_flight_bytes = seen.saturating_sub(last_seen_flight_bytes);
+            last_seen_flight_bytes = seen;
+
+            ensure_part_writer(
+                &mut current_sender,
+                &mut active_writers,
+                &mut parts,
+                max_part_writers,
+                self.store.clone(),
+                self.config.parquet.clone(),
+                &key,
+                &mut next_part,
+            )
+            .await?;
+
+            send_part_batch(
+                current_sender.as_ref(),
+                PartBatch {
+                    batch,
+                    flight_stream_bytes: batch_flight_bytes,
+                },
+            )
+            .await?;
+            current_part_flight_bytes += batch_flight_bytes;
+
+            if current_part_flight_bytes >= target_file_size as u64 {
+                current_sender.take();
+                current_part_flight_bytes = 0;
+            }
         }
 
-        drop(senders);
+        drop(current_sender);
 
-        let mut parts = Vec::with_capacity(parallelism);
-        for handle in handles {
-            match handle.await {
-                Ok(Ok(Some(part))) => parts.push(part),
-                Ok(Ok(None)) => {}
-                Ok(Err(error)) => return Err(Status::internal(error)),
-                Err(error) => return Err(Status::internal(error.to_string())),
-            }
+        while !active_writers.is_empty() {
+            collect_next_part(&mut active_writers, &mut parts).await?;
         }
 
         if parts.is_empty() {
@@ -259,20 +344,27 @@ impl S3FlightService {
             ));
         }
 
-        parts.sort_by_key(|part| part.worker);
+        parts.sort_by_key(|part| part.part_index);
         let rows_written = parts.iter().map(|part| part.rows).sum();
         let batches_written = parts.iter().map(|part| part.batches).sum();
-        let arrow_memory_bytes = parts.iter().map(|part| part.arrow_memory_bytes).sum();
+        let assigned_flight_stream_bytes = parts.iter().map(|part| part.flight_stream_bytes).sum();
+        let arrow_memory_bytes_estimate = parts
+            .iter()
+            .map(|part| part.arrow_memory_bytes_estimate)
+            .sum();
         let parquet_object_bytes = parts.iter().map(|part| part.parquet_object_bytes).sum();
+        let total_flight_stream_bytes = flight_stream_bytes.load(Ordering::Relaxed);
         let manifest_key = dataset_manifest_key(&key);
         let manifest = DatasetManifest {
             format: DATASET_MANIFEST_FORMAT.to_owned(),
             logical_key: key.clone(),
-            ordered: false,
+            ordered: true,
             compression: self.config.parquet.compression_name.clone(),
+            target_file_size: Some(target_file_size),
             rows: rows_written,
             batches: batches_written,
-            arrow_memory_bytes,
+            flight_stream_bytes: assigned_flight_stream_bytes,
+            arrow_memory_bytes_estimate,
             parquet_object_bytes,
             parts,
         };
@@ -289,15 +381,17 @@ impl S3FlightService {
 
         let summary = PutSummary {
             key,
-            mode: "parallel_dataset".to_owned(),
+            mode: "sized_dataset".to_owned(),
             rows: rows_written,
             batches: batches_written,
             parts: manifest.parts.len(),
-            put_parallelism: parallelism,
-            arrow_memory_bytes,
+            put_parallelism: max_part_writers,
+            flight_stream_bytes: total_flight_stream_bytes,
+            arrow_memory_bytes_estimate,
             parquet_object_bytes: Some(parquet_object_bytes),
             manifest_key: Some(manifest_key),
             manifest_object_bytes: manifest_meta.map(|meta| meta.size),
+            target_file_size: Some(target_file_size),
             elapsed_ms: start.elapsed().as_millis(),
             compression: self.config.parquet.compression_name.clone(),
             multipart_part_size: self.config.parquet.multipart_part_size,
@@ -310,9 +404,10 @@ impl S3FlightService {
             rows = summary.rows,
             batches = summary.batches,
             parts = summary.parts,
+            target_file_size = target_file_size,
             parquet_object_bytes = ?summary.parquet_object_bytes,
             elapsed_ms = summary.elapsed_ms,
-            "DoPut persisted parallel parquet dataset"
+            "DoPut persisted size-split parquet dataset"
         );
 
         Ok(summary)
@@ -546,9 +641,32 @@ fn dataset_manifest_key(key: &str) -> String {
     format!("{key}.manifest.json")
 }
 
-fn dataset_part_key(key: &str, worker: usize) -> String {
+fn parse_put_options(app_metadata: &Bytes) -> Result<PutOptions, Status> {
+    if app_metadata.is_empty() {
+        return Ok(PutOptions::default());
+    }
+
+    serde_json::from_slice(app_metadata).map_err(|err| {
+        Status::invalid_argument(format!("invalid DoPut app_metadata options: {err}"))
+    })
+}
+
+fn flight_data_size(data: &FlightData) -> u64 {
+    let descriptor_bytes = data
+        .flight_descriptor
+        .as_ref()
+        .map(|descriptor| {
+            descriptor.cmd.len() + descriptor.path.iter().map(|part| part.len()).sum::<usize>()
+        })
+        .unwrap_or_default();
+
+    (data.app_metadata.len() + data.data_body.len() + data.data_header.len() + descriptor_bytes)
+        as u64
+}
+
+fn dataset_part_key(key: &str, part_index: usize) -> String {
     let stem = key.strip_suffix(".parquet").unwrap_or(key);
-    format!("{stem}.parts/part-{worker:05}.parquet")
+    format!("{stem}.parts/part-{part_index:05}.parquet")
 }
 
 fn parquet_object_writer(
@@ -565,45 +683,48 @@ async fn write_dataset_part(
     store: Arc<dyn ObjectStore>,
     tuning: ParquetTuning,
     key: String,
-    worker: usize,
-    mut receiver: mpsc::Receiver<RecordBatch>,
+    part_index: usize,
+    mut receiver: mpsc::Receiver<PartBatch>,
 ) -> Result<Option<DatasetPart>, String> {
-    let Some(first_batch) = receiver.recv().await else {
+    let Some(first) = receiver.recv().await else {
         return Ok(None);
     };
 
     let path = path_from_key(&key);
     let props = writer_properties(&tuning);
     let object_writer = parquet_object_writer(store.clone(), path.clone(), &tuning);
-    let mut writer = AsyncArrowWriter::try_new(object_writer, first_batch.schema(), Some(props))
+    let mut writer = AsyncArrowWriter::try_new(object_writer, first.batch.schema(), Some(props))
         .map_err(|err| err.to_string())?;
 
     let mut batches_written = 0usize;
     let mut rows_written = 0usize;
-    let mut arrow_memory_bytes = 0u64;
+    let mut flight_stream_bytes = 0u64;
+    let mut arrow_memory_bytes_estimate = 0u64;
 
     write_batch(
         &mut writer,
-        &first_batch,
+        &first.batch,
         &tuning,
         &mut batches_written,
         &mut rows_written,
-        &mut arrow_memory_bytes,
+        &mut arrow_memory_bytes_estimate,
     )
     .await
     .map_err(|err| err.to_string())?;
+    flight_stream_bytes += first.flight_stream_bytes;
 
-    while let Some(batch) = receiver.recv().await {
+    while let Some(part_batch) = receiver.recv().await {
         write_batch(
             &mut writer,
-            &batch,
+            &part_batch.batch,
             &tuning,
             &mut batches_written,
             &mut rows_written,
-            &mut arrow_memory_bytes,
+            &mut arrow_memory_bytes_estimate,
         )
         .await
         .map_err(|err| err.to_string())?;
+        flight_stream_bytes += part_batch.flight_stream_bytes;
     }
 
     writer.close().await.map_err(|err| err.to_string())?;
@@ -611,12 +732,86 @@ async fn write_dataset_part(
 
     Ok(Some(DatasetPart {
         key,
-        worker,
+        part_index,
         rows: rows_written,
         batches: batches_written,
-        arrow_memory_bytes,
+        flight_stream_bytes,
+        arrow_memory_bytes_estimate,
         parquet_object_bytes: object_meta.size,
     }))
+}
+
+fn spawn_dataset_part_writer(
+    store: Arc<dyn ObjectStore>,
+    tuning: ParquetTuning,
+    key: &str,
+    part_index: usize,
+) -> (
+    mpsc::Sender<PartBatch>,
+    JoinHandle<Result<Option<DatasetPart>, String>>,
+) {
+    let (sender, receiver) = mpsc::channel(tuning.put_queue_depth);
+    let part_key = dataset_part_key(key, part_index);
+    let handle = tokio::spawn(async move {
+        write_dataset_part(store, tuning, part_key, part_index, receiver).await
+    });
+
+    (sender, handle)
+}
+
+async fn ensure_part_writer(
+    sender: &mut Option<mpsc::Sender<PartBatch>>,
+    active_writers: &mut VecDeque<JoinHandle<Result<Option<DatasetPart>, String>>>,
+    parts: &mut Vec<DatasetPart>,
+    max_part_writers: usize,
+    store: Arc<dyn ObjectStore>,
+    tuning: ParquetTuning,
+    key: &str,
+    next_part: &mut usize,
+) -> Result<(), Status> {
+    if sender.is_some() {
+        return Ok(());
+    }
+
+    while active_writers.len() >= max_part_writers {
+        collect_next_part(active_writers, parts).await?;
+    }
+
+    let (next_sender, handle) = spawn_dataset_part_writer(store, tuning, key, *next_part);
+    *next_part += 1;
+    active_writers.push_back(handle);
+    *sender = Some(next_sender);
+    Ok(())
+}
+
+async fn send_part_batch(
+    sender: Option<&mpsc::Sender<PartBatch>>,
+    part_batch: PartBatch,
+) -> Result<(), Status> {
+    let sender = sender.ok_or_else(|| Status::internal("dataset writer was not initialized"))?;
+    sender
+        .send(part_batch)
+        .await
+        .map_err(|_| Status::internal("dataset writer task stopped during DoPut"))
+}
+
+async fn collect_next_part(
+    active_writers: &mut VecDeque<JoinHandle<Result<Option<DatasetPart>, String>>>,
+    parts: &mut Vec<DatasetPart>,
+) -> Result<(), Status> {
+    let handle = active_writers
+        .pop_front()
+        .ok_or_else(|| Status::internal("no active dataset writer to collect"))?;
+
+    match handle.await {
+        Ok(Ok(Some(part))) => {
+            parts.push(part);
+            Ok(())
+        }
+        Ok(Ok(None)) => Ok(()),
+        Ok(Err(error)) => Err(Status::internal(error)),
+        Err(error) => Err(Status::internal(error.to_string())),
+    }
 }
 
 struct DatasetReadState {
@@ -696,7 +891,7 @@ async fn write_batch<W>(
     tuning: &ParquetTuning,
     batches_written: &mut usize,
     rows_written: &mut usize,
-    arrow_memory_bytes: &mut u64,
+    arrow_memory_bytes_estimate: &mut u64,
 ) -> Result<(), Status>
 where
     W: parquet::arrow::async_writer::AsyncFileWriter + Unpin + Send,
@@ -704,7 +899,7 @@ where
     writer.write(batch).await.map_err(status_from_anyhow)?;
     *batches_written += 1;
     *rows_written += batch.num_rows();
-    *arrow_memory_bytes += batch_memory_size(batch);
+    *arrow_memory_bytes_estimate += batch_memory_size(batch);
 
     if writer.in_progress_size() >= tuning.flush_threshold_bytes {
         writer.flush().await.map_err(status_from_anyhow)?;

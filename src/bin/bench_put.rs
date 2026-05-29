@@ -5,13 +5,15 @@ use arrow_flight::{
     FlightClient, FlightDescriptor, encode::FlightDataEncoderBuilder, error::FlightError,
 };
 use arrow_ipc::reader::StreamReader;
+use bytes::Bytes;
 use clap::Parser;
 use futures::{TryStreamExt, stream};
+use serde::Serialize;
 use tonic::transport::Channel;
 
 use arrow_flight_s3_mvp::{
     config::BenchConfig,
-    util::{pretty_bytes, throughput},
+    util::{parse_size, pretty_bytes, throughput},
 };
 
 #[derive(Debug, Parser)]
@@ -24,6 +26,19 @@ struct Args {
 
     #[arg(long, env = "FLIGHT_URI")]
     uri: Option<String>,
+
+    #[arg(
+        long = "file-size",
+        alias = "target-file-size",
+        env = "TARGET_FILE_SIZE"
+    )]
+    file_size: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct PutOptions {
+    target_file_size: Option<usize>,
+    input_file_bytes: u64,
 }
 
 #[tokio::main(flavor = "multi_thread")]
@@ -35,6 +50,12 @@ async fn main() -> Result<()> {
     let input_bytes = std::fs::metadata(&args.input)
         .with_context(|| format!("failed to stat {}", args.input.display()))?
         .len();
+    let target_file_size = args
+        .file_size
+        .as_deref()
+        .map(parse_size)
+        .transpose()
+        .context("failed to parse --file-size")?;
     let reader = StreamReader::try_new(
         File::open(&args.input)
             .with_context(|| format!("failed to open {}", args.input.display()))?,
@@ -42,10 +63,19 @@ async fn main() -> Result<()> {
     )?;
 
     let batch_stream = stream::iter(reader.map(|batch| batch.map_err(FlightError::from)));
-    let flight_stream = FlightDataEncoderBuilder::new()
+    let mut encoder = FlightDataEncoderBuilder::new()
         .with_flight_descriptor(Some(FlightDescriptor::new_path(vec![args.path.clone()])))
-        .with_max_flight_data_size(config.flight_data_chunk_size)
-        .build(batch_stream);
+        .with_max_flight_data_size(config.flight_data_chunk_size);
+
+    if target_file_size.is_some() {
+        let metadata = serde_json::to_vec(&PutOptions {
+            target_file_size,
+            input_file_bytes: input_bytes,
+        })?;
+        encoder = encoder.with_metadata(Bytes::from(metadata));
+    }
+
+    let flight_stream = encoder.build(batch_stream);
 
     let channel = Channel::from_shared(uri.clone())?.connect().await?;
     let mut client = FlightClient::new_from_inner(
@@ -67,6 +97,10 @@ async fn main() -> Result<()> {
     println!("input_bytes={input_bytes}");
     println!("input_size={}", pretty_bytes(input_bytes));
     println!("path={}", args.path);
+    if let Some(target_file_size) = target_file_size {
+        println!("target_file_size_bytes={target_file_size}");
+        println!("target_file_size={}", pretty_bytes(target_file_size as u64));
+    }
     println!("elapsed_ms={}", elapsed.as_millis());
     println!("throughput={}", throughput(input_bytes, elapsed));
     for result in put_results {

@@ -100,7 +100,7 @@ impl ParquetTuning {
             multipart_part_size: env_usize("S3_MULTIPART_PART_SIZE", 64 * 1024 * 1024)?
                 .max(5 * 1024 * 1024),
             multipart_max_concurrency: env_usize("S3_MULTIPART_MAX_CONCURRENCY", 16)?.max(1),
-            put_parallelism: env_usize("PUT_PARALLELISM", 1)?.max(1),
+            put_parallelism: env_usize("PUT_PARALLELISM", 4)?.max(1),
             put_queue_depth: env_usize("PUT_QUEUE_DEPTH", 2)?.max(1),
         })
     }

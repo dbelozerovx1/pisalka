@@ -1,7 +1,7 @@
 use std::time::Instant;
 
 use anyhow::Result;
-use arrow_flight::{FlightClient, Ticket};
+use arrow_flight::{FlightClient, FlightDescriptor, Ticket};
 use bytes::Bytes;
 use clap::Parser;
 use futures::TryStreamExt;
@@ -37,16 +37,24 @@ async fn main() -> Result<()> {
     let ticket = Ticket {
         ticket: Bytes::from(args.path.clone()),
     };
+    let info = client
+        .get_flight_info(FlightDescriptor::new_path(vec![args.path.clone()]))
+        .await
+        .ok();
+    let source_object_bytes = info
+        .as_ref()
+        .and_then(|info| (info.total_bytes > 0).then_some(info.total_bytes as u64));
+
     let started = Instant::now();
     let mut stream = client.do_get(ticket).await?;
 
     let mut rows = 0usize;
     let mut batches = 0usize;
-    let mut arrow_memory_bytes = 0u64;
+    let mut arrow_memory_bytes_estimate = 0u64;
     while let Some(batch) = stream.try_next().await? {
         rows += batch.num_rows();
         batches += 1;
-        arrow_memory_bytes += batch_memory_size(&batch);
+        arrow_memory_bytes_estimate += batch_memory_size(&batch);
     }
     let elapsed = started.elapsed();
 
@@ -54,10 +62,23 @@ async fn main() -> Result<()> {
     println!("path={}", args.path);
     println!("rows={rows}");
     println!("batches={batches}");
-    println!("arrow_memory_bytes={arrow_memory_bytes}");
-    println!("arrow_memory_size={}", pretty_bytes(arrow_memory_bytes));
+    if let Some(source_object_bytes) = source_object_bytes {
+        println!("source_object_bytes={source_object_bytes}");
+        println!("source_object_size={}", pretty_bytes(source_object_bytes));
+    }
+    println!("arrow_memory_bytes_estimate={arrow_memory_bytes_estimate}");
+    println!(
+        "arrow_memory_size_estimate={}",
+        pretty_bytes(arrow_memory_bytes_estimate)
+    );
     println!("elapsed_ms={}", elapsed.as_millis());
-    println!("throughput={}", throughput(arrow_memory_bytes, elapsed));
+    println!(
+        "throughput={}",
+        throughput(
+            source_object_bytes.unwrap_or(arrow_memory_bytes_estimate),
+            elapsed
+        )
+    );
 
     Ok(())
 }
