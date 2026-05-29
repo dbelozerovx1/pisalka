@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+cd "$(dirname "$0")/.."
+
+export RUST_LOG="${RUST_LOG:-info}"
+export FLIGHT_ADDR="${FLIGHT_ADDR:-0.0.0.0:50051}"
+export S3_ENDPOINT="${S3_ENDPOINT:-http://127.0.0.1:9000}"
+export S3_BUCKET="${S3_BUCKET:-arrow-flight}"
+export S3_REGION="${S3_REGION:-us-east-1}"
+export AWS_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID:-minioadmin}"
+export AWS_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY:-minioadmin}"
+export AWS_ALLOW_HTTP="${AWS_ALLOW_HTTP:-true}"
+export PARQUET_COMPRESSION="${PARQUET_COMPRESSION:-uncompressed}"
+export PARQUET_DICTIONARY="${PARQUET_DICTIONARY:-false}"
+export S3_MULTIPART_PART_SIZE="${S3_MULTIPART_PART_SIZE:-67108864}"
+export S3_MULTIPART_MAX_CONCURRENCY="${S3_MULTIPART_MAX_CONCURRENCY:-16}"
+export PUT_PARALLELISM="${PUT_PARALLELISM:-1}"
+export PUT_QUEUE_DEPTH="${PUT_QUEUE_DEPTH:-2}"
+export FLIGHT_MAX_MESSAGE_SIZE="${FLIGHT_MAX_MESSAGE_SIZE:-268435456}"
+export FLIGHT_DATA_CHUNK_SIZE="${FLIGHT_DATA_CHUNK_SIZE:-16777216}"
+
+cargo run --release --bin flight-server

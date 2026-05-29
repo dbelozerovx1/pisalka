@@ -1,0 +1,55 @@
+services:
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio-data:/data
+
+  minio-create-bucket:
+    image: minio/mc:latest
+    depends_on:
+      - minio
+    entrypoint: >
+      /bin/sh -c "
+      until /usr/bin/mc alias set local http://minio:9000 minioadmin minioadmin; do sleep 1; done;
+      /usr/bin/mc mb --ignore-existing local/arrow-flight;
+      /usr/bin/mc anonymous set none local/arrow-flight;
+      "
+
+  flight-server:
+    build:
+      context: .
+    depends_on:
+      minio-create-bucket:
+        condition: service_completed_successfully
+    environment:
+      RUST_LOG: info
+      FLIGHT_ADDR: 0.0.0.0:50051
+      S3_ENDPOINT: http://minio:9000
+      S3_BUCKET: arrow-flight
+      S3_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+      AWS_ALLOW_HTTP: "true"
+      PARQUET_COMPRESSION: "${PARQUET_COMPRESSION:-uncompressed}"
+      PARQUET_DICTIONARY: "${PARQUET_DICTIONARY:-false}"
+      PARQUET_MAX_ROW_GROUP_ROWS: "${PARQUET_MAX_ROW_GROUP_ROWS:-1048576}"
+      PARQUET_WRITE_BATCH_SIZE: "${PARQUET_WRITE_BATCH_SIZE:-65536}"
+      PARQUET_FLUSH_THRESHOLD_BYTES: "${PARQUET_FLUSH_THRESHOLD_BYTES:-268435456}"
+      S3_MULTIPART_PART_SIZE: "${S3_MULTIPART_PART_SIZE:-67108864}"
+      S3_MULTIPART_MAX_CONCURRENCY: "${S3_MULTIPART_MAX_CONCURRENCY:-16}"
+      PUT_PARALLELISM: "${PUT_PARALLELISM:-1}"
+      PUT_QUEUE_DEPTH: "${PUT_QUEUE_DEPTH:-2}"
+      FLIGHT_MAX_MESSAGE_SIZE: "${FLIGHT_MAX_MESSAGE_SIZE:-268435456}"
+      FLIGHT_DATA_CHUNK_SIZE: "${FLIGHT_DATA_CHUNK_SIZE:-16777216}"
+    ports:
+      - "50051:50051"
+
+volumes:
+  minio-data:

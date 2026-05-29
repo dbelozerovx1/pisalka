@@ -1,0 +1,7 @@
+/target/
+/data/*.arrow
+/data/*.ipc
+/data/*.parquet
+.env
+.DS_Store
+.idea/
