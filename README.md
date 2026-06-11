@@ -6,10 +6,10 @@ Rust Arrow Flight service focused on high-throughput `DoPut` into Parquet on S3-
 
 - `src/main.rs`: Flight server.
 - `src/flight_service.rs`: `DoPut` Arrow stream decode -> async Parquet writer -> S3, and `DoGet` Parquet -> Arrow Flight stream.
-- `src/bin/gen_arrow.rs`: local Arrow IPC stream generator for configurable test sizes.
-- `src/bin/bench_put.rs`: `DoPut` benchmark client.
-- `src/bin/bench_get.rs`: `DoGet` benchmark client.
-- `dev/`: one-command local scripts.
+- `benchmarks/tools/`: benchmark/data-generation Rust binaries.
+- `benchmarks/tools/common/`: benchmark-only profiling/output helpers.
+- `benchmarks/scripts/`: benchmark shell entrypoints.
+- `dev/`: local environment scripts and compatibility wrappers.
 
 ## Requirements
 
@@ -35,25 +35,49 @@ Or run only MinIO in Docker and the server as a local release binary:
 Generate test Arrow IPC data:
 
 ```bash
-./dev/generate_arrow.sh 1gb data/test-1gb.arrow
+./benchmarks/scripts/generate_arrow.sh 1gb data/test-1gb.arrow
 ```
 
 Benchmark write:
 
 ```bash
-./dev/bench_put.sh data/test-1gb.arrow bench/test-1gb.parquet
+./benchmarks/scripts/bench_put.sh data/test-1gb.arrow bench/test-1gb.parquet
 ```
 
 Benchmark write split into target-sized Parquet objects:
 
 ```bash
-PUT_PARALLELISM=4 ./dev/bench_put.sh data/test-1gb.arrow bench/test-1gb.parquet 256mb
+PUT_PARALLELISM=4 ./benchmarks/scripts/bench_put.sh data/test-1gb.arrow bench/test-1gb.parquet 256mb
+```
+
+Profiling is opt-in. A normal write benchmark prints only the core client-side result and the compact `put_result` summary. Add `--profile` with the Rust binary, pass `true` as the fourth script argument, or set `PUT_PROFILE=true` to request server-side `DoPut` profiling:
+
+```bash
+PUT_PROFILE=true ./benchmarks/scripts/bench_put.sh data/test-1gb.arrow bench/profiled.parquet 256mb
+cargo run --release --bin bench-put -- --input data/test-1gb.arrow --path bench/profiled.parquet --file-size 256mb --profile
+```
+
+When profiling is enabled, the benchmark also prints client Arrow IPC source-read timing and a server-side stage breakdown:
+
+- `client_source.ipc_read_ms`: client time spent reading/decompressing Arrow IPC source batches before Flight encoding.
+- `profile.receive_decode_ms`: server time waiting for and decoding Flight batches.
+- `profile.enqueue_wait_ms`: time blocked handing batches to writer tasks.
+- `profile.collect_writer_wait_ms`: time waiting for active part writers to finish when the parallelism limit is reached or at final drain.
+- `profile.writer_task_write_ms_sum` / `writer_task_write_ms_max`: total writer CPU/object-writer time across all part tasks, plus the slowest single writer.
+- `profile.writer_task_flush_ms_sum` and `writer_task_close_ms_sum`: Parquet flush/finalization and object upload close time.
+- `profile.manifest_put_ms`: manifest commit time for target-sized datasets.
+- `part_profiles`: per-output-file rows, batches, Parquet bytes, and writer timings.
+
+For very many output files, the client prints the first 16 part profiles by default. Override with:
+
+```bash
+PROFILE_PART_LIMIT=64 PUT_PROFILE=true ./benchmarks/scripts/bench_put.sh data/test-1gb.arrow bench/test-1gb.parquet 128mb
 ```
 
 Benchmark read:
 
 ```bash
-./dev/bench_get.sh bench/test-1gb.parquet
+./benchmarks/scripts/bench_get.sh bench/test-1gb.parquet
 ```
 
 Run a small end-to-end smoke:
@@ -65,7 +89,7 @@ Run a small end-to-end smoke:
 Run a write parallelism matrix against the Docker Compose server:
 
 ```bash
-./dev/bench_put_matrix.sh data/test-1gb.arrow 1gb matrix 256mb
+./benchmarks/scripts/bench_put_matrix.sh data/test-1gb.arrow 1gb matrix 256mb
 ```
 
 ## Performance Knobs
@@ -85,6 +109,7 @@ Useful environment variables:
 - `FLIGHT_DATA_CHUNK_SIZE=16777216`
 - `READ_BATCH_SIZE=65536`
 - `TARGET_FILE_SIZE=256mb` for client-side benchmark scripts
+- `PUT_PROFILE=true` to request optional benchmark/server profiling
 
 Defaults favor the fastest measured local write path: uncompressed Parquet, dictionary disabled, large Flight chunks, large gRPC message limits, 64 MiB S3 multipart uploads, and up to four active part writers when target-sized output is requested.
 

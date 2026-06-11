@@ -54,6 +54,9 @@ struct PutSummary {
     batches: usize,
     parts: usize,
     put_parallelism: usize,
+    client_input_file_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    flight_data_messages: Option<u64>,
     flight_stream_bytes: u64,
     arrow_memory_bytes_estimate: u64,
     parquet_object_bytes: Option<u64>,
@@ -64,6 +67,65 @@ struct PutSummary {
     compression: String,
     multipart_part_size: usize,
     multipart_max_concurrency: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    profile: Option<PutProfile>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    part_profiles: Option<Vec<PartProfileSummary>>,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+struct PutProfile {
+    total_server_ms: u128,
+    first_flight_data_message_ms: u128,
+    first_batch_receive_decode_ms: u128,
+    receive_decode_ms: u128,
+    enqueue_wait_ms: u128,
+    collect_writer_wait_ms: u128,
+    manifest_put_ms: u128,
+    manifest_head_ms: u128,
+    object_head_ms: u128,
+    writer_task_elapsed_ms_sum: u128,
+    writer_task_elapsed_ms_max: u128,
+    writer_task_idle_wait_ms_sum: u128,
+    writer_task_write_ms_sum: u128,
+    writer_task_write_ms_max: u128,
+    writer_task_flush_ms_sum: u128,
+    writer_task_close_ms_sum: u128,
+    writer_task_close_ms_max: u128,
+    writer_task_head_ms_sum: u128,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct PartProfile {
+    elapsed_ms: u128,
+    idle_wait_ms: u128,
+    write_ms: u128,
+    flush_ms: u128,
+    close_ms: u128,
+    head_ms: u128,
+}
+
+impl PartProfile {
+    fn is_empty(&self) -> bool {
+        self.elapsed_ms == 0
+            && self.idle_wait_ms == 0
+            && self.write_ms == 0
+            && self.flush_ms == 0
+            && self.close_ms == 0
+            && self.head_ms == 0
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct PartProfileSummary {
+    key: String,
+    part_index: usize,
+    rows: usize,
+    batches: usize,
+    flight_stream_bytes: u64,
+    arrow_memory_bytes_estimate: u64,
+    parquet_object_bytes: u64,
+    profile: PartProfile,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -78,6 +140,9 @@ struct DatasetPart {
     #[serde(alias = "arrow_memory_bytes")]
     arrow_memory_bytes_estimate: u64,
     parquet_object_bytes: u64,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "PartProfile::is_empty")]
+    profile: PartProfile,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -102,6 +167,8 @@ struct DatasetManifest {
 struct PutOptions {
     target_file_size: Option<usize>,
     input_file_bytes: Option<u64>,
+    #[serde(default)]
+    profile: bool,
 }
 
 struct PartBatch {
@@ -121,23 +188,34 @@ impl S3FlightService {
         &self,
         request: Request<Streaming<FlightData>>,
     ) -> Result<PutSummary, Status> {
+        let request_started = Instant::now();
         let mut incoming = request.into_inner();
+        let first_message_started = Some(Instant::now());
         let first = incoming
             .message()
             .await?
             .ok_or_else(|| Status::invalid_argument("DoPut stream was empty"))?;
+        let first_flight_data_message_ms = first_message_started
+            .map(|started| started.elapsed().as_millis())
+            .unwrap_or_default();
 
         let key = descriptor_to_object_key(first.flight_descriptor.as_ref());
         let put_options = parse_put_options(&first.app_metadata)?;
+        let profile_enabled = put_options.profile;
         let path = path_from_key(&key);
         let flight_stream_bytes = Arc::new(AtomicU64::new(0));
+        let flight_data_messages = Arc::new(AtomicU64::new(0));
 
         let first_stream = stream::once(async move { Ok(first) });
         let stream_bytes = flight_stream_bytes.clone();
+        let stream_messages = flight_data_messages.clone();
         let flight_stream = first_stream
             .chain(incoming.map(|item| item.map_err(FlightError::from)))
             .map(move |item| {
                 item.map(|data| {
+                    if profile_enabled {
+                        stream_messages.fetch_add(1, Ordering::Relaxed);
+                    }
                     stream_bytes.fetch_add(flight_data_size(&data), Ordering::Relaxed);
                     data
                 })
@@ -145,6 +223,7 @@ impl S3FlightService {
         let mut batches =
             arrow_flight::decode::FlightRecordBatchStream::new_from_flight_data(flight_stream);
 
+        let first_batch_started = profile_enabled.then(Instant::now);
         let first_batch = batches
             .try_next()
             .await
@@ -152,6 +231,10 @@ impl S3FlightService {
             .ok_or_else(|| {
                 Status::invalid_argument("DoPut stream did not contain record batches")
             })?;
+        let first_batch_receive_decode_ms = first_batch_started
+            .map(|started| started.elapsed().as_millis())
+            .unwrap_or_default();
+        let receive_decode_ms = first_batch_receive_decode_ms;
         let first_batch_flight_bytes = flight_stream_bytes.load(Ordering::Relaxed);
 
         if let Some(target_file_size) = put_options.target_file_size {
@@ -159,25 +242,52 @@ impl S3FlightService {
                 .write_sized_dataset(
                     key,
                     target_file_size,
+                    put_options.input_file_bytes,
                     first_batch,
                     first_batch_flight_bytes,
                     &mut batches,
                     &flight_stream_bytes,
+                    &flight_data_messages,
+                    request_started,
+                    first_flight_data_message_ms,
+                    first_batch_receive_decode_ms,
+                    receive_decode_ms,
+                    profile_enabled,
                 )
                 .await;
         }
 
-        self.write_single_file(key, path, first_batch, &mut batches, &flight_stream_bytes)
-            .await
+        self.write_single_file(
+            key,
+            path,
+            put_options.input_file_bytes,
+            first_batch,
+            &mut batches,
+            &flight_stream_bytes,
+            &flight_data_messages,
+            request_started,
+            first_flight_data_message_ms,
+            first_batch_receive_decode_ms,
+            receive_decode_ms,
+            profile_enabled,
+        )
+        .await
     }
 
     async fn write_single_file<S>(
         &self,
         key: String,
         path: Path,
+        client_input_file_bytes: Option<u64>,
         first_batch: RecordBatch,
         batches: &mut S,
         flight_stream_bytes: &AtomicU64,
+        flight_data_messages: &AtomicU64,
+        request_started: Instant,
+        first_flight_data_message_ms: u128,
+        first_batch_receive_decode_ms: u128,
+        mut receive_decode_ms: u128,
+        profile_enabled: bool,
     ) -> Result<PutSummary, Status>
     where
         S: Stream<Item = Result<RecordBatch, FlightError>> + Unpin,
@@ -189,7 +299,8 @@ impl S3FlightService {
             AsyncArrowWriter::try_new(object_writer, first_batch.schema(), Some(props))
                 .map_err(status_from_anyhow)?;
 
-        let start = Instant::now();
+        let writer_started = profile_enabled.then(Instant::now);
+        let mut writer_profile = PartProfile::default();
         let mut batches_written = 0usize;
         let mut rows_written = 0usize;
         let mut arrow_memory_bytes_estimate = 0u64;
@@ -201,10 +312,21 @@ impl S3FlightService {
             &mut batches_written,
             &mut rows_written,
             &mut arrow_memory_bytes_estimate,
+            &mut writer_profile,
+            profile_enabled,
         )
         .await?;
 
-        while let Some(batch) = batches.try_next().await.map_err(status_from_flight_error)? {
+        loop {
+            let receive_started = profile_enabled.then(Instant::now);
+            let next_batch = batches.try_next().await.map_err(status_from_flight_error)?;
+            if let Some(started) = receive_started {
+                receive_decode_ms += started.elapsed().as_millis();
+            }
+            let Some(batch) = next_batch else {
+                break;
+            };
+
             write_batch(
                 &mut writer,
                 &batch,
@@ -212,13 +334,54 @@ impl S3FlightService {
                 &mut batches_written,
                 &mut rows_written,
                 &mut arrow_memory_bytes_estimate,
+                &mut writer_profile,
+                profile_enabled,
             )
             .await?;
         }
 
+        let close_started = profile_enabled.then(Instant::now);
         writer.close().await.map_err(status_from_anyhow)?;
+        if let Some(started) = close_started {
+            writer_profile.close_ms += started.elapsed().as_millis();
+        }
+        let head_started = profile_enabled.then(Instant::now);
         let object_meta = self.store.head(&path).await.ok();
+        if let Some(started) = head_started {
+            writer_profile.head_ms += started.elapsed().as_millis();
+        }
+        if let Some(started) = writer_started {
+            writer_profile.elapsed_ms = started.elapsed().as_millis();
+        }
         let flight_stream_bytes = flight_stream_bytes.load(Ordering::Relaxed);
+        let flight_data_messages = flight_data_messages.load(Ordering::Relaxed);
+        let parquet_object_bytes = object_meta.as_ref().map(|meta| meta.size);
+        let elapsed_ms = request_started.elapsed().as_millis();
+        let profile = profile_enabled.then(|| {
+            profile_from_parts(
+                elapsed_ms,
+                first_flight_data_message_ms,
+                first_batch_receive_decode_ms,
+                receive_decode_ms,
+                0,
+                0,
+                0,
+                0,
+                std::slice::from_ref(&writer_profile),
+            )
+        });
+        let part_profiles = profile_enabled.then(|| {
+            vec![PartProfileSummary {
+                key: path.to_string(),
+                part_index: 0,
+                rows: rows_written,
+                batches: batches_written,
+                flight_stream_bytes,
+                arrow_memory_bytes_estimate,
+                parquet_object_bytes: parquet_object_bytes.unwrap_or_default(),
+                profile: writer_profile.clone(),
+            }]
+        });
         let summary = PutSummary {
             key,
             mode: "single".to_owned(),
@@ -226,16 +389,20 @@ impl S3FlightService {
             batches: batches_written,
             parts: 1,
             put_parallelism: 1,
+            client_input_file_bytes,
+            flight_data_messages: profile_enabled.then_some(flight_data_messages),
             flight_stream_bytes,
             arrow_memory_bytes_estimate,
-            parquet_object_bytes: object_meta.map(|meta| meta.size),
+            parquet_object_bytes,
             manifest_key: None,
             manifest_object_bytes: None,
             target_file_size: None,
-            elapsed_ms: start.elapsed().as_millis(),
+            elapsed_ms,
             compression: self.config.parquet.compression_name.clone(),
             multipart_part_size: self.config.parquet.multipart_part_size,
             multipart_max_concurrency: self.config.parquet.multipart_max_concurrency,
+            profile,
+            part_profiles,
         };
 
         info!(
@@ -245,6 +412,10 @@ impl S3FlightService {
             batches = summary.batches,
             parquet_object_bytes = ?summary.parquet_object_bytes,
             elapsed_ms = summary.elapsed_ms,
+            receive_decode_ms = ?summary.profile.as_ref().map(|profile| profile.receive_decode_ms),
+            writer_write_ms = ?summary.profile.as_ref().map(|profile| profile.writer_task_write_ms_sum),
+            writer_flush_ms = ?summary.profile.as_ref().map(|profile| profile.writer_task_flush_ms_sum),
+            writer_close_ms = ?summary.profile.as_ref().map(|profile| profile.writer_task_close_ms_sum),
             "DoPut persisted parquet object"
         );
 
@@ -255,15 +426,21 @@ impl S3FlightService {
         &self,
         key: String,
         target_file_size: usize,
+        client_input_file_bytes: Option<u64>,
         first_batch: RecordBatch,
         first_batch_flight_bytes: u64,
         batches: &mut S,
         flight_stream_bytes: &AtomicU64,
+        flight_data_messages: &AtomicU64,
+        request_started: Instant,
+        first_flight_data_message_ms: u128,
+        first_batch_receive_decode_ms: u128,
+        mut receive_decode_ms: u128,
+        profile_enabled: bool,
     ) -> Result<PutSummary, Status>
     where
         S: Stream<Item = Result<RecordBatch, FlightError>> + Unpin,
     {
-        let start = Instant::now();
         let max_part_writers = self.config.parquet.put_parallelism.max(1);
         let mut active_writers = VecDeque::new();
         let mut parts = Vec::new();
@@ -271,7 +448,10 @@ impl S3FlightService {
         let mut current_part_flight_bytes = 0u64;
         let mut next_part = 0usize;
         let mut last_seen_flight_bytes = first_batch_flight_bytes;
+        let mut enqueue_wait_ms = 0u128;
+        let mut collect_writer_wait_ms = 0u128;
 
+        let ensure_started = profile_enabled.then(Instant::now);
         ensure_part_writer(
             &mut current_sender,
             &mut active_writers,
@@ -281,9 +461,14 @@ impl S3FlightService {
             self.config.parquet.clone(),
             &key,
             &mut next_part,
+            profile_enabled,
         )
         .await?;
+        if let Some(started) = ensure_started {
+            collect_writer_wait_ms += started.elapsed().as_millis();
+        }
 
+        let enqueue_started = profile_enabled.then(Instant::now);
         send_part_batch(
             current_sender.as_ref(),
             PartBatch {
@@ -292,6 +477,9 @@ impl S3FlightService {
             },
         )
         .await?;
+        if let Some(started) = enqueue_started {
+            enqueue_wait_ms += started.elapsed().as_millis();
+        }
         current_part_flight_bytes += first_batch_flight_bytes;
 
         if current_part_flight_bytes >= target_file_size as u64 {
@@ -299,11 +487,21 @@ impl S3FlightService {
             current_part_flight_bytes = 0;
         }
 
-        while let Some(batch) = batches.try_next().await.map_err(status_from_flight_error)? {
+        loop {
+            let receive_started = profile_enabled.then(Instant::now);
+            let next_batch = batches.try_next().await.map_err(status_from_flight_error)?;
+            if let Some(started) = receive_started {
+                receive_decode_ms += started.elapsed().as_millis();
+            }
+            let Some(batch) = next_batch else {
+                break;
+            };
+
             let seen = flight_stream_bytes.load(Ordering::Relaxed);
             let batch_flight_bytes = seen.saturating_sub(last_seen_flight_bytes);
             last_seen_flight_bytes = seen;
 
+            let ensure_started = profile_enabled.then(Instant::now);
             ensure_part_writer(
                 &mut current_sender,
                 &mut active_writers,
@@ -313,9 +511,14 @@ impl S3FlightService {
                 self.config.parquet.clone(),
                 &key,
                 &mut next_part,
+                profile_enabled,
             )
             .await?;
+            if let Some(started) = ensure_started {
+                collect_writer_wait_ms += started.elapsed().as_millis();
+            }
 
+            let enqueue_started = profile_enabled.then(Instant::now);
             send_part_batch(
                 current_sender.as_ref(),
                 PartBatch {
@@ -324,6 +527,9 @@ impl S3FlightService {
                 },
             )
             .await?;
+            if let Some(started) = enqueue_started {
+                enqueue_wait_ms += started.elapsed().as_millis();
+            }
             current_part_flight_bytes += batch_flight_bytes;
 
             if current_part_flight_bytes >= target_file_size as u64 {
@@ -335,7 +541,11 @@ impl S3FlightService {
         drop(current_sender);
 
         while !active_writers.is_empty() {
+            let collect_started = profile_enabled.then(Instant::now);
             collect_next_part(&mut active_writers, &mut parts).await?;
+            if let Some(started) = collect_started {
+                collect_writer_wait_ms += started.elapsed().as_millis();
+            }
         }
 
         if parts.is_empty() {
@@ -354,7 +564,9 @@ impl S3FlightService {
             .sum();
         let parquet_object_bytes = parts.iter().map(|part| part.parquet_object_bytes).sum();
         let total_flight_stream_bytes = flight_stream_bytes.load(Ordering::Relaxed);
+        let flight_data_messages = flight_data_messages.load(Ordering::Relaxed);
         let manifest_key = dataset_manifest_key(&key);
+        let part_profiles = profile_enabled.then(|| part_profile_summaries(&parts));
         let manifest = DatasetManifest {
             format: DATASET_MANIFEST_FORMAT.to_owned(),
             logical_key: key.clone(),
@@ -373,11 +585,33 @@ impl S3FlightService {
             serde_json::to_vec(&manifest).map_err(|err| Status::internal(err.to_string()))?,
         );
         let manifest_path = Path::from(manifest_key.clone());
+        let manifest_put_started = profile_enabled.then(Instant::now);
         self.store
             .put(&manifest_path, manifest_payload.into())
             .await
             .map_err(status_from_anyhow)?;
+        let manifest_put_ms = manifest_put_started
+            .map(|started| started.elapsed().as_millis())
+            .unwrap_or_default();
+        let manifest_head_started = profile_enabled.then(Instant::now);
         let manifest_meta = self.store.head(&manifest_path).await.ok();
+        let manifest_head_ms = manifest_head_started
+            .map(|started| started.elapsed().as_millis())
+            .unwrap_or_default();
+        let elapsed_ms = request_started.elapsed().as_millis();
+        let profile = profile_enabled.then(|| {
+            profile_from_dataset_parts(
+                elapsed_ms,
+                first_flight_data_message_ms,
+                first_batch_receive_decode_ms,
+                receive_decode_ms,
+                enqueue_wait_ms,
+                collect_writer_wait_ms,
+                manifest_put_ms,
+                manifest_head_ms,
+                &manifest.parts,
+            )
+        });
 
         let summary = PutSummary {
             key,
@@ -386,16 +620,20 @@ impl S3FlightService {
             batches: batches_written,
             parts: manifest.parts.len(),
             put_parallelism: max_part_writers,
+            client_input_file_bytes,
+            flight_data_messages: profile_enabled.then_some(flight_data_messages),
             flight_stream_bytes: total_flight_stream_bytes,
             arrow_memory_bytes_estimate,
             parquet_object_bytes: Some(parquet_object_bytes),
             manifest_key: Some(manifest_key),
             manifest_object_bytes: manifest_meta.map(|meta| meta.size),
             target_file_size: Some(target_file_size),
-            elapsed_ms: start.elapsed().as_millis(),
+            elapsed_ms,
             compression: self.config.parquet.compression_name.clone(),
             multipart_part_size: self.config.parquet.multipart_part_size,
             multipart_max_concurrency: self.config.parquet.multipart_max_concurrency,
+            profile,
+            part_profiles,
         };
 
         info!(
@@ -407,6 +645,13 @@ impl S3FlightService {
             target_file_size = target_file_size,
             parquet_object_bytes = ?summary.parquet_object_bytes,
             elapsed_ms = summary.elapsed_ms,
+            receive_decode_ms = ?summary.profile.as_ref().map(|profile| profile.receive_decode_ms),
+            enqueue_wait_ms = ?summary.profile.as_ref().map(|profile| profile.enqueue_wait_ms),
+            collect_writer_wait_ms = ?summary.profile.as_ref().map(|profile| profile.collect_writer_wait_ms),
+            writer_write_ms_sum = ?summary.profile.as_ref().map(|profile| profile.writer_task_write_ms_sum),
+            writer_write_ms_max = ?summary.profile.as_ref().map(|profile| profile.writer_task_write_ms_max),
+            writer_close_ms_max = ?summary.profile.as_ref().map(|profile| profile.writer_task_close_ms_max),
+            manifest_put_ms = ?summary.profile.as_ref().map(|profile| profile.manifest_put_ms),
             "DoPut persisted size-split parquet dataset"
         );
 
@@ -669,6 +914,95 @@ fn dataset_part_key(key: &str, part_index: usize) -> String {
     format!("{stem}.parts/part-{part_index:05}.parquet")
 }
 
+fn part_profile_summaries(parts: &[DatasetPart]) -> Vec<PartProfileSummary> {
+    parts
+        .iter()
+        .map(|part| PartProfileSummary {
+            key: part.key.clone(),
+            part_index: part.part_index,
+            rows: part.rows,
+            batches: part.batches,
+            flight_stream_bytes: part.flight_stream_bytes,
+            arrow_memory_bytes_estimate: part.arrow_memory_bytes_estimate,
+            parquet_object_bytes: part.parquet_object_bytes,
+            profile: part.profile.clone(),
+        })
+        .collect()
+}
+
+fn profile_from_dataset_parts(
+    total_server_ms: u128,
+    first_flight_data_message_ms: u128,
+    first_batch_receive_decode_ms: u128,
+    receive_decode_ms: u128,
+    enqueue_wait_ms: u128,
+    collect_writer_wait_ms: u128,
+    manifest_put_ms: u128,
+    manifest_head_ms: u128,
+    parts: &[DatasetPart],
+) -> PutProfile {
+    let profiles = parts
+        .iter()
+        .map(|part| part.profile.clone())
+        .collect::<Vec<_>>();
+    profile_from_parts(
+        total_server_ms,
+        first_flight_data_message_ms,
+        first_batch_receive_decode_ms,
+        receive_decode_ms,
+        enqueue_wait_ms,
+        collect_writer_wait_ms,
+        manifest_put_ms,
+        manifest_head_ms,
+        &profiles,
+    )
+}
+
+fn profile_from_parts(
+    total_server_ms: u128,
+    first_flight_data_message_ms: u128,
+    first_batch_receive_decode_ms: u128,
+    receive_decode_ms: u128,
+    enqueue_wait_ms: u128,
+    collect_writer_wait_ms: u128,
+    manifest_put_ms: u128,
+    manifest_head_ms: u128,
+    parts: &[PartProfile],
+) -> PutProfile {
+    PutProfile {
+        total_server_ms,
+        first_flight_data_message_ms,
+        first_batch_receive_decode_ms,
+        receive_decode_ms,
+        enqueue_wait_ms,
+        collect_writer_wait_ms,
+        manifest_put_ms,
+        manifest_head_ms,
+        object_head_ms: parts.iter().map(|part| part.head_ms).sum(),
+        writer_task_elapsed_ms_sum: parts.iter().map(|part| part.elapsed_ms).sum(),
+        writer_task_elapsed_ms_max: parts
+            .iter()
+            .map(|part| part.elapsed_ms)
+            .max()
+            .unwrap_or_default(),
+        writer_task_idle_wait_ms_sum: parts.iter().map(|part| part.idle_wait_ms).sum(),
+        writer_task_write_ms_sum: parts.iter().map(|part| part.write_ms).sum(),
+        writer_task_write_ms_max: parts
+            .iter()
+            .map(|part| part.write_ms)
+            .max()
+            .unwrap_or_default(),
+        writer_task_flush_ms_sum: parts.iter().map(|part| part.flush_ms).sum(),
+        writer_task_close_ms_sum: parts.iter().map(|part| part.close_ms).sum(),
+        writer_task_close_ms_max: parts
+            .iter()
+            .map(|part| part.close_ms)
+            .max()
+            .unwrap_or_default(),
+        writer_task_head_ms_sum: parts.iter().map(|part| part.head_ms).sum(),
+    }
+}
+
 fn parquet_object_writer(
     store: Arc<dyn ObjectStore>,
     path: Path,
@@ -685,10 +1019,17 @@ async fn write_dataset_part(
     key: String,
     part_index: usize,
     mut receiver: mpsc::Receiver<PartBatch>,
+    profile_enabled: bool,
 ) -> Result<Option<DatasetPart>, String> {
+    let started = profile_enabled.then(Instant::now);
+    let mut profile = PartProfile::default();
+    let wait_started = profile_enabled.then(Instant::now);
     let Some(first) = receiver.recv().await else {
         return Ok(None);
     };
+    if let Some(started) = wait_started {
+        profile.idle_wait_ms += started.elapsed().as_millis();
+    }
 
     let path = path_from_key(&key);
     let props = writer_properties(&tuning);
@@ -708,12 +1049,25 @@ async fn write_dataset_part(
         &mut batches_written,
         &mut rows_written,
         &mut arrow_memory_bytes_estimate,
+        &mut profile,
+        profile_enabled,
     )
     .await
     .map_err(|err| err.to_string())?;
     flight_stream_bytes += first.flight_stream_bytes;
 
-    while let Some(part_batch) = receiver.recv().await {
+    loop {
+        let wait_started = profile_enabled.then(Instant::now);
+        let Some(part_batch) = receiver.recv().await else {
+            if let Some(started) = wait_started {
+                profile.idle_wait_ms += started.elapsed().as_millis();
+            }
+            break;
+        };
+        if let Some(started) = wait_started {
+            profile.idle_wait_ms += started.elapsed().as_millis();
+        }
+
         write_batch(
             &mut writer,
             &part_batch.batch,
@@ -721,14 +1075,27 @@ async fn write_dataset_part(
             &mut batches_written,
             &mut rows_written,
             &mut arrow_memory_bytes_estimate,
+            &mut profile,
+            profile_enabled,
         )
         .await
         .map_err(|err| err.to_string())?;
         flight_stream_bytes += part_batch.flight_stream_bytes;
     }
 
+    let close_started = profile_enabled.then(Instant::now);
     writer.close().await.map_err(|err| err.to_string())?;
+    if let Some(started) = close_started {
+        profile.close_ms += started.elapsed().as_millis();
+    }
+    let head_started = profile_enabled.then(Instant::now);
     let object_meta = store.head(&path).await.map_err(|err| err.to_string())?;
+    if let Some(started) = head_started {
+        profile.head_ms += started.elapsed().as_millis();
+    }
+    if let Some(started) = started {
+        profile.elapsed_ms = started.elapsed().as_millis();
+    }
 
     Ok(Some(DatasetPart {
         key,
@@ -738,6 +1105,7 @@ async fn write_dataset_part(
         flight_stream_bytes,
         arrow_memory_bytes_estimate,
         parquet_object_bytes: object_meta.size,
+        profile,
     }))
 }
 
@@ -746,6 +1114,7 @@ fn spawn_dataset_part_writer(
     tuning: ParquetTuning,
     key: &str,
     part_index: usize,
+    profile_enabled: bool,
 ) -> (
     mpsc::Sender<PartBatch>,
     JoinHandle<Result<Option<DatasetPart>, String>>,
@@ -753,7 +1122,15 @@ fn spawn_dataset_part_writer(
     let (sender, receiver) = mpsc::channel(tuning.put_queue_depth);
     let part_key = dataset_part_key(key, part_index);
     let handle = tokio::spawn(async move {
-        write_dataset_part(store, tuning, part_key, part_index, receiver).await
+        write_dataset_part(
+            store,
+            tuning,
+            part_key,
+            part_index,
+            receiver,
+            profile_enabled,
+        )
+        .await
     });
 
     (sender, handle)
@@ -768,6 +1145,7 @@ async fn ensure_part_writer(
     tuning: ParquetTuning,
     key: &str,
     next_part: &mut usize,
+    profile_enabled: bool,
 ) -> Result<(), Status> {
     if sender.is_some() {
         return Ok(());
@@ -777,7 +1155,8 @@ async fn ensure_part_writer(
         collect_next_part(active_writers, parts).await?;
     }
 
-    let (next_sender, handle) = spawn_dataset_part_writer(store, tuning, key, *next_part);
+    let (next_sender, handle) =
+        spawn_dataset_part_writer(store, tuning, key, *next_part, profile_enabled);
     *next_part += 1;
     active_writers.push_back(handle);
     *sender = Some(next_sender);
@@ -892,17 +1271,27 @@ async fn write_batch<W>(
     batches_written: &mut usize,
     rows_written: &mut usize,
     arrow_memory_bytes_estimate: &mut u64,
+    profile: &mut PartProfile,
+    profile_enabled: bool,
 ) -> Result<(), Status>
 where
     W: parquet::arrow::async_writer::AsyncFileWriter + Unpin + Send,
 {
+    let write_started = profile_enabled.then(Instant::now);
     writer.write(batch).await.map_err(status_from_anyhow)?;
+    if let Some(started) = write_started {
+        profile.write_ms += started.elapsed().as_millis();
+    }
     *batches_written += 1;
     *rows_written += batch.num_rows();
     *arrow_memory_bytes_estimate += batch_memory_size(batch);
 
     if writer.in_progress_size() >= tuning.flush_threshold_bytes {
+        let flush_started = profile_enabled.then(Instant::now);
         writer.flush().await.map_err(status_from_anyhow)?;
+        if let Some(started) = flush_started {
+            profile.flush_ms += started.elapsed().as_millis();
+        }
     }
 
     Ok(())

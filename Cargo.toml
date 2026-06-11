@@ -10,15 +10,15 @@ path = "src/main.rs"
 
 [[bin]]
 name = "gen-arrow"
-path = "src/bin/gen_arrow.rs"
+path = "benchmarks/tools/gen_arrow.rs"
 
 [[bin]]
 name = "bench-put"
-path = "src/bin/bench_put.rs"
+path = "benchmarks/tools/bench_put.rs"
 
 [[bin]]
 name = "bench-get"
-path = "src/bin/bench_get.rs"
+path = "benchmarks/tools/bench_get.rs"
 
 [dependencies]
 anyhow = "1"
