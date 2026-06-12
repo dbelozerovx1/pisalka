@@ -32,7 +32,7 @@ use tracing::{error, info};
 
 use crate::{
     config::{AppConfig, ParquetTuning},
-    util::{batch_memory_size, descriptor_to_object_key, normalize_object_key, path_from_key},
+    util::{descriptor_to_object_key, normalize_object_key, path_from_key},
 };
 
 type ResponseStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send + 'static>>;
@@ -58,7 +58,6 @@ struct PutSummary {
     #[serde(skip_serializing_if = "Option::is_none")]
     flight_data_messages: Option<u64>,
     flight_stream_bytes: u64,
-    arrow_memory_bytes_estimate: u64,
     parquet_object_bytes: Option<u64>,
     manifest_key: Option<String>,
     manifest_object_bytes: Option<u64>,
@@ -123,7 +122,6 @@ struct PartProfileSummary {
     rows: usize,
     batches: usize,
     flight_stream_bytes: u64,
-    arrow_memory_bytes_estimate: u64,
     parquet_object_bytes: u64,
     profile: PartProfile,
 }
@@ -137,8 +135,6 @@ struct DatasetPart {
     batches: usize,
     #[serde(default)]
     flight_stream_bytes: u64,
-    #[serde(alias = "arrow_memory_bytes")]
-    arrow_memory_bytes_estimate: u64,
     parquet_object_bytes: u64,
     #[serde(default)]
     #[serde(skip_serializing_if = "PartProfile::is_empty")]
@@ -157,8 +153,6 @@ struct DatasetManifest {
     batches: usize,
     #[serde(default)]
     flight_stream_bytes: u64,
-    #[serde(alias = "arrow_memory_bytes")]
-    arrow_memory_bytes_estimate: u64,
     parquet_object_bytes: u64,
     parts: Vec<DatasetPart>,
 }
@@ -303,7 +297,6 @@ impl S3FlightService {
         let mut writer_profile = PartProfile::default();
         let mut batches_written = 0usize;
         let mut rows_written = 0usize;
-        let mut arrow_memory_bytes_estimate = 0u64;
 
         write_batch(
             &mut writer,
@@ -311,7 +304,6 @@ impl S3FlightService {
             &self.config.parquet,
             &mut batches_written,
             &mut rows_written,
-            &mut arrow_memory_bytes_estimate,
             &mut writer_profile,
             profile_enabled,
         )
@@ -333,7 +325,6 @@ impl S3FlightService {
                 &self.config.parquet,
                 &mut batches_written,
                 &mut rows_written,
-                &mut arrow_memory_bytes_estimate,
                 &mut writer_profile,
                 profile_enabled,
             )
@@ -377,7 +368,6 @@ impl S3FlightService {
                 rows: rows_written,
                 batches: batches_written,
                 flight_stream_bytes,
-                arrow_memory_bytes_estimate,
                 parquet_object_bytes: parquet_object_bytes.unwrap_or_default(),
                 profile: writer_profile.clone(),
             }]
@@ -392,7 +382,6 @@ impl S3FlightService {
             client_input_file_bytes,
             flight_data_messages: profile_enabled.then_some(flight_data_messages),
             flight_stream_bytes,
-            arrow_memory_bytes_estimate,
             parquet_object_bytes,
             manifest_key: None,
             manifest_object_bytes: None,
@@ -558,10 +547,6 @@ impl S3FlightService {
         let rows_written = parts.iter().map(|part| part.rows).sum();
         let batches_written = parts.iter().map(|part| part.batches).sum();
         let assigned_flight_stream_bytes = parts.iter().map(|part| part.flight_stream_bytes).sum();
-        let arrow_memory_bytes_estimate = parts
-            .iter()
-            .map(|part| part.arrow_memory_bytes_estimate)
-            .sum();
         let parquet_object_bytes = parts.iter().map(|part| part.parquet_object_bytes).sum();
         let total_flight_stream_bytes = flight_stream_bytes.load(Ordering::Relaxed);
         let flight_data_messages = flight_data_messages.load(Ordering::Relaxed);
@@ -576,7 +561,6 @@ impl S3FlightService {
             rows: rows_written,
             batches: batches_written,
             flight_stream_bytes: assigned_flight_stream_bytes,
-            arrow_memory_bytes_estimate,
             parquet_object_bytes,
             parts,
         };
@@ -623,7 +607,6 @@ impl S3FlightService {
             client_input_file_bytes,
             flight_data_messages: profile_enabled.then_some(flight_data_messages),
             flight_stream_bytes: total_flight_stream_bytes,
-            arrow_memory_bytes_estimate,
             parquet_object_bytes: Some(parquet_object_bytes),
             manifest_key: Some(manifest_key),
             manifest_object_bytes: manifest_meta.map(|meta| meta.size),
@@ -923,7 +906,6 @@ fn part_profile_summaries(parts: &[DatasetPart]) -> Vec<PartProfileSummary> {
             rows: part.rows,
             batches: part.batches,
             flight_stream_bytes: part.flight_stream_bytes,
-            arrow_memory_bytes_estimate: part.arrow_memory_bytes_estimate,
             parquet_object_bytes: part.parquet_object_bytes,
             profile: part.profile.clone(),
         })
@@ -1040,7 +1022,6 @@ async fn write_dataset_part(
     let mut batches_written = 0usize;
     let mut rows_written = 0usize;
     let mut flight_stream_bytes = 0u64;
-    let mut arrow_memory_bytes_estimate = 0u64;
 
     write_batch(
         &mut writer,
@@ -1048,7 +1029,6 @@ async fn write_dataset_part(
         &tuning,
         &mut batches_written,
         &mut rows_written,
-        &mut arrow_memory_bytes_estimate,
         &mut profile,
         profile_enabled,
     )
@@ -1074,7 +1054,6 @@ async fn write_dataset_part(
             &tuning,
             &mut batches_written,
             &mut rows_written,
-            &mut arrow_memory_bytes_estimate,
             &mut profile,
             profile_enabled,
         )
@@ -1103,7 +1082,6 @@ async fn write_dataset_part(
         rows: rows_written,
         batches: batches_written,
         flight_stream_bytes,
-        arrow_memory_bytes_estimate,
         parquet_object_bytes: object_meta.size,
         profile,
     }))
@@ -1266,11 +1244,10 @@ fn writer_properties(tuning: &ParquetTuning) -> WriterProperties {
 
 async fn write_batch<W>(
     writer: &mut AsyncArrowWriter<W>,
-    batch: &arrow_array::RecordBatch,
+    batch: &RecordBatch,
     tuning: &ParquetTuning,
     batches_written: &mut usize,
     rows_written: &mut usize,
-    arrow_memory_bytes_estimate: &mut u64,
     profile: &mut PartProfile,
     profile_enabled: bool,
 ) -> Result<(), Status>
@@ -1284,7 +1261,6 @@ where
     }
     *batches_written += 1;
     *rows_written += batch.num_rows();
-    *arrow_memory_bytes_estimate += batch_memory_size(batch);
 
     if writer.in_progress_size() >= tuning.flush_threshold_bytes {
         let flush_started = profile_enabled.then(Instant::now);
