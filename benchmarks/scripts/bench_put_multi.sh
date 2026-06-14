@@ -4,18 +4,25 @@ set -euo pipefail
 cd "$(dirname "$0")/../.."
 
 input="${1:-data/test-3gb.arrow}"
-key="${2:-bench/test.parquet}"
-file_size="${3:-${TARGET_FILE_SIZE:-512mb}}"
-profile="${4:-${PUT_PROFILE:-false}}"
+streams="${2:-${PUT_STREAMS:-4}}"
+staging_prefix="${3:-${PUT_STAGING_PREFIX:-}}"
+file_size="${4:-${TARGET_FILE_SIZE:-256mb}}"
+profile="${5:-${PUT_PROFILE:-false}}"
 
 export FLIGHT_URI="${FLIGHT_URI:-http://127.0.0.1:50051}"
 export FLIGHT_MAX_MESSAGE_SIZE="${FLIGHT_MAX_MESSAGE_SIZE:-268435456}"
 export FLIGHT_DATA_CHUNK_SIZE="${FLIGHT_DATA_CHUNK_SIZE:-16777216}"
+export PUT_PARALLELISM=4
+export PARQUET_COMPRESSION=snappy
 
 args=(
   --input "$input"
-  --path "$key"
+  --streams "$streams"
 )
+
+if [[ -n "$staging_prefix" ]]; then
+  args+=(--staging-prefix "$staging_prefix")
+fi
 
 if [[ -n "$file_size" ]]; then
   args+=(--file-size "$file_size")
@@ -28,4 +35,4 @@ case "$profile_lc" in
     ;;
 esac
 
-cargo run --release --bin bench-put -- "${args[@]}"
+cargo run --release --bin bench-put-multi -- "${args[@]}"

@@ -1,11 +1,11 @@
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     pin::Pin,
     sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+        atomic::{AtomicU64, AtomicUsize, Ordering},
     },
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use arrow_array::RecordBatch;
@@ -25,13 +25,17 @@ use parquet::{
     file::properties::WriterProperties,
 };
 use serde::{Deserialize, Serialize};
-use tokio::task::JoinHandle;
-use tokio::{sync::mpsc, time::Instant as TokioInstant};
+use tokio::{
+    sync::{OwnedSemaphorePermit, Semaphore, mpsc},
+    task::JoinHandle,
+    time::{Instant as TokioInstant, sleep, timeout},
+};
 use tonic::{Request, Response, Status, Streaming};
 use tracing::{error, info};
 
 use crate::{
     config::{AppConfig, ParquetTuning},
+    metadata_store::{MetadataStore, PutStreamCompleteRecord, PutStreamStartRecord},
     util::{descriptor_to_object_key, normalize_object_key, path_from_key},
 };
 
@@ -44,11 +48,16 @@ const DATASET_MANIFEST_FORMAT: &str = "arrow-flight-s3-mvp.dataset.v1";
 pub struct S3FlightService {
     config: Arc<AppConfig>,
     store: Arc<dyn ObjectStore>,
+    metadata_store: Option<Arc<MetadataStore>>,
+    put_slots: Arc<Semaphore>,
+    upload_streams: Arc<Mutex<HashMap<String, usize>>>,
+    active_put_streams: Arc<AtomicUsize>,
 }
 
 #[derive(Debug, Serialize)]
 struct PutSummary {
     key: String,
+    worker: WorkerPutSummary,
     mode: String,
     rows: usize,
     batches: usize,
@@ -70,6 +79,21 @@ struct PutSummary {
     profile: Option<PutProfile>,
     #[serde(skip_serializing_if = "Option::is_none")]
     part_profiles: Option<Vec<PartProfileSummary>>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct WorkerPutSummary {
+    worker_id: String,
+    attempt_id: String,
+    upload_id: Option<String>,
+    stream_id: Option<String>,
+    staging_prefix: Option<String>,
+    admission_wait_ms: u128,
+    global_put_stream_limit: usize,
+    upload_put_stream_limit: Option<usize>,
+    active_put_streams_at_admit: usize,
+    upload_active_streams_at_admit: Option<usize>,
+    stream_budget_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -145,6 +169,16 @@ struct DatasetPart {
 struct DatasetManifest {
     format: String,
     logical_key: String,
+    #[serde(default)]
+    worker_id: Option<String>,
+    #[serde(default)]
+    attempt_id: Option<String>,
+    #[serde(default)]
+    upload_id: Option<String>,
+    #[serde(default)]
+    stream_id: Option<String>,
+    #[serde(default)]
+    staging_prefix: Option<String>,
     ordered: bool,
     compression: String,
     #[serde(default)]
@@ -157,12 +191,57 @@ struct DatasetManifest {
     parts: Vec<DatasetPart>,
 }
 
-#[derive(Debug, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 struct PutOptions {
+    attempt_id: Option<String>,
+    upload_id: Option<String>,
+    stream_id: Option<String>,
+    staging_prefix: Option<String>,
+    max_upload_streams: Option<usize>,
+    max_stream_bytes: Option<u64>,
     target_file_size: Option<usize>,
     input_file_bytes: Option<u64>,
     #[serde(default)]
     profile: bool,
+}
+
+#[derive(Debug, Clone)]
+struct PutContext {
+    attempt_id: String,
+    upload_id: Option<String>,
+    stream_id: Option<String>,
+    staging_prefix: Option<String>,
+    upload_stream_limit: Option<usize>,
+    stream_budget_bytes: Option<u64>,
+}
+
+struct PutAdmission {
+    _permit: OwnedSemaphorePermit,
+    upload_id: Option<String>,
+    upload_streams: Arc<Mutex<HashMap<String, usize>>>,
+    active_put_streams: Arc<AtomicUsize>,
+}
+
+impl Drop for PutAdmission {
+    fn drop(&mut self) {
+        self.active_put_streams.fetch_sub(1, Ordering::Relaxed);
+
+        let Some(upload_id) = self.upload_id.as_ref() else {
+            return;
+        };
+
+        let mut upload_streams = self
+            .upload_streams
+            .lock()
+            .expect("upload stream slot tracker mutex poisoned");
+        match upload_streams.get_mut(upload_id) {
+            Some(active) if *active > 1 => *active -= 1,
+            Some(_) => {
+                upload_streams.remove(upload_id);
+            }
+            None => {}
+        }
+    }
 }
 
 struct PartBatch {
@@ -171,10 +250,275 @@ struct PartBatch {
 }
 
 impl S3FlightService {
-    pub fn new(config: AppConfig, store: Arc<dyn ObjectStore>) -> Self {
+    pub fn new(
+        config: AppConfig,
+        store: Arc<dyn ObjectStore>,
+        metadata_store: Option<MetadataStore>,
+    ) -> Self {
+        let put_slots = Arc::new(Semaphore::new(config.worker.max_active_put_streams.max(1)));
         Self {
             config: Arc::new(config),
             store,
+            metadata_store: metadata_store.map(Arc::new),
+            put_slots,
+            upload_streams: Arc::new(Mutex::new(HashMap::new())),
+            active_put_streams: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    fn build_put_context(&self, key: &str, options: &PutOptions) -> Result<PutContext, Status> {
+        let attempt_id = validate_worker_id("attempt_id", options.attempt_id.as_deref())?
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let upload_id = validate_worker_id("upload_id", options.upload_id.as_deref())?;
+        let stream_id = validate_worker_id("stream_id", options.stream_id.as_deref())?;
+        let staging_prefix = options
+            .staging_prefix
+            .as_deref()
+            .map(normalize_staging_prefix)
+            .transpose()?;
+
+        if self.config.worker.require_staging_prefix && staging_prefix.is_none() {
+            return Err(Status::permission_denied(
+                "DoPut requires staging_prefix metadata",
+            ));
+        }
+
+        if let Some(staging_prefix) = staging_prefix.as_ref() {
+            if !key.starts_with(staging_prefix) {
+                return Err(Status::permission_denied(format!(
+                    "DoPut key {key:?} is outside staging_prefix {staging_prefix:?}"
+                )));
+            }
+        }
+
+        let upload_stream_limit = upload_id.as_ref().map(|_| {
+            options
+                .max_upload_streams
+                .unwrap_or(self.config.worker.max_put_streams_per_upload)
+                .min(self.config.worker.max_put_streams_per_upload)
+                .max(1)
+        });
+        let stream_budget_bytes = min_optional_u64(
+            options.max_stream_bytes.filter(|bytes| *bytes > 0),
+            self.config.worker.max_put_stream_bytes,
+        );
+
+        if let (Some(input_file_bytes), Some(stream_budget_bytes)) =
+            (options.input_file_bytes, stream_budget_bytes)
+        {
+            if input_file_bytes > stream_budget_bytes {
+                return Err(Status::resource_exhausted(format!(
+                    "DoPut input_file_bytes {input_file_bytes} exceeds stream budget {stream_budget_bytes}"
+                )));
+            }
+        }
+
+        Ok(PutContext {
+            attempt_id,
+            upload_id,
+            stream_id,
+            staging_prefix,
+            upload_stream_limit,
+            stream_budget_bytes,
+        })
+    }
+
+    async fn admit_put(
+        &self,
+        context: &PutContext,
+    ) -> Result<(PutAdmission, WorkerPutSummary), Status> {
+        let wait_started = Instant::now();
+        let permit = if self.config.worker.put_slot_wait_ms == 0 {
+            self.put_slots
+                .clone()
+                .try_acquire_owned()
+                .map_err(|_| Status::resource_exhausted("DoPut worker has no free upload slots"))?
+        } else {
+            timeout(
+                Duration::from_millis(self.config.worker.put_slot_wait_ms),
+                self.put_slots.clone().acquire_owned(),
+            )
+            .await
+            .map_err(|_| Status::resource_exhausted("timed out waiting for DoPut upload slot"))?
+            .map_err(|err| Status::internal(err.to_string()))?
+        };
+        let admission_wait_ms = wait_started.elapsed().as_millis();
+
+        let upload_active_streams_at_admit = if let (Some(upload_id), Some(upload_stream_limit)) =
+            (context.upload_id.as_ref(), context.upload_stream_limit)
+        {
+            let mut upload_streams = self
+                .upload_streams
+                .lock()
+                .map_err(|_| Status::internal("upload stream slot tracker mutex poisoned"))?;
+            let active_streams = upload_streams.get(upload_id).copied().unwrap_or_default();
+            if active_streams >= upload_stream_limit {
+                return Err(Status::resource_exhausted(format!(
+                    "upload {upload_id:?} has no free stream slots; active={active_streams}, limit={upload_stream_limit}"
+                )));
+            }
+
+            let admitted_streams = active_streams + 1;
+            upload_streams.insert(upload_id.clone(), admitted_streams);
+            Some(admitted_streams)
+        } else {
+            None
+        };
+
+        let active_put_streams_at_admit =
+            self.active_put_streams.fetch_add(1, Ordering::Relaxed) + 1;
+        let summary = WorkerPutSummary {
+            worker_id: self.config.worker.worker_id.clone(),
+            attempt_id: context.attempt_id.clone(),
+            upload_id: context.upload_id.clone(),
+            stream_id: context.stream_id.clone(),
+            staging_prefix: context.staging_prefix.clone(),
+            admission_wait_ms,
+            global_put_stream_limit: self.config.worker.max_active_put_streams,
+            upload_put_stream_limit: context.upload_stream_limit,
+            active_put_streams_at_admit,
+            upload_active_streams_at_admit,
+            stream_budget_bytes: context.stream_budget_bytes,
+        };
+        let admission = PutAdmission {
+            _permit: permit,
+            upload_id: context.upload_id.clone(),
+            upload_streams: self.upload_streams.clone(),
+            active_put_streams: self.active_put_streams.clone(),
+        };
+
+        Ok((admission, summary))
+    }
+
+    fn put_start_record(
+        &self,
+        key: &str,
+        context: &PutContext,
+        worker_summary: Option<&WorkerPutSummary>,
+        options: &PutOptions,
+    ) -> PutStreamStartRecord {
+        PutStreamStartRecord {
+            attempt_id: context.attempt_id.clone(),
+            upload_id: context.upload_id.clone(),
+            stream_id: context.stream_id.clone(),
+            worker_id: self.config.worker.worker_id.clone(),
+            key: key.to_owned(),
+            mode: Some(put_mode(options).to_owned()),
+            staging_prefix: context.staging_prefix.clone(),
+            target_file_size: options.target_file_size.map(usize_to_i64),
+            client_input_file_bytes: options.input_file_bytes.map(u64_to_i64),
+            stream_budget_bytes: context.stream_budget_bytes.map(u64_to_i64),
+            global_put_stream_limit: usize_to_i32(self.config.worker.max_active_put_streams),
+            upload_put_stream_limit: context.upload_stream_limit.map(usize_to_i32),
+            active_put_streams_at_admit: worker_summary
+                .map(|summary| usize_to_i32(summary.active_put_streams_at_admit)),
+            upload_active_streams_at_admit: worker_summary
+                .and_then(|summary| summary.upload_active_streams_at_admit)
+                .map(usize_to_i32),
+            compression: self.config.parquet.compression_name.clone(),
+            multipart_part_size: usize_to_i64(self.config.parquet.multipart_part_size),
+            multipart_max_concurrency: usize_to_i32(self.config.parquet.multipart_max_concurrency),
+        }
+    }
+
+    async fn record_put_admitted(&self, record: &PutStreamStartRecord) -> Result<(), Status> {
+        let Some(metadata_store) = self.metadata_store.as_ref() else {
+            return Ok(());
+        };
+        metadata_store
+            .record_admitted(record)
+            .await
+            .map_err(status_from_context)?;
+
+        let timeout_ms = self.config.worker.put_first_batch_timeout_ms;
+        if timeout_ms > 0 {
+            let metadata_store = metadata_store.clone();
+            let attempt_id = record.attempt_id.clone();
+            tokio::spawn(async move {
+                sleep(Duration::from_millis(timeout_ms)).await;
+                let error_message =
+                    format!("timed out waiting {timeout_ms}ms for first DoPut record batch");
+                match metadata_store
+                    .record_failed_if_status(&attempt_id, "ADMITTED", &error_message)
+                    .await
+                {
+                    Ok(1) => info!(
+                        attempt_id = %attempt_id,
+                        "marked stale admitted DoPut stream as failed"
+                    ),
+                    Ok(_) => {}
+                    Err(error) => error!(
+                        attempt_id = %attempt_id,
+                        error = %error,
+                        "failed to mark stale admitted DoPut stream as failed"
+                    ),
+                }
+            });
+        }
+
+        Ok(())
+    }
+
+    async fn record_put_rejected(
+        &self,
+        record: &PutStreamStartRecord,
+        status: &Status,
+    ) -> Result<(), Status> {
+        let Some(metadata_store) = self.metadata_store.as_ref() else {
+            return Ok(());
+        };
+        metadata_store
+            .record_rejected(record, &status.to_string())
+            .await
+            .map_err(status_from_context)
+    }
+
+    async fn record_put_writing(&self, attempt_id: &str) -> Result<(), Status> {
+        let Some(metadata_store) = self.metadata_store.as_ref() else {
+            return Ok(());
+        };
+        metadata_store
+            .record_writing(attempt_id)
+            .await
+            .map_err(status_from_context)
+    }
+
+    async fn record_put_completed(&self, summary: &PutSummary) -> Result<(), Status> {
+        let Some(metadata_store) = self.metadata_store.as_ref() else {
+            return Ok(());
+        };
+        let record = PutStreamCompleteRecord {
+            attempt_id: summary.worker.attempt_id.clone(),
+            mode: summary.mode.clone(),
+            rows: usize_to_i64(summary.rows),
+            batches: usize_to_i64(summary.batches),
+            parts: usize_to_i32(summary.parts),
+            flight_stream_bytes: u64_to_i64(summary.flight_stream_bytes),
+            parquet_object_bytes: summary.parquet_object_bytes.map(u64_to_i64),
+            manifest_key: summary.manifest_key.clone(),
+            manifest_object_bytes: summary.manifest_object_bytes.map(u64_to_i64),
+            elapsed_ms: u128_to_i64(summary.elapsed_ms),
+            put_result_json: serde_json::to_value(summary).map_err(status_from_anyhow)?,
+        };
+        metadata_store
+            .record_completed(&record)
+            .await
+            .map_err(status_from_context)
+    }
+
+    async fn record_put_failed(&self, attempt_id: &str, status: &Status) {
+        let Some(metadata_store) = self.metadata_store.as_ref() else {
+            return;
+        };
+        if let Err(error) = metadata_store
+            .record_failed(attempt_id, &status.to_string())
+            .await
+        {
+            error!(
+                attempt_id = %attempt_id,
+                error = %error,
+                "failed to persist DoPut failure status"
+            );
         }
     }
 
@@ -195,77 +539,111 @@ impl S3FlightService {
 
         let key = descriptor_to_object_key(first.flight_descriptor.as_ref());
         let put_options = parse_put_options(&first.app_metadata)?;
-        let profile_enabled = put_options.profile;
-        let path = path_from_key(&key);
-        let flight_stream_bytes = Arc::new(AtomicU64::new(0));
-        let flight_data_messages = Arc::new(AtomicU64::new(0));
+        let put_context = self.build_put_context(&key, &put_options)?;
+        let (admission_guard, worker_summary) = match self.admit_put(&put_context).await {
+            Ok(admission) => admission,
+            Err(status) => {
+                let record = self.put_start_record(&key, &put_context, None, &put_options);
+                self.record_put_rejected(&record, &status).await?;
+                return Err(status);
+            }
+        };
+        let start_record =
+            self.put_start_record(&key, &put_context, Some(&worker_summary), &put_options);
+        self.record_put_admitted(&start_record).await?;
 
-        let first_stream = stream::once(async move { Ok(first) });
-        let stream_bytes = flight_stream_bytes.clone();
-        let stream_messages = flight_data_messages.clone();
-        let flight_stream = first_stream
-            .chain(incoming.map(|item| item.map_err(FlightError::from)))
-            .map(move |item| {
-                item.map(|data| {
-                    if profile_enabled {
-                        stream_messages.fetch_add(1, Ordering::Relaxed);
-                    }
-                    stream_bytes.fetch_add(flight_data_size(&data), Ordering::Relaxed);
-                    data
-                })
-            });
-        let mut batches =
-            arrow_flight::decode::FlightRecordBatchStream::new_from_flight_data(flight_stream);
+        let attempt_id = worker_summary.attempt_id.clone();
+        let result = async {
+            let profile_enabled = put_options.profile;
+            let path = path_from_key(&key);
+            let flight_stream_bytes = Arc::new(AtomicU64::new(0));
+            let flight_data_messages = Arc::new(AtomicU64::new(0));
 
-        let first_batch_started = profile_enabled.then(Instant::now);
-        let first_batch = batches
-            .try_next()
+            let first_stream = stream::once(async move { Ok(first) });
+            let stream_bytes = flight_stream_bytes.clone();
+            let stream_messages = flight_data_messages.clone();
+            let flight_stream = first_stream
+                .chain(incoming.map(|item| item.map_err(FlightError::from)))
+                .map(move |item| {
+                    item.map(|data| {
+                        if profile_enabled {
+                            stream_messages.fetch_add(1, Ordering::Relaxed);
+                        }
+                        stream_bytes.fetch_add(flight_data_size(&data), Ordering::Relaxed);
+                        data
+                    })
+                });
+            let mut batches =
+                arrow_flight::decode::FlightRecordBatchStream::new_from_flight_data(flight_stream);
+
+            let first_batch_started = profile_enabled.then(Instant::now);
+            let first_batch =
+                read_first_batch(&mut batches, self.config.worker.put_first_batch_timeout_ms)
+                    .await?
+                    .ok_or_else(|| {
+                        Status::invalid_argument("DoPut stream did not contain record batches")
+                    })?;
+            enforce_stream_budget(&put_context, flight_stream_bytes.load(Ordering::Relaxed))?;
+            self.record_put_writing(&attempt_id).await?;
+            let first_batch_receive_decode_ms = first_batch_started
+                .map(|started| started.elapsed().as_millis())
+                .unwrap_or_default();
+            let receive_decode_ms = first_batch_receive_decode_ms;
+            let first_batch_flight_bytes = flight_stream_bytes.load(Ordering::Relaxed);
+
+            if let Some(target_file_size) = put_options.target_file_size {
+                return self
+                    .write_sized_dataset(
+                        key,
+                        target_file_size,
+                        put_options.input_file_bytes,
+                        first_batch,
+                        first_batch_flight_bytes,
+                        &mut batches,
+                        &flight_stream_bytes,
+                        &flight_data_messages,
+                        request_started,
+                        first_flight_data_message_ms,
+                        first_batch_receive_decode_ms,
+                        receive_decode_ms,
+                        profile_enabled,
+                        put_context,
+                        worker_summary,
+                    )
+                    .await;
+            }
+
+            self.write_single_file(
+                key,
+                path,
+                put_options.input_file_bytes,
+                first_batch,
+                &mut batches,
+                &flight_stream_bytes,
+                &flight_data_messages,
+                request_started,
+                first_flight_data_message_ms,
+                first_batch_receive_decode_ms,
+                receive_decode_ms,
+                profile_enabled,
+                put_context,
+                worker_summary,
+            )
             .await
-            .map_err(status_from_flight_error)?
-            .ok_or_else(|| {
-                Status::invalid_argument("DoPut stream did not contain record batches")
-            })?;
-        let first_batch_receive_decode_ms = first_batch_started
-            .map(|started| started.elapsed().as_millis())
-            .unwrap_or_default();
-        let receive_decode_ms = first_batch_receive_decode_ms;
-        let first_batch_flight_bytes = flight_stream_bytes.load(Ordering::Relaxed);
-
-        if let Some(target_file_size) = put_options.target_file_size {
-            return self
-                .write_sized_dataset(
-                    key,
-                    target_file_size,
-                    put_options.input_file_bytes,
-                    first_batch,
-                    first_batch_flight_bytes,
-                    &mut batches,
-                    &flight_stream_bytes,
-                    &flight_data_messages,
-                    request_started,
-                    first_flight_data_message_ms,
-                    first_batch_receive_decode_ms,
-                    receive_decode_ms,
-                    profile_enabled,
-                )
-                .await;
         }
+        .await;
+        drop(admission_guard);
 
-        self.write_single_file(
-            key,
-            path,
-            put_options.input_file_bytes,
-            first_batch,
-            &mut batches,
-            &flight_stream_bytes,
-            &flight_data_messages,
-            request_started,
-            first_flight_data_message_ms,
-            first_batch_receive_decode_ms,
-            receive_decode_ms,
-            profile_enabled,
-        )
-        .await
+        match result {
+            Ok(summary) => {
+                self.record_put_completed(&summary).await?;
+                Ok(summary)
+            }
+            Err(status) => {
+                self.record_put_failed(&attempt_id, &status).await;
+                Err(status)
+            }
+        }
     }
 
     async fn write_single_file<S>(
@@ -282,6 +660,8 @@ impl S3FlightService {
         first_batch_receive_decode_ms: u128,
         mut receive_decode_ms: u128,
         profile_enabled: bool,
+        put_context: PutContext,
+        worker_summary: WorkerPutSummary,
     ) -> Result<PutSummary, Status>
     where
         S: Stream<Item = Result<RecordBatch, FlightError>> + Unpin,
@@ -318,6 +698,7 @@ impl S3FlightService {
             let Some(batch) = next_batch else {
                 break;
             };
+            enforce_stream_budget(&put_context, flight_stream_bytes.load(Ordering::Relaxed))?;
 
             write_batch(
                 &mut writer,
@@ -374,6 +755,7 @@ impl S3FlightService {
         });
         let summary = PutSummary {
             key,
+            worker: worker_summary,
             mode: "single".to_owned(),
             rows: rows_written,
             batches: batches_written,
@@ -396,6 +778,12 @@ impl S3FlightService {
 
         info!(
             key = %summary.key,
+            worker_id = %summary.worker.worker_id,
+            attempt_id = %summary.worker.attempt_id,
+            upload_id = ?summary.worker.upload_id,
+            stream_id = ?summary.worker.stream_id,
+            admission_wait_ms = summary.worker.admission_wait_ms,
+            active_put_streams_at_admit = summary.worker.active_put_streams_at_admit,
             mode = %summary.mode,
             rows = summary.rows,
             batches = summary.batches,
@@ -426,6 +814,8 @@ impl S3FlightService {
         first_batch_receive_decode_ms: u128,
         mut receive_decode_ms: u128,
         profile_enabled: bool,
+        put_context: PutContext,
+        worker_summary: WorkerPutSummary,
     ) -> Result<PutSummary, Status>
     where
         S: Stream<Item = Result<RecordBatch, FlightError>> + Unpin,
@@ -485,6 +875,7 @@ impl S3FlightService {
             let Some(batch) = next_batch else {
                 break;
             };
+            enforce_stream_budget(&put_context, flight_stream_bytes.load(Ordering::Relaxed))?;
 
             let seen = flight_stream_bytes.load(Ordering::Relaxed);
             let batch_flight_bytes = seen.saturating_sub(last_seen_flight_bytes);
@@ -555,6 +946,11 @@ impl S3FlightService {
         let manifest = DatasetManifest {
             format: DATASET_MANIFEST_FORMAT.to_owned(),
             logical_key: key.clone(),
+            worker_id: Some(worker_summary.worker_id.clone()),
+            attempt_id: Some(worker_summary.attempt_id.clone()),
+            upload_id: worker_summary.upload_id.clone(),
+            stream_id: worker_summary.stream_id.clone(),
+            staging_prefix: worker_summary.staging_prefix.clone(),
             ordered: true,
             compression: self.config.parquet.compression_name.clone(),
             target_file_size: Some(target_file_size),
@@ -599,6 +995,7 @@ impl S3FlightService {
 
         let summary = PutSummary {
             key,
+            worker: worker_summary,
             mode: "sized_dataset".to_owned(),
             rows: rows_written,
             batches: batches_written,
@@ -621,6 +1018,12 @@ impl S3FlightService {
 
         info!(
             key = %summary.key,
+            worker_id = %summary.worker.worker_id,
+            attempt_id = %summary.worker.attempt_id,
+            upload_id = ?summary.worker.upload_id,
+            stream_id = ?summary.worker.stream_id,
+            admission_wait_ms = summary.worker.admission_wait_ms,
+            active_put_streams_at_admit = summary.worker.active_put_streams_at_admit,
             mode = %summary.mode,
             rows = summary.rows,
             batches = summary.batches,
@@ -877,6 +1280,94 @@ fn parse_put_options(app_metadata: &Bytes) -> Result<PutOptions, Status> {
     serde_json::from_slice(app_metadata).map_err(|err| {
         Status::invalid_argument(format!("invalid DoPut app_metadata options: {err}"))
     })
+}
+
+fn put_mode(options: &PutOptions) -> &'static str {
+    if options.target_file_size.is_some() {
+        "sized_dataset"
+    } else {
+        "single"
+    }
+}
+
+fn usize_to_i32(value: usize) -> i32 {
+    value.min(i32::MAX as usize) as i32
+}
+
+fn usize_to_i64(value: usize) -> i64 {
+    value.min(i64::MAX as usize) as i64
+}
+
+fn u64_to_i64(value: u64) -> i64 {
+    value.min(i64::MAX as u64) as i64
+}
+
+fn u128_to_i64(value: u128) -> i64 {
+    value.min(i64::MAX as u128) as i64
+}
+
+fn validate_worker_id(name: &str, value: Option<&str>) -> Result<Option<String>, Status> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(Status::invalid_argument(format!(
+            "{name} must not be empty"
+        )));
+    }
+    if value.len() > 128 {
+        return Err(Status::invalid_argument(format!(
+            "{name} must be at most 128 bytes"
+        )));
+    }
+    if !value
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
+    {
+        return Err(Status::invalid_argument(format!(
+            "{name} may only contain ASCII letters, digits, '-', '_', '.', and ':'"
+        )));
+    }
+
+    Ok(Some(value.to_owned()))
+}
+
+fn normalize_staging_prefix(raw: &str) -> Result<String, Status> {
+    let prefix = raw
+        .replace('\\', "/")
+        .split('/')
+        .filter(|part| !part.is_empty() && *part != "." && *part != "..")
+        .collect::<Vec<_>>()
+        .join("/");
+
+    if prefix.is_empty() {
+        return Err(Status::invalid_argument("staging_prefix must not be empty"));
+    }
+
+    Ok(format!("{prefix}/"))
+}
+
+fn min_optional_u64(left: Option<u64>, right: Option<u64>) -> Option<u64> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left.min(right)),
+        (Some(value), None) | (None, Some(value)) => Some(value),
+        (None, None) => None,
+    }
+}
+
+fn enforce_stream_budget(context: &PutContext, observed_bytes: u64) -> Result<(), Status> {
+    let Some(stream_budget_bytes) = context.stream_budget_bytes else {
+        return Ok(());
+    };
+
+    if observed_bytes > stream_budget_bytes {
+        return Err(Status::resource_exhausted(format!(
+            "DoPut stream exceeded byte budget; observed={observed_bytes}, budget={stream_budget_bytes}"
+        )));
+    }
+
+    Ok(())
 }
 
 fn flight_data_size(data: &FlightData) -> u64 {
@@ -1150,6 +1641,27 @@ async fn send_part_batch(
         .send(part_batch)
         .await
         .map_err(|_| Status::internal("dataset writer task stopped during DoPut"))
+}
+
+async fn read_first_batch<S>(
+    batches: &mut S,
+    timeout_ms: u64,
+) -> Result<Option<RecordBatch>, Status>
+where
+    S: Stream<Item = Result<RecordBatch, FlightError>> + Unpin,
+{
+    if timeout_ms == 0 {
+        return batches.try_next().await.map_err(status_from_flight_error);
+    }
+
+    timeout(Duration::from_millis(timeout_ms), batches.try_next())
+        .await
+        .map_err(|_| {
+            Status::deadline_exceeded(format!(
+                "timed out waiting {timeout_ms}ms for first DoPut record batch after admission"
+            ))
+        })?
+        .map_err(status_from_flight_error)
 }
 
 async fn collect_next_part(

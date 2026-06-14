@@ -8,6 +8,8 @@ pub struct AppConfig {
     pub flight_addr: SocketAddr,
     pub s3: S3Config,
     pub parquet: ParquetTuning,
+    pub worker: WorkerConfig,
+    pub metadata: MetadataConfig,
     pub flight_max_message_size: usize,
     pub flight_data_chunk_size: usize,
     pub read_batch_size: usize,
@@ -45,6 +47,23 @@ pub struct ParquetTuning {
     pub put_queue_depth: usize,
 }
 
+#[derive(Debug, Clone)]
+pub struct WorkerConfig {
+    pub worker_id: String,
+    pub max_active_put_streams: usize,
+    pub max_put_streams_per_upload: usize,
+    pub put_slot_wait_ms: u64,
+    pub put_first_batch_timeout_ms: u64,
+    pub max_put_stream_bytes: Option<u64>,
+    pub require_staging_prefix: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct MetadataConfig {
+    pub database_url: Option<String>,
+    pub auto_migrate: bool,
+}
+
 impl AppConfig {
     pub fn from_env() -> Result<Self> {
         let flight_addr = env_string("FLIGHT_ADDR", "0.0.0.0:50051")
@@ -55,6 +74,8 @@ impl AppConfig {
             flight_addr,
             s3: S3Config::from_env(),
             parquet: ParquetTuning::from_env()?,
+            worker: WorkerConfig::from_env()?,
+            metadata: MetadataConfig::from_env(),
             flight_max_message_size: env_usize("FLIGHT_MAX_MESSAGE_SIZE", 256 * 1024 * 1024)?,
             flight_data_chunk_size: env_usize("FLIGHT_DATA_CHUNK_SIZE", 16 * 1024 * 1024)?,
             read_batch_size: env_usize("READ_BATCH_SIZE", 65_536)?,
@@ -106,6 +127,29 @@ impl ParquetTuning {
     }
 }
 
+impl WorkerConfig {
+    pub fn from_env() -> Result<Self> {
+        Ok(Self {
+            worker_id: env_string("WORKER_ID", "local-worker"),
+            max_active_put_streams: env_usize("PUT_MAX_ACTIVE_STREAMS", 16)?.max(1),
+            max_put_streams_per_upload: env_usize("PUT_MAX_STREAMS_PER_UPLOAD", 8)?.max(1),
+            put_slot_wait_ms: env_usize("PUT_SLOT_WAIT_MS", 30_000)? as u64,
+            put_first_batch_timeout_ms: env_usize("PUT_FIRST_BATCH_TIMEOUT_MS", 10_000)? as u64,
+            max_put_stream_bytes: env_optional_u64("PUT_MAX_STREAM_BYTES")?,
+            require_staging_prefix: env_bool("PUT_REQUIRE_STAGING_PREFIX", false),
+        })
+    }
+}
+
+impl MetadataConfig {
+    pub fn from_env() -> Self {
+        Self {
+            database_url: env_optional_string("METADATA_DATABASE_URL"),
+            auto_migrate: env_bool("METADATA_DB_AUTO_MIGRATE", true),
+        }
+    }
+}
+
 pub fn parse_compression(value: &str) -> Result<Compression> {
     match value.trim().to_ascii_lowercase().as_str() {
         "none" | "uncompressed" => Ok(Compression::UNCOMPRESSED),
@@ -119,6 +163,13 @@ pub fn parse_compression(value: &str) -> Result<Compression> {
 
 fn env_string(key: &str, default: &str) -> String {
     env::var(key).unwrap_or_else(|_| default.to_owned())
+}
+
+fn env_optional_string(key: &str) -> Option<String> {
+    env::var(key).ok().and_then(|value| {
+        let value = value.trim().to_owned();
+        (!value.is_empty()).then_some(value)
+    })
 }
 
 fn env_bool(key: &str, default: bool) -> bool {
@@ -137,5 +188,17 @@ fn env_usize(key: &str, default: usize) -> Result<usize> {
         Ok(value) => crate::util::parse_size(&value)
             .with_context(|| format!("{key} must be a byte count or size like 64mb")),
         Err(_) => Ok(default),
+    }
+}
+
+fn env_optional_u64(key: &str) -> Result<Option<u64>> {
+    match env::var(key) {
+        Ok(value) if value.trim().is_empty() || value.trim() == "0" => Ok(None),
+        Ok(value) => Ok(Some(
+            crate::util::parse_size(&value)
+                .with_context(|| format!("{key} must be 0, a byte count, or a size like 64mb"))?
+                as u64,
+        )),
+        Err(_) => Ok(None),
     }
 }

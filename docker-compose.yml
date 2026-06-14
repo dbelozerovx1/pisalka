@@ -22,12 +22,30 @@ services:
       /usr/bin/mc anonymous set none local/arrow-flight;
       "
 
+  metadata-db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: flight_metadata
+      POSTGRES_USER: flight
+      POSTGRES_PASSWORD: flight
+    ports:
+      - "5432:5432"
+    volumes:
+      - metadata-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U flight -d flight_metadata"]
+      interval: 2s
+      timeout: 5s
+      retries: 20
+
   flight-server:
     build:
       context: .
     depends_on:
       minio-create-bucket:
         condition: service_completed_successfully
+      metadata-db:
+        condition: service_healthy
     environment:
       RUST_LOG: info
       FLIGHT_ADDR: 0.0.0.0:50051
@@ -37,13 +55,22 @@ services:
       AWS_ACCESS_KEY_ID: minioadmin
       AWS_SECRET_ACCESS_KEY: minioadmin
       AWS_ALLOW_HTTP: "true"
-      PARQUET_COMPRESSION: "${PARQUET_COMPRESSION:-uncompressed}"
+      PARQUET_COMPRESSION: "${PARQUET_COMPRESSION:-snappy}"
       PARQUET_DICTIONARY: "${PARQUET_DICTIONARY:-false}"
       PARQUET_MAX_ROW_GROUP_ROWS: "${PARQUET_MAX_ROW_GROUP_ROWS:-1048576}"
       PARQUET_WRITE_BATCH_SIZE: "${PARQUET_WRITE_BATCH_SIZE:-65536}"
       PARQUET_FLUSH_THRESHOLD_BYTES: "${PARQUET_FLUSH_THRESHOLD_BYTES:-268435456}"
       S3_MULTIPART_PART_SIZE: "${S3_MULTIPART_PART_SIZE:-67108864}"
       S3_MULTIPART_MAX_CONCURRENCY: "${S3_MULTIPART_MAX_CONCURRENCY:-16}"
+      WORKER_ID: "${WORKER_ID:-local-worker}"
+      PUT_MAX_ACTIVE_STREAMS: "${PUT_MAX_ACTIVE_STREAMS:-16}"
+      PUT_MAX_STREAMS_PER_UPLOAD: "${PUT_MAX_STREAMS_PER_UPLOAD:-8}"
+      PUT_SLOT_WAIT_MS: "${PUT_SLOT_WAIT_MS:-30000}"
+      PUT_FIRST_BATCH_TIMEOUT_MS: "${PUT_FIRST_BATCH_TIMEOUT_MS:-10000}"
+      PUT_MAX_STREAM_BYTES: "${PUT_MAX_STREAM_BYTES:-}"
+      PUT_REQUIRE_STAGING_PREFIX: "${PUT_REQUIRE_STAGING_PREFIX:-false}"
+      METADATA_DATABASE_URL: "${METADATA_DATABASE_URL:-postgres://flight:flight@metadata-db:5432/flight_metadata}"
+      METADATA_DB_AUTO_MIGRATE: "${METADATA_DB_AUTO_MIGRATE:-true}"
       PUT_PARALLELISM: "${PUT_PARALLELISM:-4}"
       PUT_QUEUE_DEPTH: "${PUT_QUEUE_DEPTH:-2}"
       FLIGHT_MAX_MESSAGE_SIZE: "${FLIGHT_MAX_MESSAGE_SIZE:-268435456}"
@@ -53,3 +80,4 @@ services:
 
 volumes:
   minio-data:
+  metadata-db-data:

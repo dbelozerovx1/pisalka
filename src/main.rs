@@ -1,7 +1,8 @@
 use anyhow::Result;
 use arrow_flight::flight_service_server::FlightServiceServer;
 use arrow_flight_s3_mvp::{
-    config::AppConfig, flight_service::S3FlightService, util::build_object_store,
+    config::AppConfig, flight_service::S3FlightService, metadata_store::MetadataStore,
+    util::build_object_store,
 };
 use tonic::transport::Server;
 use tracing::info;
@@ -14,7 +15,8 @@ async fn main() -> Result<()> {
 
     let config = AppConfig::from_env()?;
     let store = build_object_store(&config.s3)?;
-    let service = S3FlightService::new(config.clone(), store);
+    let metadata_store = MetadataStore::connect(&config.metadata).await?;
+    let service = S3FlightService::new(config.clone(), store, metadata_store);
     let flight_service = FlightServiceServer::new(service)
         .max_decoding_message_size(config.flight_max_message_size)
         .max_encoding_message_size(config.flight_max_message_size);
@@ -23,6 +25,7 @@ async fn main() -> Result<()> {
         addr = %config.flight_addr,
         s3_endpoint = %config.s3.endpoint,
         bucket = %config.s3.bucket,
+        metadata_db = config.metadata.database_url.is_some(),
         compression = %config.parquet.compression_name,
         dictionary = config.parquet.dictionary_enabled,
         "starting Arrow Flight S3 MVP server"
