@@ -39,10 +39,24 @@ pub struct PutStreamCompleteRecord {
     pub parts: i32,
     pub flight_stream_bytes: i64,
     pub parquet_object_bytes: Option<i64>,
-    pub manifest_key: Option<String>,
-    pub manifest_object_bytes: Option<i64>,
     pub elapsed_ms: i64,
     pub put_result_json: Value,
+    pub files: Vec<PutFileRecord>,
+}
+
+#[derive(Debug)]
+pub struct PutFileRecord {
+    pub attempt_id: String,
+    pub upload_id: Option<String>,
+    pub stream_id: Option<String>,
+    pub worker_id: String,
+    pub logical_key: String,
+    pub part_index: i32,
+    pub file_path: String,
+    pub rows: i64,
+    pub batches: i64,
+    pub flight_stream_bytes: i64,
+    pub parquet_object_bytes: i64,
 }
 
 impl MetadataStore {
@@ -96,8 +110,6 @@ CREATE TABLE IF NOT EXISTS worker_put_streams (
     parts INTEGER NOT NULL DEFAULT 0,
     flight_stream_bytes BIGINT NOT NULL DEFAULT 0,
     parquet_object_bytes BIGINT,
-    manifest_key TEXT,
-    manifest_object_bytes BIGINT,
     elapsed_ms BIGINT,
     error_message TEXT,
     put_result_json JSONB,
@@ -114,6 +126,28 @@ CREATE INDEX IF NOT EXISTS worker_put_streams_upload_stream_idx
 
 CREATE INDEX IF NOT EXISTS worker_put_streams_status_idx
     ON worker_put_streams (status, updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS worker_put_files (
+    attempt_id TEXT NOT NULL REFERENCES worker_put_streams(attempt_id) ON DELETE CASCADE,
+    upload_id TEXT,
+    stream_id TEXT,
+    worker_id TEXT NOT NULL,
+    logical_key TEXT NOT NULL,
+    part_index INTEGER NOT NULL,
+    file_path TEXT NOT NULL,
+    rows BIGINT NOT NULL,
+    batches BIGINT NOT NULL,
+    flight_stream_bytes BIGINT NOT NULL,
+    parquet_object_bytes BIGINT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (attempt_id, part_index)
+);
+
+CREATE INDEX IF NOT EXISTS worker_put_files_upload_idx
+    ON worker_put_files (upload_id, stream_id, part_index);
+
+CREATE INDEX IF NOT EXISTS worker_put_files_path_idx
+    ON worker_put_files (file_path);
 "#,
             )
             .await
@@ -299,6 +333,72 @@ WHERE attempt_id = $1
     pub async fn record_completed(&self, record: &PutStreamCompleteRecord) -> Result<()> {
         self.client
             .execute(
+                "DELETE FROM worker_put_files WHERE attempt_id = $1",
+                &[&record.attempt_id],
+            )
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to clear completed DoPut file rows for attempt {}",
+                    record.attempt_id
+                )
+            })?;
+
+        for file in &record.files {
+            self.client
+                .execute(
+                    r#"
+INSERT INTO worker_put_files (
+    attempt_id,
+    upload_id,
+    stream_id,
+    worker_id,
+    logical_key,
+    part_index,
+    file_path,
+    rows,
+    batches,
+    flight_stream_bytes,
+    parquet_object_bytes
+) VALUES (
+    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11
+)
+ON CONFLICT (attempt_id, part_index) DO UPDATE SET
+    upload_id = EXCLUDED.upload_id,
+    stream_id = EXCLUDED.stream_id,
+    worker_id = EXCLUDED.worker_id,
+    logical_key = EXCLUDED.logical_key,
+    file_path = EXCLUDED.file_path,
+    rows = EXCLUDED.rows,
+    batches = EXCLUDED.batches,
+    flight_stream_bytes = EXCLUDED.flight_stream_bytes,
+    parquet_object_bytes = EXCLUDED.parquet_object_bytes
+"#,
+                    &[
+                        &file.attempt_id,
+                        &file.upload_id,
+                        &file.stream_id,
+                        &file.worker_id,
+                        &file.logical_key,
+                        &file.part_index,
+                        &file.file_path,
+                        &file.rows,
+                        &file.batches,
+                        &file.flight_stream_bytes,
+                        &file.parquet_object_bytes,
+                    ],
+                )
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed to record completed DoPut file {} for attempt {}",
+                        file.file_path, file.attempt_id
+                    )
+                })?;
+        }
+
+        self.client
+            .execute(
                 r#"
 UPDATE worker_put_streams
 SET status = 'SUCCEEDED',
@@ -308,11 +408,9 @@ SET status = 'SUCCEEDED',
     parts = $5,
     flight_stream_bytes = $6,
     parquet_object_bytes = $7,
-    manifest_key = $8,
-    manifest_object_bytes = $9,
-    elapsed_ms = $10,
+    elapsed_ms = $8,
     error_message = NULL,
-    put_result_json = $11,
+    put_result_json = $9,
     updated_at = now(),
     completed_at = now()
 WHERE attempt_id = $1
@@ -325,8 +423,6 @@ WHERE attempt_id = $1
                     &record.parts,
                     &record.flight_stream_bytes,
                     &record.parquet_object_bytes,
-                    &record.manifest_key,
-                    &record.manifest_object_bytes,
                     &record.elapsed_ms,
                     &record.put_result_json,
                 ],

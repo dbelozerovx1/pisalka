@@ -1,7 +1,7 @@
 FROM rust:1.88.0-bookworm AS builder
 
 WORKDIR /app
-COPY Cargo.toml rust-toolchain.toml ./
+COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY src ./src
 RUN cargo build --release --bin flight-server
 

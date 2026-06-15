@@ -86,8 +86,6 @@ pub fn print_server_profile(result: &str) {
         "receive_decode_ms",
         "enqueue_wait_ms",
         "collect_writer_wait_ms",
-        "manifest_put_ms",
-        "manifest_head_ms",
         "object_head_ms",
         "writer_task_elapsed_ms_max",
         "writer_task_write_ms_max",

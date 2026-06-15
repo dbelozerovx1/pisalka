@@ -35,14 +35,11 @@ use tracing::{error, info};
 
 use crate::{
     config::{AppConfig, ParquetTuning},
-    metadata_store::{MetadataStore, PutStreamCompleteRecord, PutStreamStartRecord},
+    metadata_store::{MetadataStore, PutFileRecord, PutStreamCompleteRecord, PutStreamStartRecord},
     util::{descriptor_to_object_key, normalize_object_key, path_from_key},
 };
 
 type ResponseStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send + 'static>>;
-type BatchStream = Pin<Box<dyn Stream<Item = Result<RecordBatch, FlightError>> + Send + 'static>>;
-
-const DATASET_MANIFEST_FORMAT: &str = "arrow-flight-s3-mvp.dataset.v1";
 
 #[derive(Clone)]
 pub struct S3FlightService {
@@ -68,8 +65,7 @@ struct PutSummary {
     flight_data_messages: Option<u64>,
     flight_stream_bytes: u64,
     parquet_object_bytes: Option<u64>,
-    manifest_key: Option<String>,
-    manifest_object_bytes: Option<u64>,
+    files: Vec<PutFileSummary>,
     target_file_size: Option<usize>,
     elapsed_ms: u128,
     compression: String,
@@ -79,6 +75,16 @@ struct PutSummary {
     profile: Option<PutProfile>,
     #[serde(skip_serializing_if = "Option::is_none")]
     part_profiles: Option<Vec<PartProfileSummary>>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct PutFileSummary {
+    key: String,
+    part_index: usize,
+    rows: usize,
+    batches: usize,
+    flight_stream_bytes: u64,
+    parquet_object_bytes: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -104,8 +110,6 @@ struct PutProfile {
     receive_decode_ms: u128,
     enqueue_wait_ms: u128,
     collect_writer_wait_ms: u128,
-    manifest_put_ms: u128,
-    manifest_head_ms: u128,
     object_head_ms: u128,
     writer_task_elapsed_ms_sum: u128,
     writer_task_elapsed_ms_max: u128,
@@ -163,32 +167,6 @@ struct DatasetPart {
     #[serde(default)]
     #[serde(skip_serializing_if = "PartProfile::is_empty")]
     profile: PartProfile,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct DatasetManifest {
-    format: String,
-    logical_key: String,
-    #[serde(default)]
-    worker_id: Option<String>,
-    #[serde(default)]
-    attempt_id: Option<String>,
-    #[serde(default)]
-    upload_id: Option<String>,
-    #[serde(default)]
-    stream_id: Option<String>,
-    #[serde(default)]
-    staging_prefix: Option<String>,
-    ordered: bool,
-    compression: String,
-    #[serde(default)]
-    target_file_size: Option<usize>,
-    rows: usize,
-    batches: usize,
-    #[serde(default)]
-    flight_stream_bytes: u64,
-    parquet_object_bytes: u64,
-    parts: Vec<DatasetPart>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -495,10 +473,9 @@ impl S3FlightService {
             parts: usize_to_i32(summary.parts),
             flight_stream_bytes: u64_to_i64(summary.flight_stream_bytes),
             parquet_object_bytes: summary.parquet_object_bytes.map(u64_to_i64),
-            manifest_key: summary.manifest_key.clone(),
-            manifest_object_bytes: summary.manifest_object_bytes.map(u64_to_i64),
             elapsed_ms: u128_to_i64(summary.elapsed_ms),
             put_result_json: serde_json::to_value(summary).map_err(status_from_anyhow)?,
+            files: put_file_records(summary),
         };
         metadata_store
             .record_completed(&record)
@@ -728,6 +705,14 @@ impl S3FlightService {
         let flight_stream_bytes = flight_stream_bytes.load(Ordering::Relaxed);
         let flight_data_messages = flight_data_messages.load(Ordering::Relaxed);
         let parquet_object_bytes = object_meta.as_ref().map(|meta| meta.size);
+        let files = vec![PutFileSummary {
+            key: path.to_string(),
+            part_index: 0,
+            rows: rows_written,
+            batches: batches_written,
+            flight_stream_bytes,
+            parquet_object_bytes: parquet_object_bytes.unwrap_or_default(),
+        }];
         let elapsed_ms = request_started.elapsed().as_millis();
         let profile = profile_enabled.then(|| {
             profile_from_parts(
@@ -735,8 +720,6 @@ impl S3FlightService {
                 first_flight_data_message_ms,
                 first_batch_receive_decode_ms,
                 receive_decode_ms,
-                0,
-                0,
                 0,
                 0,
                 std::slice::from_ref(&writer_profile),
@@ -765,8 +748,7 @@ impl S3FlightService {
             flight_data_messages: profile_enabled.then_some(flight_data_messages),
             flight_stream_bytes,
             parquet_object_bytes,
-            manifest_key: None,
-            manifest_object_bytes: None,
+            files,
             target_file_size: None,
             elapsed_ms,
             compression: self.config.parquet.compression_name.clone(),
@@ -937,47 +919,11 @@ impl S3FlightService {
         parts.sort_by_key(|part| part.part_index);
         let rows_written = parts.iter().map(|part| part.rows).sum();
         let batches_written = parts.iter().map(|part| part.batches).sum();
-        let assigned_flight_stream_bytes = parts.iter().map(|part| part.flight_stream_bytes).sum();
         let parquet_object_bytes = parts.iter().map(|part| part.parquet_object_bytes).sum();
         let total_flight_stream_bytes = flight_stream_bytes.load(Ordering::Relaxed);
         let flight_data_messages = flight_data_messages.load(Ordering::Relaxed);
-        let manifest_key = dataset_manifest_key(&key);
         let part_profiles = profile_enabled.then(|| part_profile_summaries(&parts));
-        let manifest = DatasetManifest {
-            format: DATASET_MANIFEST_FORMAT.to_owned(),
-            logical_key: key.clone(),
-            worker_id: Some(worker_summary.worker_id.clone()),
-            attempt_id: Some(worker_summary.attempt_id.clone()),
-            upload_id: worker_summary.upload_id.clone(),
-            stream_id: worker_summary.stream_id.clone(),
-            staging_prefix: worker_summary.staging_prefix.clone(),
-            ordered: true,
-            compression: self.config.parquet.compression_name.clone(),
-            target_file_size: Some(target_file_size),
-            rows: rows_written,
-            batches: batches_written,
-            flight_stream_bytes: assigned_flight_stream_bytes,
-            parquet_object_bytes,
-            parts,
-        };
-
-        let manifest_payload = Bytes::from(
-            serde_json::to_vec(&manifest).map_err(|err| Status::internal(err.to_string()))?,
-        );
-        let manifest_path = Path::from(manifest_key.clone());
-        let manifest_put_started = profile_enabled.then(Instant::now);
-        self.store
-            .put(&manifest_path, manifest_payload.into())
-            .await
-            .map_err(status_from_anyhow)?;
-        let manifest_put_ms = manifest_put_started
-            .map(|started| started.elapsed().as_millis())
-            .unwrap_or_default();
-        let manifest_head_started = profile_enabled.then(Instant::now);
-        let manifest_meta = self.store.head(&manifest_path).await.ok();
-        let manifest_head_ms = manifest_head_started
-            .map(|started| started.elapsed().as_millis())
-            .unwrap_or_default();
+        let files = put_file_summaries_from_parts(&parts);
         let elapsed_ms = request_started.elapsed().as_millis();
         let profile = profile_enabled.then(|| {
             profile_from_dataset_parts(
@@ -987,9 +933,7 @@ impl S3FlightService {
                 receive_decode_ms,
                 enqueue_wait_ms,
                 collect_writer_wait_ms,
-                manifest_put_ms,
-                manifest_head_ms,
-                &manifest.parts,
+                &parts,
             )
         });
 
@@ -999,14 +943,13 @@ impl S3FlightService {
             mode: "sized_dataset".to_owned(),
             rows: rows_written,
             batches: batches_written,
-            parts: manifest.parts.len(),
+            parts: parts.len(),
             put_parallelism: max_part_writers,
             client_input_file_bytes,
             flight_data_messages: profile_enabled.then_some(flight_data_messages),
             flight_stream_bytes: total_flight_stream_bytes,
             parquet_object_bytes: Some(parquet_object_bytes),
-            manifest_key: Some(manifest_key),
-            manifest_object_bytes: manifest_meta.map(|meta| meta.size),
+            files,
             target_file_size: Some(target_file_size),
             elapsed_ms,
             compression: self.config.parquet.compression_name.clone(),
@@ -1037,33 +980,10 @@ impl S3FlightService {
             writer_write_ms_sum = ?summary.profile.as_ref().map(|profile| profile.writer_task_write_ms_sum),
             writer_write_ms_max = ?summary.profile.as_ref().map(|profile| profile.writer_task_write_ms_max),
             writer_close_ms_max = ?summary.profile.as_ref().map(|profile| profile.writer_task_close_ms_max),
-            manifest_put_ms = ?summary.profile.as_ref().map(|profile| profile.manifest_put_ms),
             "DoPut persisted size-split parquet dataset"
         );
 
         Ok(summary)
-    }
-
-    async fn load_dataset_manifest(&self, key: &str) -> Result<Option<DatasetManifest>, Status> {
-        let manifest_path = Path::from(dataset_manifest_key(key));
-        let result = match self.store.get(&manifest_path).await {
-            Ok(result) => result,
-            Err(object_store::Error::NotFound { .. }) => return Ok(None),
-            Err(error) => return Err(status_from_anyhow(error)),
-        };
-
-        let bytes = result.bytes().await.map_err(status_from_anyhow)?;
-        let manifest: DatasetManifest =
-            serde_json::from_slice(&bytes).map_err(|err| Status::internal(err.to_string()))?;
-
-        if manifest.format != DATASET_MANIFEST_FORMAT {
-            return Err(Status::internal(format!(
-                "unsupported dataset manifest format: {}",
-                manifest.format
-            )));
-        }
-
-        Ok(Some(manifest))
     }
 }
 
@@ -1097,17 +1017,13 @@ impl FlightService for S3FlightService {
     ) -> Result<Response<FlightInfo>, Status> {
         let descriptor = request.into_inner();
         let key = descriptor_to_object_key(Some(&descriptor));
-        let total_bytes = if let Some(manifest) = self.load_dataset_manifest(&key).await? {
-            manifest.parquet_object_bytes as i64
-        } else {
-            let path = path_from_key(&key);
-            let meta = self
-                .store
-                .head(&path)
-                .await
-                .map_err(|err| Status::not_found(err.to_string()))?;
-            meta.size as i64
-        };
+        let path = path_from_key(&key);
+        let meta = self
+            .store
+            .head(&path)
+            .await
+            .map_err(|err| Status::not_found(err.to_string()))?;
+        let total_bytes = meta.size as i64;
 
         let ticket = Ticket {
             ticket: Bytes::from(key),
@@ -1154,41 +1070,6 @@ impl FlightService for S3FlightService {
             std::str::from_utf8(&request.into_inner().ticket)
                 .map_err(|err| Status::invalid_argument(err.to_string()))?,
         );
-
-        if let Some(manifest) = self.load_dataset_manifest(&key).await? {
-            let first_part = manifest
-                .parts
-                .first()
-                .ok_or_else(|| Status::not_found("dataset manifest did not contain parts"))?;
-            let first_reader =
-                ParquetObjectReader::new(self.store.clone(), path_from_key(&first_part.key))
-                    .with_file_size(first_part.parquet_object_bytes);
-            let first_builder = ParquetRecordBatchStreamBuilder::new(first_reader)
-                .await
-                .map_err(status_from_anyhow)?;
-            let schema = first_builder.schema().clone();
-            let part_count = manifest.parts.len();
-            let total_bytes = manifest.parquet_object_bytes;
-            let parquet_stream = dataset_batch_stream(
-                self.store.clone(),
-                manifest.parts,
-                self.config.read_batch_size,
-            );
-
-            let flight_stream = arrow_flight::encode::FlightDataEncoderBuilder::new()
-                .with_schema(schema)
-                .with_max_flight_data_size(self.config.flight_data_chunk_size)
-                .build(parquet_stream)
-                .map(|result| result.map_err(status_from_flight_error));
-
-            info!(
-                key = %key,
-                parts = part_count,
-                bytes = total_bytes,
-                "DoGet streaming parallel parquet dataset"
-            );
-            return Ok(Response::new(Box::pin(flight_stream)));
-        }
 
         let path = path_from_key(&key);
         let meta = self
@@ -1266,10 +1147,6 @@ impl FlightService for S3FlightService {
     ) -> Result<Response<Self::ListActionsStream>, Status> {
         Ok(Response::new(Box::pin(stream::empty())))
     }
-}
-
-fn dataset_manifest_key(key: &str) -> String {
-    format!("{key}.manifest.json")
 }
 
 fn parse_put_options(app_metadata: &Bytes) -> Result<PutOptions, Status> {
@@ -1403,6 +1280,40 @@ fn part_profile_summaries(parts: &[DatasetPart]) -> Vec<PartProfileSummary> {
         .collect()
 }
 
+fn put_file_summaries_from_parts(parts: &[DatasetPart]) -> Vec<PutFileSummary> {
+    parts
+        .iter()
+        .map(|part| PutFileSummary {
+            key: part.key.clone(),
+            part_index: part.part_index,
+            rows: part.rows,
+            batches: part.batches,
+            flight_stream_bytes: part.flight_stream_bytes,
+            parquet_object_bytes: part.parquet_object_bytes,
+        })
+        .collect()
+}
+
+fn put_file_records(summary: &PutSummary) -> Vec<PutFileRecord> {
+    summary
+        .files
+        .iter()
+        .map(|file| PutFileRecord {
+            attempt_id: summary.worker.attempt_id.clone(),
+            upload_id: summary.worker.upload_id.clone(),
+            stream_id: summary.worker.stream_id.clone(),
+            worker_id: summary.worker.worker_id.clone(),
+            logical_key: summary.key.clone(),
+            part_index: usize_to_i32(file.part_index),
+            file_path: file.key.clone(),
+            rows: usize_to_i64(file.rows),
+            batches: usize_to_i64(file.batches),
+            flight_stream_bytes: u64_to_i64(file.flight_stream_bytes),
+            parquet_object_bytes: u64_to_i64(file.parquet_object_bytes),
+        })
+        .collect()
+}
+
 fn profile_from_dataset_parts(
     total_server_ms: u128,
     first_flight_data_message_ms: u128,
@@ -1410,8 +1321,6 @@ fn profile_from_dataset_parts(
     receive_decode_ms: u128,
     enqueue_wait_ms: u128,
     collect_writer_wait_ms: u128,
-    manifest_put_ms: u128,
-    manifest_head_ms: u128,
     parts: &[DatasetPart],
 ) -> PutProfile {
     let profiles = parts
@@ -1425,8 +1334,6 @@ fn profile_from_dataset_parts(
         receive_decode_ms,
         enqueue_wait_ms,
         collect_writer_wait_ms,
-        manifest_put_ms,
-        manifest_head_ms,
         &profiles,
     )
 }
@@ -1438,8 +1345,6 @@ fn profile_from_parts(
     receive_decode_ms: u128,
     enqueue_wait_ms: u128,
     collect_writer_wait_ms: u128,
-    manifest_put_ms: u128,
-    manifest_head_ms: u128,
     parts: &[PartProfile],
 ) -> PutProfile {
     PutProfile {
@@ -1449,8 +1354,6 @@ fn profile_from_parts(
         receive_decode_ms,
         enqueue_wait_ms,
         collect_writer_wait_ms,
-        manifest_put_ms,
-        manifest_head_ms,
         object_head_ms: parts.iter().map(|part| part.head_ms).sum(),
         writer_task_elapsed_ms_sum: parts.iter().map(|part| part.elapsed_ms).sum(),
         writer_task_elapsed_ms_max: parts
@@ -1681,67 +1584,6 @@ async fn collect_next_part(
         Ok(Err(error)) => Err(Status::internal(error)),
         Err(error) => Err(Status::internal(error.to_string())),
     }
-}
-
-struct DatasetReadState {
-    store: Arc<dyn ObjectStore>,
-    parts: Vec<DatasetPart>,
-    next_part: usize,
-    current: Option<BatchStream>,
-    batch_size: usize,
-}
-
-fn dataset_batch_stream(
-    store: Arc<dyn ObjectStore>,
-    parts: Vec<DatasetPart>,
-    batch_size: usize,
-) -> BatchStream {
-    Box::pin(stream::unfold(
-        DatasetReadState {
-            store,
-            parts,
-            next_part: 0,
-            current: None,
-            batch_size,
-        },
-        |mut state| async move {
-            loop {
-                if let Some(current) = state.current.as_mut() {
-                    match current.next().await {
-                        Some(Ok(batch)) => return Some((Ok(batch), state)),
-                        Some(Err(error)) => return Some((Err(error), state)),
-                        None => {
-                            state.current = None;
-                            continue;
-                        }
-                    }
-                }
-
-                let Some(part) = state.parts.get(state.next_part).cloned() else {
-                    return None;
-                };
-                state.next_part += 1;
-
-                let reader =
-                    ParquetObjectReader::new(state.store.clone(), path_from_key(&part.key))
-                        .with_file_size(part.parquet_object_bytes);
-                let builder = match ParquetRecordBatchStreamBuilder::new(reader).await {
-                    Ok(builder) => builder,
-                    Err(error) => {
-                        return Some((Err(FlightError::ExternalError(Box::new(error))), state));
-                    }
-                };
-                let stream = match builder.with_batch_size(state.batch_size).build() {
-                    Ok(stream) => stream.map_err(|err| FlightError::ExternalError(Box::new(err))),
-                    Err(error) => {
-                        return Some((Err(FlightError::ExternalError(Box::new(error))), state));
-                    }
-                };
-
-                state.current = Some(Box::pin(stream));
-            }
-        },
-    ))
 }
 
 fn writer_properties(tuning: &ParquetTuning) -> WriterProperties {
