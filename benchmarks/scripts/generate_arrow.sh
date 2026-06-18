@@ -3,7 +3,7 @@ set -euo pipefail
 
 cd "$(dirname "$0")/../.."
 
-size="${3:-3gb}"
+size="${1:-2gb}"
 output="${2:-data/test-${size}.arrow}"
 rows_per_batch="${ROWS_PER_BATCH:-65536}"
 payload_bytes="${PAYLOAD_BYTES:-64}"

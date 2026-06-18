@@ -92,6 +92,33 @@ Run a write parallelism matrix against the Docker Compose server:
 ./benchmarks/scripts/bench_put_matrix.sh data/test-1gb.arrow 1gb matrix 256mb
 ```
 
+Run the benchmark client and data generator inside Docker as well:
+
+```bash
+BENCH_SIZE=2gb BENCH_MODE=single BENCH_FILE_SIZE=512mb ./dev/bench-docker.sh
+BENCH_SIZE=2gb BENCH_MODE=multi PUT_STREAMS=6 BENCH_FILE_SIZE=512mb ./dev/bench-docker.sh
+```
+
+The Docker benchmark service stores generated Arrow IPC files in a named Docker volume at `/bench-data`, so repeated runs can reuse the same input without reading it from the host filesystem. Force regeneration with:
+
+```bash
+BENCH_REGENERATE=true BENCH_SIZE=2gb ./dev/bench-docker.sh
+```
+
+Use `BENCH_FILE_SIZE=none` to keep single-object write mode instead of target-sized dataset parts.
+
+Server-side write knobs such as `PUT_PARALLELISM` and `PARQUET_COMPRESSION` are applied when the Compose server is started. For example:
+
+```bash
+PUT_PARALLELISM=4 PARQUET_COMPRESSION=snappy BENCH_MODE=multi PUT_STREAMS=6 ./dev/bench-docker.sh
+```
+
+For repeated runs against an already-started server, skip the Compose `up` step:
+
+```bash
+BENCH_SKIP_UP=true BENCH_MODE=single ./dev/bench-docker.sh
+```
+
 ## Performance Knobs
 
 Useful environment variables:

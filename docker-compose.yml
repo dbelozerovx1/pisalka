@@ -41,6 +41,7 @@ services:
   flight-server:
     build:
       context: .
+      target: server
     depends_on:
       minio-create-bucket:
         condition: service_completed_successfully
@@ -78,6 +79,39 @@ services:
     ports:
       - "50051:50051"
 
+  bench:
+    profiles:
+      - bench
+    build:
+      context: .
+      target: bench
+    depends_on:
+      - flight-server
+    environment:
+      FLIGHT_URI: "${BENCH_FLIGHT_URI:-http://flight-server:50051}"
+      FLIGHT_MAX_MESSAGE_SIZE: "${FLIGHT_MAX_MESSAGE_SIZE:-268435456}"
+      FLIGHT_DATA_CHUNK_SIZE: "${FLIGHT_DATA_CHUNK_SIZE:-16777216}"
+      BENCH_DATA_DIR: "${BENCH_DATA_DIR:-/bench-data}"
+      BENCH_MODE: "${BENCH_MODE:-single}"
+      BENCH_SIZE: "${BENCH_SIZE:-1gb}"
+      BENCH_INPUT: "${BENCH_INPUT:-}"
+      BENCH_REGENERATE: "${BENCH_REGENERATE:-false}"
+      BENCH_PATH: "${BENCH_PATH:-}"
+      BENCH_FILE_SIZE: "${BENCH_FILE_SIZE:-${TARGET_FILE_SIZE:-512mb}}"
+      BENCH_STARTUP_WAIT: "${BENCH_STARTUP_WAIT:-2}"
+      ROWS_PER_BATCH: "${ROWS_PER_BATCH:-65536}"
+      PAYLOAD_BYTES: "${PAYLOAD_BYTES:-64}"
+      PUT_PROFILE: "${PUT_PROFILE:-false}"
+      PUT_STREAMS: "${PUT_STREAMS:-6}"
+      PUT_CLIENT_QUEUE_DEPTH: "${PUT_CLIENT_QUEUE_DEPTH:-2}"
+      BENCH_STAGING_PREFIX: "${BENCH_STAGING_PREFIX:-}"
+      BENCH_MAX_UPLOAD_STREAMS: "${BENCH_MAX_UPLOAD_STREAMS:-}"
+      BENCH_MAX_STREAM_BYTES: "${BENCH_MAX_STREAM_BYTES:-}"
+      PROFILE_PART_LIMIT: "${PROFILE_PART_LIMIT:-16}"
+    volumes:
+      - benchmark-data:/bench-data
+
 volumes:
   minio-data:
   metadata-db-data:
+  benchmark-data:

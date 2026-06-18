@@ -4,7 +4,7 @@ set -euo pipefail
 cd "$(dirname "$0")/../.."
 
 input="${1:-data/test-3gb.arrow}"
-streams="${2:-${PUT_STREAMS:-4}}"
+streams="${2:-${PUT_STREAMS:-6}}"
 staging_prefix="${3:-${PUT_STAGING_PREFIX:-}}"
 file_size="${4:-${TARGET_FILE_SIZE:-512mb}}"
 profile="${5:-${PUT_PROFILE:-false}}"
