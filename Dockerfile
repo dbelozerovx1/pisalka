@@ -3,6 +3,7 @@ FROM rust:1.88.0-bookworm AS builder
 WORKDIR /app
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY src ./src
+COPY db ./db
 COPY benchmarks/tools ./benchmarks/tools
 RUN cargo build --release \
     --bin flight-server \

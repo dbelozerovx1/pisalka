@@ -3,15 +3,15 @@ use std::{
     pin::Pin,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
 };
 
 use arrow_array::RecordBatch;
 use arrow_flight::{
-    Action, ActionType, Criteria, Empty, FlightData, FlightDescriptor, FlightEndpoint, FlightInfo,
-    HandshakeRequest, HandshakeResponse, Location, PollInfo, PutResult, SchemaResult, Ticket,
+    Action, ActionType, Criteria, Empty, FlightData, FlightDescriptor, FlightInfo,
+    HandshakeRequest, HandshakeResponse, PollInfo, PutResult, SchemaResult, Ticket,
     error::FlightError, flight_service_server::FlightService,
 };
 use bytes::Bytes;
@@ -24,9 +24,8 @@ use parquet::{
     },
     file::properties::WriterProperties,
 };
-use serde::{Deserialize, Serialize};
 use tokio::{
-    sync::{OwnedSemaphorePermit, Semaphore, mpsc},
+    sync::{Semaphore, mpsc},
     task::JoinHandle,
     time::{Instant as TokioInstant, sleep, timeout},
 };
@@ -34,213 +33,95 @@ use tonic::{Request, Response, Status, Streaming};
 use tracing::{error, info};
 
 use crate::{
+    admission::{GuardedResponseStream, PutAdmission, ReadAdmission},
     config::{AppConfig, ParquetTuning},
     metadata_store::{MetadataStore, PutFileRecord, PutStreamCompleteRecord, PutStreamStartRecord},
-    util::{descriptor_to_object_key, normalize_object_key, path_from_key},
+    metrics::{MeasuredReadStream, WorkerMetrics},
+    put_model::{
+        DatasetPart, PartBatch, PartProfile, PartProfileSummary, PutContext, PutFileSummary,
+        PutOptions, PutProfile, PutSummary, WorkerPutSummary,
+    },
+    ticket::parse_read_ticket,
+    util::{descriptor_to_object_key, path_from_key},
+    worker_status::{WorkerCapacity, WorkerState, WorkerStatus},
 };
 
 type ResponseStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send + 'static>>;
 
 #[derive(Clone)]
-pub struct S3FlightService {
+pub struct WorkerFlightService {
     config: Arc<AppConfig>,
     store: Arc<dyn ObjectStore>,
     metadata_store: Option<Arc<MetadataStore>>,
     put_slots: Arc<Semaphore>,
+    read_slots: Arc<Semaphore>,
     upload_streams: Arc<Mutex<HashMap<String, usize>>>,
     active_put_streams: Arc<AtomicUsize>,
+    active_read_streams: Arc<AtomicUsize>,
+    draining: Arc<AtomicBool>,
+    metrics: Arc<WorkerMetrics>,
 }
 
-#[derive(Debug, Serialize)]
-struct PutSummary {
-    key: String,
-    worker: WorkerPutSummary,
-    mode: String,
-    rows: usize,
-    batches: usize,
-    parts: usize,
-    put_parallelism: usize,
-    client_input_file_bytes: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    flight_data_messages: Option<u64>,
-    flight_stream_bytes: u64,
-    parquet_object_bytes: Option<u64>,
-    files: Vec<PutFileSummary>,
-    target_file_size: Option<usize>,
-    elapsed_ms: u128,
-    compression: String,
-    multipart_part_size: usize,
-    multipart_max_concurrency: usize,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    profile: Option<PutProfile>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    part_profiles: Option<Vec<PartProfileSummary>>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct PutFileSummary {
-    key: String,
-    part_index: usize,
-    rows: usize,
-    batches: usize,
-    flight_stream_bytes: u64,
-    parquet_object_bytes: u64,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct WorkerPutSummary {
-    worker_id: String,
-    attempt_id: String,
-    upload_id: Option<String>,
-    stream_id: Option<String>,
-    staging_prefix: Option<String>,
-    admission_wait_ms: u128,
-    global_put_stream_limit: usize,
-    upload_put_stream_limit: Option<usize>,
-    active_put_streams_at_admit: usize,
-    upload_active_streams_at_admit: Option<usize>,
-    stream_budget_bytes: Option<u64>,
-}
-
-#[derive(Debug, Clone, Default, Serialize)]
-struct PutProfile {
-    total_server_ms: u128,
-    first_flight_data_message_ms: u128,
-    first_batch_receive_decode_ms: u128,
-    receive_decode_ms: u128,
-    enqueue_wait_ms: u128,
-    collect_writer_wait_ms: u128,
-    object_head_ms: u128,
-    writer_task_elapsed_ms_sum: u128,
-    writer_task_elapsed_ms_max: u128,
-    writer_task_idle_wait_ms_sum: u128,
-    writer_task_write_ms_sum: u128,
-    writer_task_write_ms_max: u128,
-    writer_task_flush_ms_sum: u128,
-    writer_task_close_ms_sum: u128,
-    writer_task_close_ms_max: u128,
-    writer_task_head_ms_sum: u128,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-struct PartProfile {
-    elapsed_ms: u128,
-    idle_wait_ms: u128,
-    write_ms: u128,
-    flush_ms: u128,
-    close_ms: u128,
-    head_ms: u128,
-}
-
-impl PartProfile {
-    fn is_empty(&self) -> bool {
-        self.elapsed_ms == 0
-            && self.idle_wait_ms == 0
-            && self.write_ms == 0
-            && self.flush_ms == 0
-            && self.close_ms == 0
-            && self.head_ms == 0
-    }
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct PartProfileSummary {
-    key: String,
-    part_index: usize,
-    rows: usize,
-    batches: usize,
-    flight_stream_bytes: u64,
-    parquet_object_bytes: u64,
-    profile: PartProfile,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct DatasetPart {
-    key: String,
-    #[serde(alias = "worker")]
-    part_index: usize,
-    rows: usize,
-    batches: usize,
-    #[serde(default)]
-    flight_stream_bytes: u64,
-    parquet_object_bytes: u64,
-    #[serde(default)]
-    #[serde(skip_serializing_if = "PartProfile::is_empty")]
-    profile: PartProfile,
-}
-
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
-struct PutOptions {
-    attempt_id: Option<String>,
-    upload_id: Option<String>,
-    stream_id: Option<String>,
-    staging_prefix: Option<String>,
-    max_upload_streams: Option<usize>,
-    max_stream_bytes: Option<u64>,
-    target_file_size: Option<usize>,
-    input_file_bytes: Option<u64>,
-    #[serde(default)]
-    profile: bool,
-}
-
-#[derive(Debug, Clone)]
-struct PutContext {
-    attempt_id: String,
-    upload_id: Option<String>,
-    stream_id: Option<String>,
-    staging_prefix: Option<String>,
-    upload_stream_limit: Option<usize>,
-    stream_budget_bytes: Option<u64>,
-}
-
-struct PutAdmission {
-    _permit: OwnedSemaphorePermit,
-    upload_id: Option<String>,
-    upload_streams: Arc<Mutex<HashMap<String, usize>>>,
-    active_put_streams: Arc<AtomicUsize>,
-}
-
-impl Drop for PutAdmission {
-    fn drop(&mut self) {
-        self.active_put_streams.fetch_sub(1, Ordering::Relaxed);
-
-        let Some(upload_id) = self.upload_id.as_ref() else {
-            return;
-        };
-
-        let mut upload_streams = self
-            .upload_streams
-            .lock()
-            .expect("upload stream slot tracker mutex poisoned");
-        match upload_streams.get_mut(upload_id) {
-            Some(active) if *active > 1 => *active -= 1,
-            Some(_) => {
-                upload_streams.remove(upload_id);
-            }
-            None => {}
-        }
-    }
-}
-
-struct PartBatch {
-    batch: RecordBatch,
-    flight_stream_bytes: u64,
-}
-
-impl S3FlightService {
+impl WorkerFlightService {
     pub fn new(
         config: AppConfig,
         store: Arc<dyn ObjectStore>,
-        metadata_store: Option<MetadataStore>,
+        metadata_store: Option<Arc<MetadataStore>>,
+        metrics: Arc<WorkerMetrics>,
     ) -> Self {
         let put_slots = Arc::new(Semaphore::new(config.worker.max_active_put_streams.max(1)));
+        let read_slots = Arc::new(Semaphore::new(config.worker.max_active_read_streams.max(1)));
+        let draining = Arc::new(AtomicBool::new(config.worker.draining));
         Self {
             config: Arc::new(config),
             store,
-            metadata_store: metadata_store.map(Arc::new),
+            metadata_store,
             put_slots,
+            read_slots,
             upload_streams: Arc::new(Mutex::new(HashMap::new())),
             active_put_streams: Arc::new(AtomicUsize::new(0)),
+            active_read_streams: Arc::new(AtomicUsize::new(0)),
+            draining,
+            metrics,
+        }
+    }
+
+    pub fn worker_status(&self) -> WorkerStatus {
+        let active_put = self.active_put_streams.load(Ordering::Relaxed);
+        let active_read = self.active_read_streams.load(Ordering::Relaxed);
+        let draining = self.draining.load(Ordering::Relaxed);
+
+        WorkerStatus {
+            worker_id: self.config.worker.worker_id.clone(),
+            flight_uri: self.config.worker.flight_uri.clone(),
+            state: if draining {
+                WorkerState::Draining
+            } else {
+                WorkerState::Active
+            },
+            draining,
+            put: WorkerCapacity {
+                limit: self.config.worker.max_active_put_streams,
+                active: active_put,
+                available: self
+                    .config
+                    .worker
+                    .max_active_put_streams
+                    .saturating_sub(active_put),
+                slot_wait_ms: self.config.worker.put_slot_wait_ms,
+            },
+            read: WorkerCapacity {
+                limit: self.config.worker.max_active_read_streams,
+                active: active_read,
+                available: self
+                    .config
+                    .worker
+                    .max_active_read_streams
+                    .saturating_sub(active_read),
+                slot_wait_ms: self.config.worker.read_slot_wait_ms,
+            },
+            heartbeat_interval_ms: self.config.worker.registry_heartbeat_interval_ms,
+            registry_ttl_ms: self.config.worker.registry_ttl_ms,
         }
     }
 
@@ -305,6 +186,12 @@ impl S3FlightService {
         &self,
         context: &PutContext,
     ) -> Result<(PutAdmission, WorkerPutSummary), Status> {
+        if self.draining.load(Ordering::Relaxed) {
+            return Err(Status::unavailable(
+                "worker is draining and rejects new DoPut streams",
+            ));
+        }
+
         let wait_started = Instant::now();
         let permit = if self.config.worker.put_slot_wait_ms == 0 {
             self.put_slots
@@ -366,6 +253,38 @@ impl S3FlightService {
         };
 
         Ok((admission, summary))
+    }
+
+    async fn admit_read(&self) -> Result<ReadAdmission, Status> {
+        if self.draining.load(Ordering::Relaxed) {
+            return Err(Status::unavailable(
+                "worker is draining and rejects new DoGet streams",
+            ));
+        }
+
+        let permit = if self.config.worker.read_slot_wait_ms == 0 {
+            self.read_slots
+                .clone()
+                .try_acquire_owned()
+                .map_err(|_| Status::resource_exhausted("DoGet worker has no free read slots"))?
+        } else {
+            timeout(
+                Duration::from_millis(self.config.worker.read_slot_wait_ms),
+                self.read_slots.clone().acquire_owned(),
+            )
+            .await
+            .map_err(|_| Status::resource_exhausted("timed out waiting for DoGet read slot"))?
+            .map_err(|err| Status::internal(err.to_string()))?
+        };
+
+        let active_read_streams_at_admit =
+            self.active_read_streams.fetch_add(1, Ordering::Relaxed) + 1;
+
+        Ok(ReadAdmission {
+            _permit: permit,
+            active_read_streams: self.active_read_streams.clone(),
+            active_read_streams_at_admit,
+        })
     }
 
     fn put_start_record(
@@ -988,7 +907,7 @@ impl S3FlightService {
 }
 
 #[tonic::async_trait]
-impl FlightService for S3FlightService {
+impl FlightService for WorkerFlightService {
     type HandshakeStream = ResponseStream<HandshakeResponse>;
     type ListFlightsStream = ResponseStream<FlightInfo>;
     type DoGetStream = ResponseStream<FlightData>;
@@ -1013,39 +932,11 @@ impl FlightService for S3FlightService {
 
     async fn get_flight_info(
         &self,
-        request: Request<FlightDescriptor>,
+        _request: Request<FlightDescriptor>,
     ) -> Result<Response<FlightInfo>, Status> {
-        let descriptor = request.into_inner();
-        let key = descriptor_to_object_key(Some(&descriptor));
-        let path = path_from_key(&key);
-        let meta = self
-            .store
-            .head(&path)
-            .await
-            .map_err(|err| Status::not_found(err.to_string()))?;
-        let total_bytes = meta.size as i64;
-
-        let ticket = Ticket {
-            ticket: Bytes::from(key),
-        };
-        let endpoint = FlightEndpoint {
-            ticket: Some(ticket),
-            location: vec![Location {
-                uri: "grpc+tcp://0.0.0.0:50051".to_owned(),
-            }],
-            expiration_time: None,
-            app_metadata: Bytes::new(),
-        };
-
-        Ok(Response::new(FlightInfo {
-            schema: Bytes::new(),
-            flight_descriptor: Some(descriptor),
-            endpoint: vec![endpoint],
-            total_records: -1,
-            total_bytes,
-            ordered: false,
-            app_metadata: Bytes::new(),
-        }))
+        Err(Status::unimplemented(
+            "GetFlightInfo is owned by the Java coordinator; worker only accepts direct DoPut/DoGet tickets",
+        ))
     }
 
     async fn poll_flight_info(
@@ -1066,37 +957,63 @@ impl FlightService for S3FlightService {
         &self,
         request: Request<Ticket>,
     ) -> Result<Response<Self::DoGetStream>, Status> {
-        let key = normalize_object_key(
-            std::str::from_utf8(&request.into_inner().ticket)
-                .map_err(|err| Status::invalid_argument(err.to_string()))?,
-        );
+        let started = Instant::now();
+        self.metrics.record_get_started();
 
-        let path = path_from_key(&key);
-        let meta = self
-            .store
-            .head(&path)
-            .await
-            .map_err(|err| Status::not_found(err.to_string()))?;
+        let result = async {
+            let ticket = parse_read_ticket(
+                &request.into_inner().ticket,
+                self.config.worker.require_structured_tickets,
+            )?;
+            let key = ticket.key;
 
-        let reader = ParquetObjectReader::new(self.store.clone(), path).with_file_size(meta.size);
-        let builder = ParquetRecordBatchStreamBuilder::new(reader)
-            .await
-            .map_err(status_from_anyhow)?;
-        let schema = builder.schema().clone();
-        let parquet_stream = builder
-            .with_batch_size(self.config.read_batch_size)
-            .build()
-            .map_err(status_from_anyhow)?
-            .map_err(|err| FlightError::ExternalError(Box::new(err)));
+            let path = path_from_key(&key);
+            let read_admission = self.admit_read().await?;
+            let meta = self
+                .store
+                .head(&path)
+                .await
+                .map_err(|err| Status::not_found(err.to_string()))?;
 
-        let flight_stream = arrow_flight::encode::FlightDataEncoderBuilder::new()
-            .with_schema(schema)
-            .with_max_flight_data_size(self.config.flight_data_chunk_size)
-            .build(parquet_stream)
-            .map(|result| result.map_err(status_from_flight_error));
+            let reader =
+                ParquetObjectReader::new(self.store.clone(), path).with_file_size(meta.size);
+            let builder = ParquetRecordBatchStreamBuilder::new(reader)
+                .await
+                .map_err(status_from_anyhow)?;
+            let schema = builder.schema().clone();
+            let parquet_stream = builder
+                .with_batch_size(self.config.read_batch_size)
+                .build()
+                .map_err(status_from_anyhow)?
+                .map_err(|err| FlightError::ExternalError(Box::new(err)));
 
-        info!(key = %key, bytes = meta.size, "DoGet streaming parquet object");
-        Ok(Response::new(Box::pin(flight_stream)))
+            let flight_stream = arrow_flight::encode::FlightDataEncoderBuilder::new()
+                .with_schema(schema)
+                .with_max_flight_data_size(self.config.flight_data_chunk_size)
+                .build(parquet_stream)
+                .map(|result| result.map_err(status_from_flight_error));
+            let measured_stream =
+                MeasuredReadStream::new(flight_stream, self.metrics.clone(), started, meta.size);
+
+            info!(
+                key = %key,
+                operation_id = ?ticket.operation_id,
+                bytes = meta.size,
+                active_read_streams_at_admit = read_admission.active_read_streams_at_admit,
+                "DoGet streaming parquet object"
+            );
+            Ok(Response::new(Box::pin(GuardedResponseStream {
+                inner: Box::pin(measured_stream),
+                _read_admission: read_admission,
+            }) as Self::DoGetStream))
+        }
+        .await;
+
+        if result.is_err() {
+            self.metrics.record_get_failed(started.elapsed());
+        }
+
+        result
     }
 
     async fn do_put(
@@ -1104,8 +1021,11 @@ impl FlightService for S3FlightService {
         request: Request<Streaming<FlightData>>,
     ) -> Result<Response<Self::DoPutStream>, Status> {
         let started = TokioInstant::now();
+        self.metrics.record_put_started();
         match self.write_put_stream(request).await {
             Ok(summary) => {
+                self.metrics
+                    .record_put_succeeded(started.elapsed(), &summary);
                 let metadata = serde_json::to_vec(&summary)
                     .map_err(|err| Status::internal(err.to_string()))?;
                 let result = PutResult {
@@ -1117,6 +1037,7 @@ impl FlightService for S3FlightService {
                 ))))
             }
             Err(status) => {
+                self.metrics.record_put_failed(started.elapsed());
                 error!(
                     elapsed_ms = started.elapsed().as_millis(),
                     error = %status,
@@ -1136,16 +1057,36 @@ impl FlightService for S3FlightService {
 
     async fn do_action(
         &self,
-        _request: Request<Action>,
+        request: Request<Action>,
     ) -> Result<Response<Self::DoActionStream>, Status> {
-        Err(Status::unimplemented("DoAction is not implemented"))
+        let action = request.into_inner();
+        match action.r#type.as_str() {
+            "worker.status" => {
+                let body = serde_json::to_vec(&self.worker_status())
+                    .map_err(|err| Status::internal(err.to_string()))?;
+                Ok(Response::new(Box::pin(stream::once(async move {
+                    Ok(arrow_flight::Result {
+                        body: Bytes::from(body),
+                    })
+                }))))
+            }
+            other => Err(Status::unimplemented(format!(
+                "unsupported worker action {other:?}"
+            ))),
+        }
     }
 
     async fn list_actions(
         &self,
         _request: Request<Empty>,
     ) -> Result<Response<Self::ListActionsStream>, Status> {
-        Ok(Response::new(Box::pin(stream::empty())))
+        Ok(Response::new(Box::pin(stream::iter(vec![Ok(
+            ActionType {
+                r#type: "worker.status".to_owned(),
+                description: "Return raw Parquet worker readiness and capacity snapshot as JSON"
+                    .to_owned(),
+            },
+        )]))))
     }
 }
 

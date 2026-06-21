@@ -1,11 +1,16 @@
-# Arrow Flight S3 MVP
+# Arrow Flight Raw Parquet Worker
 
-Rust Arrow Flight service focused on high-throughput `DoPut` into Parquet on S3-compatible storage. The local environment uses MinIO.
+Rust Arrow Flight data-plane worker focused on high-throughput raw Parquet reads and writes against S3-compatible storage. The Java coordinator owns planning, auth, Iceberg commits, and `GetFlightInfo`; this worker accepts direct `DoPut` and `DoGet` calls for already-planned physical files.
 
 ## Layout
 
-- `src/main.rs`: Flight server.
-- `src/flight_service.rs`: `DoPut` Arrow stream decode -> async Parquet writer -> S3, and `DoGet` Parquet -> Arrow Flight stream.
+- `src/main.rs`: data-plane worker server and worker-registry heartbeat.
+- `src/flight_service.rs`: direct `DoPut` Arrow stream decode -> async Parquet writer -> S3, and direct `DoGet` Parquet -> Arrow Flight stream.
+- `src/put_model.rs`: worker `DoPut` result/profile/file contracts returned to the coordinator.
+- `src/admission.rs`: read/write slot guards.
+- `src/ticket.rs`: worker `DoGet` ticket parser.
+- `src/metrics.rs`: low-overhead Prometheus text metrics endpoint.
+- `db/migrations/`: SQL DDL owned by the control plane/coordinator in production. Local Compose applies it with `metadata-migrate`.
 - `benchmarks/tools/`: benchmark/data-generation Rust binaries.
 - `benchmarks/tools/common/`: benchmark-only profiling/output helpers.
 - `benchmarks/scripts/`: benchmark shell entrypoints.
@@ -65,7 +70,6 @@ When profiling is enabled, the benchmark also prints client Arrow IPC source-rea
 - `profile.collect_writer_wait_ms`: time waiting for active part writers to finish when the parallelism limit is reached or at final drain.
 - `profile.writer_task_write_ms_sum` / `writer_task_write_ms_max`: total writer CPU/object-writer time across all part tasks, plus the slowest single writer.
 - `profile.writer_task_flush_ms_sum` and `writer_task_close_ms_sum`: Parquet flush/finalization and object upload close time.
-- `profile.manifest_put_ms`: manifest commit time for target-sized datasets.
 - `part_profiles`: per-output-file rows, batches, Parquet bytes, and writer timings.
 
 For very many output files, the client prints the first 16 part profiles by default. Override with:
@@ -130,6 +134,15 @@ Useful environment variables:
 - `PARQUET_FLUSH_THRESHOLD_BYTES=268435456`
 - `PUT_PARALLELISM=4`
 - `PUT_QUEUE_DEPTH=2`
+- `PUT_MAX_ACTIVE_STREAMS=16`
+- `READ_MAX_ACTIVE_STREAMS=16`
+- `READ_SLOT_WAIT_MS=30000`
+- `WORKER_FLIGHT_URI=http://127.0.0.1:50051`
+- `WORKER_REQUIRE_STRUCTURED_TICKETS=false`
+- `WORKER_HEARTBEAT_INTERVAL_MS=5000`
+- `WORKER_REGISTRY_TTL_MS=15000`
+- `METRICS_ENABLED=true`
+- `METRICS_ADDR=0.0.0.0:9090`
 - `S3_MULTIPART_PART_SIZE=67108864`
 - `S3_MULTIPART_MAX_CONCURRENCY=16`
 - `FLIGHT_MAX_MESSAGE_SIZE=268435456`
@@ -140,7 +153,25 @@ Useful environment variables:
 
 Defaults favor the fastest measured local write path: uncompressed Parquet, dictionary disabled, large Flight chunks, large gRPC message limits, 64 MiB S3 multipart uploads, and up to four active part writers when target-sized output is requested.
 
-Without `--file-size` / `TARGET_FILE_SIZE`, `DoPut` writes one Parquet object at the requested path. With a target file size, `DoPut` writes a logical dataset: ordered part files under `<name>.parts/` plus a manifest at `<name>.parquet.manifest.json`. `PUT_PARALLELISM` then controls the maximum number of active part writers. `DoGet` accepts the original logical path and streams the dataset back.
+Without `--file-size` / `TARGET_FILE_SIZE`, `DoPut` writes one Parquet object at the requested path. With a target file size, `DoPut` writes multiple ordered part files under `<name>.parts/` and returns the file list in the `DoPut` result and metadata DB. `PUT_PARALLELISM` controls the maximum number of active part writers. `DoGet` accepts a direct physical Parquet path ticket and streams that file back.
+
+The worker publishes readiness/capacity through the `worker_registry` table and the Arrow Flight `worker.status` action. `GetFlightInfo`, Iceberg snapshot choice, and table-level read planning are intentionally coordinator-owned.
+
+Metrics are exposed as Prometheus text at `http://127.0.0.1:9090/metrics`, with a cheap `/healthz` endpoint on the same listener. Metrics are intentionally low-cardinality and request-level only: no per-batch metrics, no object-path labels, and no upload-id labels. This keeps the hot path to a few atomic increments and one latency histogram update per completed operation.
+
+`DoGet` accepts direct worker tickets. For compatibility with local benchmarks, raw path tickets are allowed by default. For coordinator-driven environments, prefer structured JSON tickets and set `WORKER_REQUIRE_STRUCTURED_TICKETS=true`:
+
+```json
+{
+  "path": "table/date=2026-06-20/part-00000.parquet",
+  "operation_id": "read-123",
+  "expires_at_ms": 1781971200000
+}
+```
+
+This is a routing/expiry contract, not cryptographic authorization yet. Signed tickets or mTLS-bound tickets should be the next production hardening step.
+
+Worker metadata DDL lives in `db/migrations/0001_worker_metadata.sql`. The worker can still run this migration for local experiments with `METADATA_DB_AUTO_MIGRATE=true`, but the default is `false`; production should apply migrations from the coordinator/control-plane release process.
 
 For real S3 over a slower link, try `PARQUET_COMPRESSION=lz4_raw` or `snappy`, and benchmark `TARGET_FILE_SIZE`, `PUT_PARALLELISM`, `S3_MULTIPART_PART_SIZE`, and `S3_MULTIPART_MAX_CONCURRENCY` as a set.
 

@@ -1,7 +1,7 @@
 use std::time::Instant;
 
 use anyhow::Result;
-use arrow_flight::{FlightClient, FlightDescriptor, Ticket};
+use arrow_flight::{FlightClient, Ticket};
 use bytes::Bytes;
 use clap::Parser;
 use futures::TryStreamExt;
@@ -37,14 +37,6 @@ async fn main() -> Result<()> {
     let ticket = Ticket {
         ticket: Bytes::from(args.path.clone()),
     };
-    let info = client
-        .get_flight_info(FlightDescriptor::new_path(vec![args.path.clone()]))
-        .await
-        .ok();
-    let source_object_bytes = info
-        .as_ref()
-        .and_then(|info| (info.total_bytes > 0).then_some(info.total_bytes as u64));
-
     let started = Instant::now();
     let mut stream = client.do_get(ticket).await?;
 
@@ -62,10 +54,6 @@ async fn main() -> Result<()> {
     println!("path={}", args.path);
     println!("rows={rows}");
     println!("batches={batches}");
-    if let Some(source_object_bytes) = source_object_bytes {
-        println!("source_object_bytes={source_object_bytes}");
-        println!("source_object_size={}", pretty_bytes(source_object_bytes));
-    }
     println!("arrow_memory_bytes_estimate={arrow_memory_bytes_estimate}");
     println!(
         "arrow_memory_size_estimate={}",
@@ -74,10 +62,7 @@ async fn main() -> Result<()> {
     println!("elapsed_ms={}", elapsed.as_millis());
     println!(
         "throughput={}",
-        throughput(
-            source_object_bytes.unwrap_or(arrow_memory_bytes_estimate),
-            elapsed
-        )
+        throughput(arrow_memory_bytes_estimate, elapsed)
     );
 
     Ok(())

@@ -10,6 +10,7 @@ pub struct AppConfig {
     pub parquet: ParquetTuning,
     pub worker: WorkerConfig,
     pub metadata: MetadataConfig,
+    pub metrics: MetricsConfig,
     pub flight_max_message_size: usize,
     pub flight_data_chunk_size: usize,
     pub read_batch_size: usize,
@@ -50,18 +51,31 @@ pub struct ParquetTuning {
 #[derive(Debug, Clone)]
 pub struct WorkerConfig {
     pub worker_id: String,
+    pub flight_uri: String,
+    pub draining: bool,
     pub max_active_put_streams: usize,
     pub max_put_streams_per_upload: usize,
     pub put_slot_wait_ms: u64,
     pub put_first_batch_timeout_ms: u64,
     pub max_put_stream_bytes: Option<u64>,
     pub require_staging_prefix: bool,
+    pub max_active_read_streams: usize,
+    pub read_slot_wait_ms: u64,
+    pub require_structured_tickets: bool,
+    pub registry_heartbeat_interval_ms: u64,
+    pub registry_ttl_ms: u64,
 }
 
 #[derive(Debug, Clone)]
 pub struct MetadataConfig {
     pub database_url: Option<String>,
     pub auto_migrate: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct MetricsConfig {
+    pub enabled: bool,
+    pub addr: SocketAddr,
 }
 
 impl AppConfig {
@@ -76,6 +90,7 @@ impl AppConfig {
             parquet: ParquetTuning::from_env()?,
             worker: WorkerConfig::from_env()?,
             metadata: MetadataConfig::from_env(),
+            metrics: MetricsConfig::from_env()?,
             flight_max_message_size: env_usize("FLIGHT_MAX_MESSAGE_SIZE", 256 * 1024 * 1024)?,
             flight_data_chunk_size: env_usize("FLIGHT_DATA_CHUNK_SIZE", 16 * 1024 * 1024)?,
             read_batch_size: env_usize("READ_BATCH_SIZE", 65_536)?,
@@ -131,12 +146,20 @@ impl WorkerConfig {
     pub fn from_env() -> Result<Self> {
         Ok(Self {
             worker_id: env_string("WORKER_ID", "local-worker"),
+            flight_uri: env_string("WORKER_FLIGHT_URI", "http://127.0.0.1:50051"),
+            draining: env_bool("WORKER_DRAINING", false),
             max_active_put_streams: env_usize("PUT_MAX_ACTIVE_STREAMS", 16)?.max(1),
             max_put_streams_per_upload: env_usize("PUT_MAX_STREAMS_PER_UPLOAD", 8)?.max(1),
             put_slot_wait_ms: env_usize("PUT_SLOT_WAIT_MS", 30_000)? as u64,
             put_first_batch_timeout_ms: env_usize("PUT_FIRST_BATCH_TIMEOUT_MS", 10_000)? as u64,
             max_put_stream_bytes: env_optional_u64("PUT_MAX_STREAM_BYTES")?,
             require_staging_prefix: env_bool("PUT_REQUIRE_STAGING_PREFIX", false),
+            max_active_read_streams: env_usize("READ_MAX_ACTIVE_STREAMS", 16)?.max(1),
+            read_slot_wait_ms: env_usize("READ_SLOT_WAIT_MS", 30_000)? as u64,
+            require_structured_tickets: env_bool("WORKER_REQUIRE_STRUCTURED_TICKETS", false),
+            registry_heartbeat_interval_ms: env_usize("WORKER_HEARTBEAT_INTERVAL_MS", 5_000)?
+                as u64,
+            registry_ttl_ms: env_usize("WORKER_REGISTRY_TTL_MS", 15_000)? as u64,
         })
     }
 }
@@ -145,8 +168,21 @@ impl MetadataConfig {
     pub fn from_env() -> Self {
         Self {
             database_url: env_optional_string("METADATA_DATABASE_URL"),
-            auto_migrate: env_bool("METADATA_DB_AUTO_MIGRATE", true),
+            auto_migrate: env_bool("METADATA_DB_AUTO_MIGRATE", false),
         }
+    }
+}
+
+impl MetricsConfig {
+    pub fn from_env() -> Result<Self> {
+        let addr = env_string("METRICS_ADDR", "0.0.0.0:9090")
+            .parse::<SocketAddr>()
+            .context("METRICS_ADDR must be a socket address such as 0.0.0.0:9090")?;
+
+        Ok(Self {
+            enabled: env_bool("METRICS_ENABLED", true),
+            addr,
+        })
     }
 }
 

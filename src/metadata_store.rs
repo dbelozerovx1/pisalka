@@ -3,7 +3,9 @@ use serde_json::Value;
 use tokio_postgres::{Client, NoTls};
 use tracing::error;
 
-use crate::config::MetadataConfig;
+use crate::{config::MetadataConfig, worker_status::WorkerStatus};
+
+const WORKER_METADATA_MIGRATION: &str = include_str!("../db/migrations/0001_worker_metadata.sql");
 
 pub struct MetadataStore {
     client: Client,
@@ -84,72 +86,7 @@ impl MetadataStore {
 
     pub async fn migrate(&self) -> Result<()> {
         self.client
-            .batch_execute(
-                r#"
-CREATE TABLE IF NOT EXISTS worker_put_streams (
-    attempt_id TEXT PRIMARY KEY,
-    upload_id TEXT,
-    stream_id TEXT,
-    worker_id TEXT NOT NULL,
-    object_key TEXT NOT NULL,
-    status TEXT NOT NULL,
-    mode TEXT,
-    staging_prefix TEXT,
-    target_file_size BIGINT,
-    client_input_file_bytes BIGINT,
-    stream_budget_bytes BIGINT,
-    global_put_stream_limit INTEGER NOT NULL,
-    upload_put_stream_limit INTEGER,
-    active_put_streams_at_admit INTEGER,
-    upload_active_streams_at_admit INTEGER,
-    compression TEXT NOT NULL,
-    multipart_part_size BIGINT NOT NULL,
-    multipart_max_concurrency INTEGER NOT NULL,
-    rows BIGINT NOT NULL DEFAULT 0,
-    batches BIGINT NOT NULL DEFAULT 0,
-    parts INTEGER NOT NULL DEFAULT 0,
-    flight_stream_bytes BIGINT NOT NULL DEFAULT 0,
-    parquet_object_bytes BIGINT,
-    elapsed_ms BIGINT,
-    error_message TEXT,
-    put_result_json JSONB,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    completed_at TIMESTAMPTZ
-);
-
-CREATE INDEX IF NOT EXISTS worker_put_streams_upload_status_idx
-    ON worker_put_streams (upload_id, status, updated_at DESC);
-
-CREATE INDEX IF NOT EXISTS worker_put_streams_upload_stream_idx
-    ON worker_put_streams (upload_id, stream_id, updated_at DESC);
-
-CREATE INDEX IF NOT EXISTS worker_put_streams_status_idx
-    ON worker_put_streams (status, updated_at DESC);
-
-CREATE TABLE IF NOT EXISTS worker_put_files (
-    attempt_id TEXT NOT NULL REFERENCES worker_put_streams(attempt_id) ON DELETE CASCADE,
-    upload_id TEXT,
-    stream_id TEXT,
-    worker_id TEXT NOT NULL,
-    logical_key TEXT NOT NULL,
-    part_index INTEGER NOT NULL,
-    file_path TEXT NOT NULL,
-    rows BIGINT NOT NULL,
-    batches BIGINT NOT NULL,
-    flight_stream_bytes BIGINT NOT NULL,
-    parquet_object_bytes BIGINT NOT NULL,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    PRIMARY KEY (attempt_id, part_index)
-);
-
-CREATE INDEX IF NOT EXISTS worker_put_files_upload_idx
-    ON worker_put_files (upload_id, stream_id, part_index);
-
-CREATE INDEX IF NOT EXISTS worker_put_files_path_idx
-    ON worker_put_files (file_path);
-"#,
-            )
+            .batch_execute(WORKER_METADATA_MIGRATION)
             .await
             .context("failed to migrate metadata database")?;
 
@@ -483,4 +420,76 @@ WHERE attempt_id = $1
 
         Ok(updated)
     }
+
+    pub async fn record_worker_heartbeat(&self, status: &WorkerStatus) -> Result<()> {
+        let status_json =
+            serde_json::to_value(status).context("failed to serialize worker heartbeat")?;
+
+        self.client
+            .execute(
+                r#"
+INSERT INTO worker_registry (
+    worker_id,
+    flight_uri,
+    state,
+    draining,
+    put_limit,
+    active_put_streams,
+    available_put_streams,
+    read_limit,
+    active_read_streams,
+    available_read_streams,
+    heartbeat_interval_ms,
+    registry_ttl_ms,
+    status_json,
+    last_heartbeat_at
+) VALUES (
+    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, now()
+)
+ON CONFLICT (worker_id) DO UPDATE SET
+    flight_uri = EXCLUDED.flight_uri,
+    state = EXCLUDED.state,
+    draining = EXCLUDED.draining,
+    put_limit = EXCLUDED.put_limit,
+    active_put_streams = EXCLUDED.active_put_streams,
+    available_put_streams = EXCLUDED.available_put_streams,
+    read_limit = EXCLUDED.read_limit,
+    active_read_streams = EXCLUDED.active_read_streams,
+    available_read_streams = EXCLUDED.available_read_streams,
+    heartbeat_interval_ms = EXCLUDED.heartbeat_interval_ms,
+    registry_ttl_ms = EXCLUDED.registry_ttl_ms,
+    status_json = EXCLUDED.status_json,
+    last_heartbeat_at = now()
+"#,
+                &[
+                    &status.worker_id,
+                    &status.flight_uri,
+                    &status.state.as_str(),
+                    &status.draining,
+                    &usize_to_i32(status.put.limit),
+                    &usize_to_i32(status.put.active),
+                    &usize_to_i32(status.put.available),
+                    &usize_to_i32(status.read.limit),
+                    &usize_to_i32(status.read.active),
+                    &usize_to_i32(status.read.available),
+                    &u64_to_i64(status.heartbeat_interval_ms),
+                    &u64_to_i64(status.registry_ttl_ms),
+                    &status_json,
+                ],
+            )
+            .await
+            .with_context(|| {
+                format!("failed to record worker heartbeat for {}", status.worker_id)
+            })?;
+
+        Ok(())
+    }
+}
+
+fn usize_to_i32(value: usize) -> i32 {
+    value.min(i32::MAX as usize) as i32
+}
+
+fn u64_to_i64(value: u64) -> i64 {
+    value.min(i64::MAX as u64) as i64
 }

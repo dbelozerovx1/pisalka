@@ -38,6 +38,23 @@ services:
       timeout: 5s
       retries: 20
 
+  metadata-migrate:
+    image: postgres:16-alpine
+    depends_on:
+      metadata-db:
+        condition: service_healthy
+    environment:
+      PGPASSWORD: flight
+    volumes:
+      - ./db/migrations:/migrations:ro
+    entrypoint: >
+      /bin/sh -c "
+      for migration in /migrations/*.sql; do
+        echo applying $$migration;
+        psql -h metadata-db -U flight -d flight_metadata -v ON_ERROR_STOP=1 -f $$migration;
+      done;
+      "
+
   flight-server:
     build:
       context: .
@@ -47,9 +64,13 @@ services:
         condition: service_completed_successfully
       metadata-db:
         condition: service_healthy
+      metadata-migrate:
+        condition: service_completed_successfully
     environment:
       RUST_LOG: info
       FLIGHT_ADDR: 0.0.0.0:50051
+      METRICS_ENABLED: "${METRICS_ENABLED:-true}"
+      METRICS_ADDR: "${METRICS_ADDR:-0.0.0.0:9090}"
       S3_ENDPOINT: http://minio:9000
       S3_BUCKET: arrow-flight
       S3_REGION: us-east-1
@@ -64,6 +85,11 @@ services:
       S3_MULTIPART_PART_SIZE: "${S3_MULTIPART_PART_SIZE:-67108864}"
       S3_MULTIPART_MAX_CONCURRENCY: "${S3_MULTIPART_MAX_CONCURRENCY:-16}"
       WORKER_ID: "${WORKER_ID:-local-worker}"
+      WORKER_FLIGHT_URI: "${WORKER_FLIGHT_URI:-http://127.0.0.1:50051}"
+      WORKER_DRAINING: "${WORKER_DRAINING:-false}"
+      WORKER_REQUIRE_STRUCTURED_TICKETS: "${WORKER_REQUIRE_STRUCTURED_TICKETS:-false}"
+      WORKER_HEARTBEAT_INTERVAL_MS: "${WORKER_HEARTBEAT_INTERVAL_MS:-5000}"
+      WORKER_REGISTRY_TTL_MS: "${WORKER_REGISTRY_TTL_MS:-15000}"
       PUT_MAX_ACTIVE_STREAMS: "${PUT_MAX_ACTIVE_STREAMS:-16}"
       PUT_MAX_STREAMS_PER_UPLOAD: "${PUT_MAX_STREAMS_PER_UPLOAD:-8}"
       PUT_SLOT_WAIT_MS: "${PUT_SLOT_WAIT_MS:-30000}"
@@ -71,13 +97,16 @@ services:
       PUT_MAX_STREAM_BYTES: "${PUT_MAX_STREAM_BYTES:-}"
       PUT_REQUIRE_STAGING_PREFIX: "${PUT_REQUIRE_STAGING_PREFIX:-false}"
       METADATA_DATABASE_URL: "${METADATA_DATABASE_URL:-postgres://flight:flight@metadata-db:5432/flight_metadata}"
-      METADATA_DB_AUTO_MIGRATE: "${METADATA_DB_AUTO_MIGRATE:-true}"
+      METADATA_DB_AUTO_MIGRATE: "${METADATA_DB_AUTO_MIGRATE:-false}"
       PUT_PARALLELISM: "${PUT_PARALLELISM:-4}"
       PUT_QUEUE_DEPTH: "${PUT_QUEUE_DEPTH:-2}"
+      READ_MAX_ACTIVE_STREAMS: "${READ_MAX_ACTIVE_STREAMS:-16}"
+      READ_SLOT_WAIT_MS: "${READ_SLOT_WAIT_MS:-30000}"
       FLIGHT_MAX_MESSAGE_SIZE: "${FLIGHT_MAX_MESSAGE_SIZE:-268435456}"
       FLIGHT_DATA_CHUNK_SIZE: "${FLIGHT_DATA_CHUNK_SIZE:-16777216}"
     ports:
       - "50051:50051"
+      - "9090:9090"
 
   bench:
     profiles:
