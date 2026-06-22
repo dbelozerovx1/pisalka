@@ -7,7 +7,8 @@ Rust Arrow Flight data-plane worker focused on high-throughput raw Parquet reads
 - `src/main.rs`: data-plane worker server and worker-registry heartbeat.
 - `src/flight_service.rs`: direct `DoPut` Arrow stream decode -> async Parquet writer -> S3, and direct `DoGet` Parquet -> Arrow Flight stream.
 - `src/put_model.rs`: worker `DoPut` result/profile/file contracts returned to the coordinator.
-- `src/admission.rs`: read/write slot guards.
+- `src/admission.rs`: read/write admission guards.
+- `src/resource.rs`: weighted memory-budget limiter used by admission and scheduler signals.
 - `src/ticket.rs`: worker `DoGet` ticket parser.
 - `src/metrics.rs`: low-overhead Prometheus text metrics endpoint.
 - `db/migrations/`: SQL DDL owned by the control plane/coordinator in production. Local Compose applies it with `metadata-migrate`.
@@ -135,8 +136,24 @@ Useful environment variables:
 - `PUT_PARALLELISM=4`
 - `PUT_QUEUE_DEPTH=2`
 - `PUT_MAX_ACTIVE_STREAMS=16`
+- `PUT_MAX_STREAMS_PER_UPLOAD=8`
+- `PUT_SCHEDULER_RESERVED_SLOTS=0`
+- `WORKER_MEMORY_BYTES=` detected from cgroup when possible, otherwise 16 GiB fallback
+- `WORKER_RESERVED_MEMORY_BYTES=` reserved process/system headroom, otherwise max(512 MiB, 20%)
+- `PUT_MEMORY_PERCENT=55`
+- `PUT_MEMORY_BUDGET_BYTES=` explicit write memory pool override
+- `PUT_MAX_STREAM_MEMORY_BYTES=` per admitted DoPut memory charge
+- `PUT_MAX_RECORD_BATCH_BYTES=` max decoded DoPut batch memory estimate
+- `READ_MEMORY_PERCENT=30`
+- `READ_MEMORY_BUDGET_BYTES=` explicit read memory pool override
+- `READ_MAX_STREAM_MEMORY_BYTES=` per admitted DoGet memory charge
+- `READ_MAX_RECORD_BATCH_BYTES=` max decoded DoGet batch memory estimate
+- `READ_MAX_BATCH_ROWS=1048576`
 - `READ_MAX_ACTIVE_STREAMS=16`
+- `READ_MAX_STREAMS_PER_OPERATION=8`
+- `READ_SCHEDULER_RESERVED_SLOTS=0`
 - `READ_SLOT_WAIT_MS=30000`
+- `WORKER_ZONE=` optional coordinator locality hint
 - `WORKER_FLIGHT_URI=http://127.0.0.1:50051`
 - `WORKER_REQUIRE_STRUCTURED_TICKETS=false`
 - `WORKER_HEARTBEAT_INTERVAL_MS=5000`
@@ -155,7 +172,96 @@ Defaults favor the fastest measured local write path: uncompressed Parquet, dict
 
 Without `--file-size` / `TARGET_FILE_SIZE`, `DoPut` writes one Parquet object at the requested path. With a target file size, `DoPut` writes multiple ordered part files under `<name>.parts/` and returns the file list in the `DoPut` result and metadata DB. `PUT_PARALLELISM` controls the maximum number of active part writers. `DoGet` accepts a direct physical Parquet path ticket and streams that file back.
 
-The worker publishes readiness/capacity through the `worker_registry` table and the Arrow Flight `worker.status` action. `GetFlightInfo`, Iceberg snapshot choice, and table-level read planning are intentionally coordinator-owned.
+The worker publishes readiness/capacity through the `worker_registry` table and the Arrow Flight `worker.status` / `worker.scheduler.v1` actions. `GetFlightInfo`, Iceberg snapshot choice, and table-level read planning are intentionally coordinator-owned.
+
+Worker admission is resource-derived first, with slots kept as a coarse CPU/task safety rail. The worker detects or receives its memory flavor, reserves headroom, splits the remaining budget between write and read pools, and charges every admitted stream a configurable memory budget. The coordinator-facing grant for a worker is effectively:
+
+```text
+worker_recommended_streams = min(
+  active_slot_limit - active_streams - reserved_slots,
+  memory_available_bytes / max_stream_memory_bytes,
+  max_streams_per_operation
+)
+```
+
+`FLIGHT_MAX_MESSAGE_SIZE` caps individual gRPC messages before decode. `PUT_MAX_RECORD_BATCH_BYTES` and `READ_MAX_RECORD_BATCH_BYTES` reject decoded Arrow batches that exceed the worker flavor budget. This is the Rust-side equivalent of allocator discipline in Java Arrow: there is no shared `BufferAllocator` tree here, so admission, frame limits, batch limits, backpressure, and worker-level budgets are the control points.
+
+The coordinator should not ask users for table or upload size. For `DoPut`, grant streams from client capability, tenant quota, and live worker recommendations:
+
+```text
+granted_put_streams = min(
+  client_parallel_write_cap,
+  tenant_put_limit,
+  sum(worker.scheduler.put.recommended_streams),
+  upload_session_cap
+)
+```
+
+For `DoGet`, the coordinator should group known parquet files into read fragments first, then cap by client/tenant/worker capacity:
+
+```text
+granted_get_tickets = min(
+  read_fragments,
+  client_parallel_read_cap,
+  tenant_read_limit,
+  sum(worker.scheduler.read.recommended_streams)
+)
+```
+
+Each worker computes `recommended_streams` from current available slots, reserved slots, current free memory budget, and per-operation caps. `selection_score`, utilization, EWMA admission wait, EWMA duration, EWMA throughput, and failure/rejection counters are included so the coordinator can use power-of-two choices or weighted selection instead of HAProxy round-robin. The worker remains the final admission authority and can still return `RESOURCE_EXHAUSTED` when its state changes between ticket creation and stream open.
+
+Coordinator-facing worker status shape:
+
+```json
+{
+  "worker_id": "local-worker",
+  "flight_uri": "http://127.0.0.1:50051",
+  "locality": { "zone": null },
+  "state": "ACTIVE",
+  "put": { "limit": 16, "active": 0, "available": 16, "slot_wait_ms": 30000 },
+  "read": { "limit": 16, "active": 0, "available": 16, "slot_wait_ms": 30000 },
+  "resources": {
+    "worker_memory_bytes": 17179869184,
+    "reserved_memory_bytes": 3435973836,
+    "put": {
+      "limit_bytes": 7559184384,
+      "active_bytes": 0,
+      "available_bytes": 7559184384,
+      "max_stream_memory_bytes": 944892805,
+      "max_record_batch_bytes": 268435456,
+      "max_batch_rows": null
+    },
+    "read": {
+      "limit_bytes": 4123168604,
+      "active_bytes": 0,
+      "available_bytes": 4123168604,
+      "max_stream_memory_bytes": 515396075,
+      "max_record_batch_bytes": 134217728,
+      "max_batch_rows": 1048576
+    }
+  },
+  "scheduler": {
+    "put": {
+      "recommended_streams": 8,
+      "max_streams_per_operation": 8,
+      "soft_available_slots": 8,
+      "memory_available_streams": 8,
+      "utilization_per_mille": 0,
+      "selection_score": 5000
+    },
+    "read": {
+      "recommended_streams": 8,
+      "max_streams_per_operation": 8,
+      "soft_available_slots": 8,
+      "memory_available_streams": 8,
+      "utilization_per_mille": 0,
+      "selection_score": 5000
+    }
+  }
+}
+```
+
+The same scheduler fields are persisted into `worker_registry` as columns for simple SQL filtering and ordering, while the full payload is kept in `status_json`.
 
 Metrics are exposed as Prometheus text at `http://127.0.0.1:9090/metrics`, with a cheap `/healthz` endpoint on the same listener. Metrics are intentionally low-cardinality and request-level only: no per-batch metrics, no object-path labels, and no upload-id labels. This keeps the hot path to a few atomic increments and one latency histogram update per completed operation.
 

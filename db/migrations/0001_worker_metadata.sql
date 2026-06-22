@@ -64,14 +64,49 @@ CREATE INDEX IF NOT EXISTS worker_put_files_path_idx
 CREATE TABLE IF NOT EXISTS worker_registry (
     worker_id TEXT PRIMARY KEY,
     flight_uri TEXT NOT NULL,
+    worker_zone TEXT,
     state TEXT NOT NULL,
     draining BOOLEAN NOT NULL,
     put_limit INTEGER NOT NULL,
     active_put_streams INTEGER NOT NULL,
     available_put_streams INTEGER NOT NULL,
+    put_recommended_streams INTEGER NOT NULL DEFAULT 0,
+    put_soft_available_slots INTEGER NOT NULL DEFAULT 0,
+    put_memory_available_streams INTEGER NOT NULL DEFAULT 0,
+    put_utilization_per_mille INTEGER NOT NULL DEFAULT 0,
+    put_selection_score BIGINT NOT NULL DEFAULT 0,
+    put_admission_wait_ms_ewma BIGINT NOT NULL DEFAULT 0,
+    put_throughput_bytes_per_sec_ewma BIGINT NOT NULL DEFAULT 0,
+    put_succeeded_total BIGINT NOT NULL DEFAULT 0,
+    put_failed_total BIGINT NOT NULL DEFAULT 0,
+    put_rejected_total BIGINT NOT NULL DEFAULT 0,
     read_limit INTEGER NOT NULL,
     active_read_streams INTEGER NOT NULL,
     available_read_streams INTEGER NOT NULL,
+    read_recommended_streams INTEGER NOT NULL DEFAULT 0,
+    read_soft_available_slots INTEGER NOT NULL DEFAULT 0,
+    read_memory_available_streams INTEGER NOT NULL DEFAULT 0,
+    read_utilization_per_mille INTEGER NOT NULL DEFAULT 0,
+    read_selection_score BIGINT NOT NULL DEFAULT 0,
+    read_admission_wait_ms_ewma BIGINT NOT NULL DEFAULT 0,
+    read_throughput_bytes_per_sec_ewma BIGINT NOT NULL DEFAULT 0,
+    read_succeeded_total BIGINT NOT NULL DEFAULT 0,
+    read_failed_total BIGINT NOT NULL DEFAULT 0,
+    read_rejected_total BIGINT NOT NULL DEFAULT 0,
+    read_cancelled_total BIGINT NOT NULL DEFAULT 0,
+    worker_memory_bytes BIGINT NOT NULL DEFAULT 0,
+    reserved_memory_bytes BIGINT NOT NULL DEFAULT 0,
+    put_memory_limit_bytes BIGINT NOT NULL DEFAULT 0,
+    put_memory_active_bytes BIGINT NOT NULL DEFAULT 0,
+    put_memory_available_bytes BIGINT NOT NULL DEFAULT 0,
+    put_max_stream_memory_bytes BIGINT NOT NULL DEFAULT 0,
+    put_max_record_batch_bytes BIGINT NOT NULL DEFAULT 0,
+    read_memory_limit_bytes BIGINT NOT NULL DEFAULT 0,
+    read_memory_active_bytes BIGINT NOT NULL DEFAULT 0,
+    read_memory_available_bytes BIGINT NOT NULL DEFAULT 0,
+    read_max_stream_memory_bytes BIGINT NOT NULL DEFAULT 0,
+    read_max_record_batch_bytes BIGINT NOT NULL DEFAULT 0,
+    read_max_batch_rows INTEGER NOT NULL DEFAULT 0,
     heartbeat_interval_ms BIGINT NOT NULL,
     registry_ttl_ms BIGINT NOT NULL,
     status_json JSONB NOT NULL,
@@ -82,3 +117,44 @@ CREATE TABLE IF NOT EXISTS worker_registry (
 CREATE INDEX IF NOT EXISTS worker_registry_state_heartbeat_idx
     ON worker_registry (state, last_heartbeat_at DESC);
 
+ALTER TABLE worker_registry ADD COLUMN IF NOT EXISTS worker_zone TEXT;
+ALTER TABLE worker_registry ADD COLUMN IF NOT EXISTS put_recommended_streams INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE worker_registry ADD COLUMN IF NOT EXISTS put_soft_available_slots INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE worker_registry ADD COLUMN IF NOT EXISTS put_memory_available_streams INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE worker_registry ADD COLUMN IF NOT EXISTS put_utilization_per_mille INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE worker_registry ADD COLUMN IF NOT EXISTS put_selection_score BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE worker_registry ADD COLUMN IF NOT EXISTS put_admission_wait_ms_ewma BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE worker_registry ADD COLUMN IF NOT EXISTS put_throughput_bytes_per_sec_ewma BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE worker_registry ADD COLUMN IF NOT EXISTS put_succeeded_total BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE worker_registry ADD COLUMN IF NOT EXISTS put_failed_total BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE worker_registry ADD COLUMN IF NOT EXISTS put_rejected_total BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE worker_registry ADD COLUMN IF NOT EXISTS read_recommended_streams INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE worker_registry ADD COLUMN IF NOT EXISTS read_soft_available_slots INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE worker_registry ADD COLUMN IF NOT EXISTS read_memory_available_streams INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE worker_registry ADD COLUMN IF NOT EXISTS read_utilization_per_mille INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE worker_registry ADD COLUMN IF NOT EXISTS read_selection_score BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE worker_registry ADD COLUMN IF NOT EXISTS read_admission_wait_ms_ewma BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE worker_registry ADD COLUMN IF NOT EXISTS read_throughput_bytes_per_sec_ewma BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE worker_registry ADD COLUMN IF NOT EXISTS read_succeeded_total BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE worker_registry ADD COLUMN IF NOT EXISTS read_failed_total BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE worker_registry ADD COLUMN IF NOT EXISTS read_rejected_total BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE worker_registry ADD COLUMN IF NOT EXISTS read_cancelled_total BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE worker_registry ADD COLUMN IF NOT EXISTS worker_memory_bytes BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE worker_registry ADD COLUMN IF NOT EXISTS reserved_memory_bytes BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE worker_registry ADD COLUMN IF NOT EXISTS put_memory_limit_bytes BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE worker_registry ADD COLUMN IF NOT EXISTS put_memory_active_bytes BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE worker_registry ADD COLUMN IF NOT EXISTS put_memory_available_bytes BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE worker_registry ADD COLUMN IF NOT EXISTS put_max_stream_memory_bytes BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE worker_registry ADD COLUMN IF NOT EXISTS put_max_record_batch_bytes BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE worker_registry ADD COLUMN IF NOT EXISTS read_memory_limit_bytes BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE worker_registry ADD COLUMN IF NOT EXISTS read_memory_active_bytes BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE worker_registry ADD COLUMN IF NOT EXISTS read_memory_available_bytes BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE worker_registry ADD COLUMN IF NOT EXISTS read_max_stream_memory_bytes BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE worker_registry ADD COLUMN IF NOT EXISTS read_max_record_batch_bytes BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE worker_registry ADD COLUMN IF NOT EXISTS read_max_batch_rows INTEGER NOT NULL DEFAULT 0;
+
+CREATE INDEX IF NOT EXISTS worker_registry_put_scheduler_idx
+    ON worker_registry (state, draining, put_recommended_streams DESC, put_selection_score DESC, last_heartbeat_at DESC);
+
+CREATE INDEX IF NOT EXISTS worker_registry_read_scheduler_idx
+    ON worker_registry (state, draining, read_recommended_streams DESC, read_selection_score DESC, last_heartbeat_at DESC);

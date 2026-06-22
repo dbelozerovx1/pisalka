@@ -20,7 +20,9 @@ use tracing::{error, info};
 use crate::{
     config::MetricsConfig,
     put_model::PutSummary,
-    worker_status::{WorkerState, WorkerStatus},
+    worker_status::{
+        PutRuntimeStatus, ReadRuntimeStatus, WorkerRuntimeStatus, WorkerState, WorkerStatus,
+    },
 };
 
 const DURATION_BUCKET_MS: [u64; 15] = [
@@ -33,18 +35,24 @@ pub struct WorkerMetrics {
     put_started: AtomicU64,
     put_succeeded: AtomicU64,
     put_failed: AtomicU64,
+    put_rejected: AtomicU64,
     put_rows: AtomicU64,
     put_batches: AtomicU64,
     put_files: AtomicU64,
     put_flight_stream_bytes: AtomicU64,
     put_parquet_object_bytes: AtomicU64,
     put_duration: DurationHistogram,
+    put_admission_wait_ms: Ewma,
+    put_throughput_bytes_per_sec: Ewma,
     get_started: AtomicU64,
     get_succeeded: AtomicU64,
     get_failed: AtomicU64,
+    get_rejected: AtomicU64,
     get_cancelled: AtomicU64,
     get_object_bytes: AtomicU64,
     get_duration: DurationHistogram,
+    get_admission_wait_ms: Ewma,
+    get_throughput_bytes_per_sec: Ewma,
 }
 
 impl WorkerMetrics {
@@ -54,18 +62,24 @@ impl WorkerMetrics {
             put_started: AtomicU64::new(0),
             put_succeeded: AtomicU64::new(0),
             put_failed: AtomicU64::new(0),
+            put_rejected: AtomicU64::new(0),
             put_rows: AtomicU64::new(0),
             put_batches: AtomicU64::new(0),
             put_files: AtomicU64::new(0),
             put_flight_stream_bytes: AtomicU64::new(0),
             put_parquet_object_bytes: AtomicU64::new(0),
             put_duration: DurationHistogram::new(),
+            put_admission_wait_ms: Ewma::new(),
+            put_throughput_bytes_per_sec: Ewma::new(),
             get_started: AtomicU64::new(0),
             get_succeeded: AtomicU64::new(0),
             get_failed: AtomicU64::new(0),
+            get_rejected: AtomicU64::new(0),
             get_cancelled: AtomicU64::new(0),
             get_object_bytes: AtomicU64::new(0),
             get_duration: DurationHistogram::new(),
+            get_admission_wait_ms: Ewma::new(),
+            get_throughput_bytes_per_sec: Ewma::new(),
         }
     }
 
@@ -88,11 +102,21 @@ impl WorkerMetrics {
                 .fetch_add(bytes, Ordering::Relaxed);
         }
         self.put_duration.observe(elapsed);
+        self.put_throughput_bytes_per_sec
+            .observe(bytes_per_second(summary.flight_stream_bytes, elapsed));
     }
 
     pub(crate) fn record_put_failed(&self, elapsed: Duration) {
         self.put_failed.fetch_add(1, Ordering::Relaxed);
         self.put_duration.observe(elapsed);
+    }
+
+    pub(crate) fn record_put_rejected(&self) {
+        self.put_rejected.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_put_admission_wait(&self, wait_ms: u64) {
+        self.put_admission_wait_ms.observe(wait_ms);
     }
 
     pub(crate) fn record_get_started(&self) {
@@ -104,16 +128,56 @@ impl WorkerMetrics {
         self.get_duration.observe(elapsed);
     }
 
+    pub(crate) fn record_get_rejected(&self) {
+        self.get_rejected.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_get_admission_wait(&self, wait_ms: u64) {
+        self.get_admission_wait_ms.observe(wait_ms);
+    }
+
     fn record_get_succeeded(&self, elapsed: Duration, object_bytes: u64) {
         self.get_succeeded.fetch_add(1, Ordering::Relaxed);
         self.get_object_bytes
             .fetch_add(object_bytes, Ordering::Relaxed);
         self.get_duration.observe(elapsed);
+        self.get_throughput_bytes_per_sec
+            .observe(bytes_per_second(object_bytes, elapsed));
     }
 
     fn record_get_cancelled(&self, elapsed: Duration) {
         self.get_cancelled.fetch_add(1, Ordering::Relaxed);
         self.get_duration.observe(elapsed);
+    }
+
+    pub fn runtime_status(&self) -> WorkerRuntimeStatus {
+        WorkerRuntimeStatus {
+            put: PutRuntimeStatus {
+                started_total: self.put_started.load(Ordering::Relaxed),
+                succeeded_total: self.put_succeeded.load(Ordering::Relaxed),
+                failed_total: self.put_failed.load(Ordering::Relaxed),
+                rejected_total: self.put_rejected.load(Ordering::Relaxed),
+                rows_total: self.put_rows.load(Ordering::Relaxed),
+                batches_total: self.put_batches.load(Ordering::Relaxed),
+                files_total: self.put_files.load(Ordering::Relaxed),
+                flight_stream_bytes_total: self.put_flight_stream_bytes.load(Ordering::Relaxed),
+                parquet_object_bytes_total: self.put_parquet_object_bytes.load(Ordering::Relaxed),
+                admission_wait_ms_ewma: self.put_admission_wait_ms.get(),
+                duration_ms_ewma: self.put_duration.ewma_ms(),
+                throughput_bytes_per_sec_ewma: self.put_throughput_bytes_per_sec.get(),
+            },
+            read: ReadRuntimeStatus {
+                started_total: self.get_started.load(Ordering::Relaxed),
+                succeeded_total: self.get_succeeded.load(Ordering::Relaxed),
+                failed_total: self.get_failed.load(Ordering::Relaxed),
+                rejected_total: self.get_rejected.load(Ordering::Relaxed),
+                cancelled_total: self.get_cancelled.load(Ordering::Relaxed),
+                object_bytes_total: self.get_object_bytes.load(Ordering::Relaxed),
+                admission_wait_ms_ewma: self.get_admission_wait_ms.get(),
+                duration_ms_ewma: self.get_duration.ewma_ms(),
+                throughput_bytes_per_sec_ewma: self.get_throughput_bytes_per_sec.get(),
+            },
+        }
     }
 
     pub fn render_prometheus(&self, status: &WorkerStatus) -> String {
@@ -191,10 +255,126 @@ impl WorkerMetrics {
             "worker_registry_ttl_milliseconds",
             status.registry_ttl_ms,
         );
+        gauge_u64(
+            &mut out,
+            "worker_memory_bytes",
+            status.resources.worker_memory_bytes,
+        );
+        gauge_u64(
+            &mut out,
+            "worker_reserved_memory_bytes",
+            status.resources.reserved_memory_bytes,
+        );
+        gauge_u64(
+            &mut out,
+            "worker_put_memory_limit_bytes",
+            status.resources.put.limit_bytes,
+        );
+        gauge_u64(
+            &mut out,
+            "worker_put_memory_active_bytes",
+            status.resources.put.active_bytes,
+        );
+        gauge_u64(
+            &mut out,
+            "worker_put_memory_available_bytes",
+            status.resources.put.available_bytes,
+        );
+        gauge_u64(
+            &mut out,
+            "worker_put_max_stream_memory_bytes",
+            status.resources.put.max_stream_memory_bytes,
+        );
+        gauge_u64(
+            &mut out,
+            "worker_put_max_record_batch_bytes",
+            status.resources.put.max_record_batch_bytes,
+        );
+        gauge_u64(
+            &mut out,
+            "worker_read_memory_limit_bytes",
+            status.resources.read.limit_bytes,
+        );
+        gauge_u64(
+            &mut out,
+            "worker_read_memory_active_bytes",
+            status.resources.read.active_bytes,
+        );
+        gauge_u64(
+            &mut out,
+            "worker_read_memory_available_bytes",
+            status.resources.read.available_bytes,
+        );
+        gauge_u64(
+            &mut out,
+            "worker_read_max_stream_memory_bytes",
+            status.resources.read.max_stream_memory_bytes,
+        );
+        gauge_u64(
+            &mut out,
+            "worker_read_max_record_batch_bytes",
+            status.resources.read.max_record_batch_bytes,
+        );
+        gauge(
+            &mut out,
+            "worker_read_max_batch_rows",
+            status.resources.read.max_batch_rows.unwrap_or_default(),
+        );
+        gauge(
+            &mut out,
+            "worker_put_scheduler_recommended_streams",
+            status.scheduler.put.recommended_streams,
+        );
+        gauge(
+            &mut out,
+            "worker_put_scheduler_soft_available_slots",
+            status.scheduler.put.soft_available_slots,
+        );
+        gauge(
+            &mut out,
+            "worker_put_scheduler_memory_available_streams",
+            status.scheduler.put.memory_available_streams,
+        );
+        gauge_u64(
+            &mut out,
+            "worker_put_scheduler_utilization_per_mille",
+            u64::from(status.scheduler.put.utilization_per_mille),
+        );
+        gauge_u64(
+            &mut out,
+            "worker_put_scheduler_selection_score",
+            status.scheduler.put.selection_score,
+        );
+        gauge(
+            &mut out,
+            "worker_read_scheduler_recommended_streams",
+            status.scheduler.read.recommended_streams,
+        );
+        gauge(
+            &mut out,
+            "worker_read_scheduler_soft_available_slots",
+            status.scheduler.read.soft_available_slots,
+        );
+        gauge(
+            &mut out,
+            "worker_read_scheduler_memory_available_streams",
+            status.scheduler.read.memory_available_streams,
+        );
+        gauge_u64(
+            &mut out,
+            "worker_read_scheduler_utilization_per_mille",
+            u64::from(status.scheduler.read.utilization_per_mille),
+        );
+        gauge_u64(
+            &mut out,
+            "worker_read_scheduler_selection_score",
+            status.scheduler.read.selection_score,
+        );
 
         counter(&mut out, "worker_put_started_total", &self.put_started);
         counter(&mut out, "worker_put_succeeded_total", &self.put_succeeded);
         counter(&mut out, "worker_put_failed_total", &self.put_failed);
+        counter(&mut out, "worker_put_rejected_total", &self.put_rejected);
         counter(&mut out, "worker_put_rows_total", &self.put_rows);
         counter(&mut out, "worker_put_batches_total", &self.put_batches);
         counter(&mut out, "worker_put_files_total", &self.put_files);
@@ -208,17 +388,48 @@ impl WorkerMetrics {
             "worker_put_parquet_object_bytes_total",
             &self.put_parquet_object_bytes,
         );
+        gauge_u64(
+            &mut out,
+            "worker_put_admission_wait_milliseconds_ewma",
+            self.put_admission_wait_ms.get(),
+        );
+        gauge_u64(
+            &mut out,
+            "worker_put_duration_milliseconds_ewma",
+            self.put_duration.ewma_ms(),
+        );
+        gauge_u64(
+            &mut out,
+            "worker_put_throughput_bytes_per_second_ewma",
+            self.put_throughput_bytes_per_sec.get(),
+        );
         self.put_duration
             .render(&mut out, "worker_put_duration_seconds");
 
         counter(&mut out, "worker_get_started_total", &self.get_started);
         counter(&mut out, "worker_get_succeeded_total", &self.get_succeeded);
         counter(&mut out, "worker_get_failed_total", &self.get_failed);
+        counter(&mut out, "worker_get_rejected_total", &self.get_rejected);
         counter(&mut out, "worker_get_cancelled_total", &self.get_cancelled);
         counter(
             &mut out,
             "worker_get_object_bytes_total",
             &self.get_object_bytes,
+        );
+        gauge_u64(
+            &mut out,
+            "worker_get_admission_wait_milliseconds_ewma",
+            self.get_admission_wait_ms.get(),
+        );
+        gauge_u64(
+            &mut out,
+            "worker_get_duration_milliseconds_ewma",
+            self.get_duration.ewma_ms(),
+        );
+        gauge_u64(
+            &mut out,
+            "worker_get_throughput_bytes_per_second_ewma",
+            self.get_throughput_bytes_per_sec.get(),
         );
         self.get_duration
             .render(&mut out, "worker_get_duration_seconds");
@@ -238,6 +449,7 @@ struct DurationHistogram {
     buckets: [AtomicU64; DURATION_BUCKET_MS.len()],
     count: AtomicU64,
     sum_ms: AtomicU64,
+    ewma_ms: Ewma,
 }
 
 impl DurationHistogram {
@@ -246,6 +458,7 @@ impl DurationHistogram {
             buckets: std::array::from_fn(|_| AtomicU64::new(0)),
             count: AtomicU64::new(0),
             sum_ms: AtomicU64::new(0),
+            ewma_ms: Ewma::new(),
         }
     }
 
@@ -253,6 +466,7 @@ impl DurationHistogram {
         let ms = elapsed.as_millis().min(u64::MAX as u128) as u64;
         self.count.fetch_add(1, Ordering::Relaxed);
         self.sum_ms.fetch_add(ms, Ordering::Relaxed);
+        self.ewma_ms.observe(ms);
 
         if let Some(index) = DURATION_BUCKET_MS.iter().position(|bucket| ms <= *bucket) {
             self.buckets[index].fetch_add(1, Ordering::Relaxed);
@@ -272,6 +486,50 @@ impl DurationHistogram {
         let _ = writeln!(out, "{name}_bucket{{le=\"+Inf\"}} {count}");
         let _ = writeln!(out, "{name}_sum {sum_seconds}");
         let _ = writeln!(out, "{name}_count {count}");
+    }
+
+    fn ewma_ms(&self) -> u64 {
+        self.ewma_ms.get()
+    }
+}
+
+#[derive(Debug)]
+struct Ewma {
+    value: AtomicU64,
+    samples: AtomicU64,
+}
+
+impl Ewma {
+    fn new() -> Self {
+        Self {
+            value: AtomicU64::new(0),
+            samples: AtomicU64::new(0),
+        }
+    }
+
+    fn observe(&self, sample: u64) {
+        self.samples.fetch_add(1, Ordering::Relaxed);
+        let mut current = self.value.load(Ordering::Relaxed);
+        loop {
+            let next = if current == 0 {
+                sample
+            } else {
+                current.saturating_mul(7).saturating_add(sample) / 8
+            };
+            match self.value.compare_exchange_weak(
+                current,
+                next,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
+    fn get(&self) -> u64 {
+        self.value.load(Ordering::Relaxed)
     }
 }
 
@@ -399,6 +657,11 @@ fn unix_seconds() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
         .unwrap_or_default()
+}
+
+fn bytes_per_second(bytes: u64, elapsed: Duration) -> u64 {
+    let nanos = elapsed.as_nanos().max(1);
+    ((bytes as u128).saturating_mul(1_000_000_000) / nanos).min(u64::MAX as u128) as u64
 }
 
 fn metric_help(out: &mut String, name: &str, help: &str) {

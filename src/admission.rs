@@ -12,8 +12,11 @@ use futures::Stream;
 use tokio::sync::OwnedSemaphorePermit;
 use tonic::Status;
 
+use crate::resource::ResourcePermit;
+
 pub(crate) struct PutAdmission {
     pub(crate) _permit: OwnedSemaphorePermit,
+    pub(crate) _memory: ResourcePermit,
     pub(crate) upload_id: Option<String>,
     pub(crate) upload_streams: Arc<Mutex<HashMap<String, usize>>>,
     pub(crate) active_put_streams: Arc<AtomicUsize>,
@@ -43,6 +46,7 @@ impl Drop for PutAdmission {
 
 pub(crate) struct ReadAdmission {
     pub(crate) _permit: OwnedSemaphorePermit,
+    pub(crate) _memory: ResourcePermit,
     pub(crate) active_read_streams: Arc<AtomicUsize>,
     pub(crate) active_read_streams_at_admit: usize,
 }

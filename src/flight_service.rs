@@ -8,7 +8,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use arrow_array::RecordBatch;
+use arrow_array::{Array, RecordBatch};
 use arrow_flight::{
     Action, ActionType, Criteria, Empty, FlightData, FlightDescriptor, FlightInfo,
     HandshakeRequest, HandshakeResponse, PollInfo, PutResult, SchemaResult, Ticket,
@@ -41,9 +41,14 @@ use crate::{
         DatasetPart, PartBatch, PartProfile, PartProfileSummary, PutContext, PutFileSummary,
         PutOptions, PutProfile, PutSummary, WorkerPutSummary,
     },
+    resource::ResourceLimiter,
     ticket::parse_read_ticket,
     util::{descriptor_to_object_key, path_from_key},
-    worker_status::{WorkerCapacity, WorkerState, WorkerStatus},
+    worker_status::{
+        WorkerCapabilities, WorkerCapacity, WorkerLocality, WorkerResourcePool,
+        WorkerResourceStatus, WorkerSchedulerStatus, WorkerSchedulingPolicy,
+        WorkerSchedulingSignal, WorkerSchedulingTelemetry, WorkerState, WorkerStatus,
+    },
 };
 
 type ResponseStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send + 'static>>;
@@ -55,6 +60,8 @@ pub struct WorkerFlightService {
     metadata_store: Option<Arc<MetadataStore>>,
     put_slots: Arc<Semaphore>,
     read_slots: Arc<Semaphore>,
+    put_memory: ResourceLimiter,
+    read_memory: ResourceLimiter,
     upload_streams: Arc<Mutex<HashMap<String, usize>>>,
     active_put_streams: Arc<AtomicUsize>,
     active_read_streams: Arc<AtomicUsize>,
@@ -71,6 +78,8 @@ impl WorkerFlightService {
     ) -> Self {
         let put_slots = Arc::new(Semaphore::new(config.worker.max_active_put_streams.max(1)));
         let read_slots = Arc::new(Semaphore::new(config.worker.max_active_read_streams.max(1)));
+        let put_memory = ResourceLimiter::new(config.resources.put_memory_bytes);
+        let read_memory = ResourceLimiter::new(config.resources.read_memory_bytes);
         let draining = Arc::new(AtomicBool::new(config.worker.draining));
         Self {
             config: Arc::new(config),
@@ -78,6 +87,8 @@ impl WorkerFlightService {
             metadata_store,
             put_slots,
             read_slots,
+            put_memory,
+            read_memory,
             upload_streams: Arc::new(Mutex::new(HashMap::new())),
             active_put_streams: Arc::new(AtomicUsize::new(0)),
             active_read_streams: Arc::new(AtomicUsize::new(0)),
@@ -90,35 +101,118 @@ impl WorkerFlightService {
         let active_put = self.active_put_streams.load(Ordering::Relaxed);
         let active_read = self.active_read_streams.load(Ordering::Relaxed);
         let draining = self.draining.load(Ordering::Relaxed);
+        let put = WorkerCapacity {
+            limit: self.config.worker.max_active_put_streams,
+            active: active_put,
+            available: self
+                .config
+                .worker
+                .max_active_put_streams
+                .saturating_sub(active_put),
+            slot_wait_ms: self.config.worker.put_slot_wait_ms,
+        };
+        let read = WorkerCapacity {
+            limit: self.config.worker.max_active_read_streams,
+            active: active_read,
+            available: self
+                .config
+                .worker
+                .max_active_read_streams
+                .saturating_sub(active_read),
+            slot_wait_ms: self.config.worker.read_slot_wait_ms,
+        };
+        let runtime = self.metrics.runtime_status();
+        let resources = WorkerResourceStatus {
+            worker_memory_bytes: self.config.resources.worker_memory_bytes,
+            reserved_memory_bytes: self.config.resources.reserved_memory_bytes,
+            put: WorkerResourcePool {
+                limit_bytes: self.put_memory.total_bytes(),
+                active_bytes: self.put_memory.active_bytes(),
+                available_bytes: self.put_memory.available_bytes(),
+                max_stream_memory_bytes: self.config.resources.put_max_stream_memory_bytes,
+                max_record_batch_bytes: self.config.resources.put_max_record_batch_bytes,
+                max_batch_rows: None,
+            },
+            read: WorkerResourcePool {
+                limit_bytes: self.read_memory.total_bytes(),
+                active_bytes: self.read_memory.active_bytes(),
+                available_bytes: self.read_memory.available_bytes(),
+                max_stream_memory_bytes: self.config.resources.read_max_stream_memory_bytes,
+                max_record_batch_bytes: self.config.resources.read_max_record_batch_bytes,
+                max_batch_rows: Some(self.config.resources.read_max_batch_rows),
+            },
+        };
+        let scheduler = WorkerSchedulerStatus {
+            put: WorkerSchedulingSignal::from_capacity(
+                &put,
+                WorkerSchedulingPolicy {
+                    max_streams_per_operation: self.config.worker.max_put_streams_per_upload,
+                    reserved_slots: self.config.worker.put_scheduler_reserved_slots,
+                    memory_available_streams: Some(
+                        self.put_memory
+                            .available_streams(self.config.resources.put_max_stream_memory_bytes),
+                    ),
+                },
+                WorkerSchedulingTelemetry {
+                    succeeded_total: runtime.put.succeeded_total,
+                    failed_total: runtime.put.failed_total,
+                    rejected_total: runtime.put.rejected_total,
+                    cancelled_total: 0,
+                    admission_wait_ms_ewma: runtime.put.admission_wait_ms_ewma,
+                },
+                draining,
+            ),
+            read: WorkerSchedulingSignal::from_capacity(
+                &read,
+                WorkerSchedulingPolicy {
+                    max_streams_per_operation: self.config.worker.max_read_streams_per_operation,
+                    reserved_slots: self.config.worker.read_scheduler_reserved_slots,
+                    memory_available_streams: Some(
+                        self.read_memory
+                            .available_streams(self.config.resources.read_max_stream_memory_bytes),
+                    ),
+                },
+                WorkerSchedulingTelemetry {
+                    succeeded_total: runtime.read.succeeded_total,
+                    failed_total: runtime.read.failed_total,
+                    rejected_total: runtime.read.rejected_total,
+                    cancelled_total: runtime.read.cancelled_total,
+                    admission_wait_ms_ewma: runtime.read.admission_wait_ms_ewma,
+                },
+                draining,
+            ),
+        };
 
         WorkerStatus {
             worker_id: self.config.worker.worker_id.clone(),
             flight_uri: self.config.worker.flight_uri.clone(),
+            locality: WorkerLocality {
+                zone: self.config.worker.zone.clone(),
+            },
             state: if draining {
                 WorkerState::Draining
             } else {
                 WorkerState::Active
             },
             draining,
-            put: WorkerCapacity {
-                limit: self.config.worker.max_active_put_streams,
-                active: active_put,
-                available: self
-                    .config
-                    .worker
-                    .max_active_put_streams
-                    .saturating_sub(active_put),
-                slot_wait_ms: self.config.worker.put_slot_wait_ms,
-            },
-            read: WorkerCapacity {
-                limit: self.config.worker.max_active_read_streams,
-                active: active_read,
-                available: self
-                    .config
-                    .worker
-                    .max_active_read_streams
-                    .saturating_sub(active_read),
-                slot_wait_ms: self.config.worker.read_slot_wait_ms,
+            put,
+            read,
+            resources,
+            scheduler,
+            runtime,
+            capabilities: WorkerCapabilities {
+                put_parallelism: self.config.parquet.put_parallelism,
+                put_queue_depth: self.config.parquet.put_queue_depth,
+                max_put_streams_per_upload: self.config.worker.max_put_streams_per_upload,
+                max_put_stream_bytes: self.config.worker.max_put_stream_bytes,
+                put_max_stream_memory_bytes: self.config.resources.put_max_stream_memory_bytes,
+                put_max_record_batch_bytes: self.config.resources.put_max_record_batch_bytes,
+                read_max_streams_per_operation: self.config.worker.max_read_streams_per_operation,
+                read_batch_size: self.config.read_batch_size,
+                read_max_stream_memory_bytes: self.config.resources.read_max_stream_memory_bytes,
+                read_max_record_batch_bytes: self.config.resources.read_max_record_batch_bytes,
+                read_max_batch_rows: self.config.resources.read_max_batch_rows,
+                flight_data_chunk_size: self.config.flight_data_chunk_size,
             },
             heartbeat_interval_ms: self.config.worker.registry_heartbeat_interval_ms,
             registry_ttl_ms: self.config.worker.registry_ttl_ms,
@@ -187,6 +281,7 @@ impl WorkerFlightService {
         context: &PutContext,
     ) -> Result<(PutAdmission, WorkerPutSummary), Status> {
         if self.draining.load(Ordering::Relaxed) {
+            self.metrics.record_put_rejected();
             return Err(Status::unavailable(
                 "worker is draining and rejects new DoPut streams",
             ));
@@ -194,20 +289,48 @@ impl WorkerFlightService {
 
         let wait_started = Instant::now();
         let permit = if self.config.worker.put_slot_wait_ms == 0 {
-            self.put_slots
-                .clone()
-                .try_acquire_owned()
-                .map_err(|_| Status::resource_exhausted("DoPut worker has no free upload slots"))?
+            match self.put_slots.clone().try_acquire_owned() {
+                Ok(permit) => permit,
+                Err(_) => {
+                    self.metrics.record_put_rejected();
+                    return Err(Status::resource_exhausted(
+                        "DoPut worker has no free upload slots",
+                    ));
+                }
+            }
         } else {
-            timeout(
+            match timeout(
                 Duration::from_millis(self.config.worker.put_slot_wait_ms),
                 self.put_slots.clone().acquire_owned(),
             )
             .await
-            .map_err(|_| Status::resource_exhausted("timed out waiting for DoPut upload slot"))?
-            .map_err(|err| Status::internal(err.to_string()))?
+            {
+                Ok(Ok(permit)) => permit,
+                Ok(Err(err)) => return Err(Status::internal(err.to_string())),
+                Err(_) => {
+                    self.metrics.record_put_rejected();
+                    return Err(Status::resource_exhausted(
+                        "timed out waiting for DoPut upload slot",
+                    ));
+                }
+            }
         };
         let admission_wait_ms = wait_started.elapsed().as_millis();
+        let memory = match self
+            .put_memory
+            .reserve(
+                self.config.resources.put_max_stream_memory_bytes,
+                self.config.worker.put_slot_wait_ms,
+                "DoPut",
+            )
+            .await
+        {
+            Ok(memory) => memory,
+            Err(status) => {
+                self.metrics.record_put_rejected();
+                return Err(status);
+            }
+        };
 
         let upload_active_streams_at_admit = if let (Some(upload_id), Some(upload_stream_limit)) =
             (context.upload_id.as_ref(), context.upload_stream_limit)
@@ -218,6 +341,7 @@ impl WorkerFlightService {
                 .map_err(|_| Status::internal("upload stream slot tracker mutex poisoned"))?;
             let active_streams = upload_streams.get(upload_id).copied().unwrap_or_default();
             if active_streams >= upload_stream_limit {
+                self.metrics.record_put_rejected();
                 return Err(Status::resource_exhausted(format!(
                     "upload {upload_id:?} has no free stream slots; active={active_streams}, limit={upload_stream_limit}"
                 )));
@@ -232,6 +356,8 @@ impl WorkerFlightService {
 
         let active_put_streams_at_admit =
             self.active_put_streams.fetch_add(1, Ordering::Relaxed) + 1;
+        self.metrics
+            .record_put_admission_wait(u128_to_u64(admission_wait_ms));
         let summary = WorkerPutSummary {
             worker_id: self.config.worker.worker_id.clone(),
             attempt_id: context.attempt_id.clone(),
@@ -247,6 +373,7 @@ impl WorkerFlightService {
         };
         let admission = PutAdmission {
             _permit: permit,
+            _memory: memory,
             upload_id: context.upload_id.clone(),
             upload_streams: self.upload_streams.clone(),
             active_put_streams: self.active_put_streams.clone(),
@@ -257,31 +384,64 @@ impl WorkerFlightService {
 
     async fn admit_read(&self) -> Result<ReadAdmission, Status> {
         if self.draining.load(Ordering::Relaxed) {
+            self.metrics.record_get_rejected();
             return Err(Status::unavailable(
                 "worker is draining and rejects new DoGet streams",
             ));
         }
 
+        let wait_started = Instant::now();
         let permit = if self.config.worker.read_slot_wait_ms == 0 {
-            self.read_slots
-                .clone()
-                .try_acquire_owned()
-                .map_err(|_| Status::resource_exhausted("DoGet worker has no free read slots"))?
+            match self.read_slots.clone().try_acquire_owned() {
+                Ok(permit) => permit,
+                Err(_) => {
+                    self.metrics.record_get_rejected();
+                    return Err(Status::resource_exhausted(
+                        "DoGet worker has no free read slots",
+                    ));
+                }
+            }
         } else {
-            timeout(
+            match timeout(
                 Duration::from_millis(self.config.worker.read_slot_wait_ms),
                 self.read_slots.clone().acquire_owned(),
             )
             .await
-            .map_err(|_| Status::resource_exhausted("timed out waiting for DoGet read slot"))?
-            .map_err(|err| Status::internal(err.to_string()))?
+            {
+                Ok(Ok(permit)) => permit,
+                Ok(Err(err)) => return Err(Status::internal(err.to_string())),
+                Err(_) => {
+                    self.metrics.record_get_rejected();
+                    return Err(Status::resource_exhausted(
+                        "timed out waiting for DoGet read slot",
+                    ));
+                }
+            }
+        };
+        let memory = match self
+            .read_memory
+            .reserve(
+                self.config.resources.read_max_stream_memory_bytes,
+                self.config.worker.read_slot_wait_ms,
+                "DoGet",
+            )
+            .await
+        {
+            Ok(memory) => memory,
+            Err(status) => {
+                self.metrics.record_get_rejected();
+                return Err(status);
+            }
         };
 
         let active_read_streams_at_admit =
             self.active_read_streams.fetch_add(1, Ordering::Relaxed) + 1;
+        self.metrics
+            .record_get_admission_wait(u128_to_u64(wait_started.elapsed().as_millis()));
 
         Ok(ReadAdmission {
             _permit: permit,
+            _memory: memory,
             active_read_streams: self.active_read_streams.clone(),
             active_read_streams_at_admit,
         })
@@ -479,6 +639,11 @@ impl WorkerFlightService {
                     .ok_or_else(|| {
                         Status::invalid_argument("DoPut stream did not contain record batches")
                     })?;
+            enforce_record_batch_budget(
+                "DoPut",
+                &first_batch,
+                self.config.resources.put_max_record_batch_bytes,
+            )?;
             enforce_stream_budget(&put_context, flight_stream_bytes.load(Ordering::Relaxed))?;
             self.record_put_writing(&attempt_id).await?;
             let first_batch_receive_decode_ms = first_batch_started
@@ -595,6 +760,11 @@ impl WorkerFlightService {
                 break;
             };
             enforce_stream_budget(&put_context, flight_stream_bytes.load(Ordering::Relaxed))?;
+            enforce_record_batch_budget(
+                "DoPut",
+                &batch,
+                self.config.resources.put_max_record_batch_bytes,
+            )?;
 
             write_batch(
                 &mut writer,
@@ -777,6 +947,11 @@ impl WorkerFlightService {
                 break;
             };
             enforce_stream_budget(&put_context, flight_stream_bytes.load(Ordering::Relaxed))?;
+            enforce_record_batch_budget(
+                "DoPut",
+                &batch,
+                self.config.resources.put_max_record_batch_bytes,
+            )?;
 
             let seen = flight_stream_bytes.load(Ordering::Relaxed);
             let batch_flight_bytes = seen.saturating_sub(last_seen_flight_bytes);
@@ -981,11 +1156,23 @@ impl FlightService for WorkerFlightService {
                 .await
                 .map_err(status_from_anyhow)?;
             let schema = builder.schema().clone();
+            let read_batch_size = self
+                .config
+                .read_batch_size
+                .min(self.config.resources.read_max_batch_rows);
+            let max_record_batch_bytes = self.config.resources.read_max_record_batch_bytes;
             let parquet_stream = builder
-                .with_batch_size(self.config.read_batch_size)
+                .with_batch_size(read_batch_size)
                 .build()
                 .map_err(status_from_anyhow)?
-                .map_err(|err| FlightError::ExternalError(Box::new(err)));
+                .map(move |result| match result {
+                    Ok(batch) => {
+                        enforce_record_batch_budget("DoGet", &batch, max_record_batch_bytes)
+                            .map(|_| batch)
+                            .map_err(status_into_flight_error)
+                    }
+                    Err(err) => Err(FlightError::ExternalError(Box::new(err))),
+                });
 
             let flight_stream = arrow_flight::encode::FlightDataEncoderBuilder::new()
                 .with_schema(schema)
@@ -1061,7 +1248,7 @@ impl FlightService for WorkerFlightService {
     ) -> Result<Response<Self::DoActionStream>, Status> {
         let action = request.into_inner();
         match action.r#type.as_str() {
-            "worker.status" => {
+            "worker.status" | "worker.scheduler.v1" => {
                 let body = serde_json::to_vec(&self.worker_status())
                     .map_err(|err| Status::internal(err.to_string()))?;
                 Ok(Response::new(Box::pin(stream::once(async move {
@@ -1080,13 +1267,18 @@ impl FlightService for WorkerFlightService {
         &self,
         _request: Request<Empty>,
     ) -> Result<Response<Self::ListActionsStream>, Status> {
-        Ok(Response::new(Box::pin(stream::iter(vec![Ok(
-            ActionType {
+        Ok(Response::new(Box::pin(stream::iter(vec![
+            Ok(ActionType {
                 r#type: "worker.status".to_owned(),
                 description: "Return raw Parquet worker readiness and capacity snapshot as JSON"
                     .to_owned(),
-            },
-        )]))))
+            }),
+            Ok(ActionType {
+                r#type: "worker.scheduler.v1".to_owned(),
+                description: "Return coordinator-facing scheduling, runtime, and capacity signals"
+                    .to_owned(),
+            }),
+        ]))))
     }
 }
 
@@ -1122,6 +1314,10 @@ fn u64_to_i64(value: u64) -> i64 {
 
 fn u128_to_i64(value: u128) -> i64 {
     value.min(i64::MAX as u128) as i64
+}
+
+fn u128_to_u64(value: u128) -> u64 {
+    value.min(u64::MAX as u128) as u64
 }
 
 fn validate_worker_id(name: &str, value: Option<&str>) -> Result<Option<String>, Status> {
@@ -1186,6 +1382,36 @@ fn enforce_stream_budget(context: &PutContext, observed_bytes: u64) -> Result<()
     }
 
     Ok(())
+}
+
+fn enforce_record_batch_budget(
+    operation: &str,
+    batch: &RecordBatch,
+    max_bytes: u64,
+) -> Result<u64, Status> {
+    let bytes = record_batch_memory_bytes(batch);
+    if bytes > max_bytes {
+        return Err(Status::resource_exhausted(format!(
+            "{operation} record batch memory bytes {bytes} exceeds worker max {max_bytes}; reduce client batch size or increase worker flavor budget"
+        )));
+    }
+
+    Ok(bytes)
+}
+
+fn record_batch_memory_bytes(batch: &RecordBatch) -> u64 {
+    batch
+        .columns()
+        .iter()
+        .map(|array| array.get_array_memory_size() as u64)
+        .sum()
+}
+
+fn status_into_flight_error(status: Status) -> FlightError {
+    FlightError::ExternalError(Box::new(std::io::Error::new(
+        std::io::ErrorKind::Other,
+        status.to_string(),
+    )))
 }
 
 fn flight_data_size(data: &FlightData) -> u64 {
