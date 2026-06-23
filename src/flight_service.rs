@@ -34,6 +34,7 @@ use tracing::{error, info};
 
 use crate::{
     admission::{GuardedResponseStream, PutAdmission, ReadAdmission},
+    capability::{CAPABILITY_VERSION, parse_capability_envelope, verify_put_capability},
     config::{AppConfig, ParquetTuning},
     metadata_store::{MetadataStore, PutFileRecord, PutStreamCompleteRecord, PutStreamStartRecord},
     metrics::{MeasuredReadStream, WorkerMetrics},
@@ -213,6 +214,12 @@ impl WorkerFlightService {
                 read_max_record_batch_bytes: self.config.resources.read_max_record_batch_bytes,
                 read_max_batch_rows: self.config.resources.read_max_batch_rows,
                 flight_data_chunk_size: self.config.flight_data_chunk_size,
+                capability_version: CAPABILITY_VERSION,
+                signed_capabilities_required: self.config.security.require_signed_capabilities,
+                capability_worker_binding_required: self
+                    .config
+                    .security
+                    .require_capability_worker_binding,
             },
             heartbeat_interval_ms: self.config.worker.registry_heartbeat_interval_ms,
             registry_ttl_ms: self.config.worker.registry_ttl_ms,
@@ -220,15 +227,61 @@ impl WorkerFlightService {
     }
 
     fn build_put_context(&self, key: &str, options: &PutOptions) -> Result<PutContext, Status> {
-        let attempt_id = validate_worker_id("attempt_id", options.attempt_id.as_deref())?
-            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-        let upload_id = validate_worker_id("upload_id", options.upload_id.as_deref())?;
-        let stream_id = validate_worker_id("stream_id", options.stream_id.as_deref())?;
-        let staging_prefix = options
+        let capability = match options.capability.clone() {
+            Some(value) => Some(verify_put_capability(
+                value,
+                &self.config.worker,
+                &self.config.security,
+            )?),
+            None if self.config.security.require_signed_capabilities => {
+                return Err(Status::permission_denied(
+                    "worker requires signed DoPut capability metadata",
+                ));
+            }
+            None => None,
+        };
+
+        let option_attempt_id = validate_worker_id("attempt_id", options.attempt_id.as_deref())?;
+        let option_upload_id = validate_worker_id("upload_id", options.upload_id.as_deref())?;
+        let option_stream_id = validate_worker_id("stream_id", options.stream_id.as_deref())?;
+        let option_staging_prefix = options
             .staging_prefix
             .as_deref()
             .map(normalize_staging_prefix)
             .transpose()?;
+        let attempt_id = reconcile_optional_value(
+            "attempt_id",
+            option_attempt_id,
+            capability
+                .as_ref()
+                .and_then(|capability| capability.attempt_id.clone()),
+        )?
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let upload_id = reconcile_optional_value(
+            "upload_id",
+            option_upload_id,
+            capability
+                .as_ref()
+                .and_then(|capability| capability.upload_id.clone()),
+        )?;
+        let stream_id = reconcile_optional_value(
+            "stream_id",
+            option_stream_id,
+            capability
+                .as_ref()
+                .and_then(|capability| capability.stream_id.clone()),
+        )?;
+        let allowed_output_prefix = capability
+            .as_ref()
+            .map(|capability| capability.allowed_output_prefix.clone());
+        let staging_prefix = reconcile_optional_value(
+            "staging_prefix",
+            option_staging_prefix,
+            capability
+                .as_ref()
+                .and_then(|capability| capability.staging_prefix.clone())
+                .or_else(|| allowed_output_prefix.clone()),
+        )?;
 
         if self.config.worker.require_staging_prefix && staging_prefix.is_none() {
             return Err(Status::permission_denied(
@@ -243,18 +296,54 @@ impl WorkerFlightService {
                 )));
             }
         }
+        if let Some(allowed_output_prefix) = allowed_output_prefix.as_ref() {
+            if !key.starts_with(allowed_output_prefix) {
+                return Err(Status::permission_denied(format!(
+                    "DoPut key {key:?} is outside signed allowed_output_prefix {allowed_output_prefix:?}"
+                )));
+            }
+        }
+
+        if let Some(capability_target_file_size) = capability
+            .as_ref()
+            .and_then(|capability| capability.target_file_size)
+        {
+            if options.target_file_size != Some(capability_target_file_size) {
+                return Err(Status::permission_denied(format!(
+                    "DoPut target_file_size {:?} does not match signed target_file_size {capability_target_file_size}",
+                    options.target_file_size
+                )));
+            }
+        }
 
         let upload_stream_limit = upload_id.as_ref().map(|_| {
-            options
-                .max_upload_streams
-                .unwrap_or(self.config.worker.max_put_streams_per_upload)
-                .min(self.config.worker.max_put_streams_per_upload)
-                .max(1)
+            min_optional_usize(
+                options.max_upload_streams,
+                capability
+                    .as_ref()
+                    .and_then(|capability| capability.max_upload_streams),
+            )
+            .unwrap_or(self.config.worker.max_put_streams_per_upload)
+            .min(self.config.worker.max_put_streams_per_upload)
+            .max(1)
         });
         let stream_budget_bytes = min_optional_u64(
-            options.max_stream_bytes.filter(|bytes| *bytes > 0),
+            min_optional_u64(
+                options.max_stream_bytes.filter(|bytes| *bytes > 0),
+                capability
+                    .as_ref()
+                    .and_then(|capability| capability.max_stream_bytes),
+            ),
             self.config.worker.max_put_stream_bytes,
         );
+        let max_record_batch_bytes = min_optional_u64(
+            Some(self.config.resources.put_max_record_batch_bytes),
+            capability
+                .as_ref()
+                .and_then(|capability| capability.max_record_batch_bytes),
+        )
+        .unwrap_or(self.config.resources.put_max_record_batch_bytes)
+        .max(1);
 
         if let (Some(input_file_bytes), Some(stream_budget_bytes)) =
             (options.input_file_bytes, stream_budget_bytes)
@@ -267,12 +356,14 @@ impl WorkerFlightService {
         }
 
         Ok(PutContext {
+            operation_id: capability.and_then(|capability| capability.operation_id),
             attempt_id,
             upload_id,
             stream_id,
             staging_prefix,
             upload_stream_limit,
             stream_budget_bytes,
+            max_record_batch_bytes,
         })
     }
 
@@ -360,6 +451,7 @@ impl WorkerFlightService {
             .record_put_admission_wait(u128_to_u64(admission_wait_ms));
         let summary = WorkerPutSummary {
             worker_id: self.config.worker.worker_id.clone(),
+            operation_id: context.operation_id.clone(),
             attempt_id: context.attempt_id.clone(),
             upload_id: context.upload_id.clone(),
             stream_id: context.stream_id.clone(),
@@ -639,11 +731,7 @@ impl WorkerFlightService {
                     .ok_or_else(|| {
                         Status::invalid_argument("DoPut stream did not contain record batches")
                     })?;
-            enforce_record_batch_budget(
-                "DoPut",
-                &first_batch,
-                self.config.resources.put_max_record_batch_bytes,
-            )?;
+            enforce_record_batch_budget("DoPut", &first_batch, put_context.max_record_batch_bytes)?;
             enforce_stream_budget(&put_context, flight_stream_bytes.load(Ordering::Relaxed))?;
             self.record_put_writing(&attempt_id).await?;
             let first_batch_receive_decode_ms = first_batch_started
@@ -760,11 +848,7 @@ impl WorkerFlightService {
                 break;
             };
             enforce_stream_budget(&put_context, flight_stream_bytes.load(Ordering::Relaxed))?;
-            enforce_record_batch_budget(
-                "DoPut",
-                &batch,
-                self.config.resources.put_max_record_batch_bytes,
-            )?;
+            enforce_record_batch_budget("DoPut", &batch, put_context.max_record_batch_bytes)?;
 
             write_batch(
                 &mut writer,
@@ -947,11 +1031,7 @@ impl WorkerFlightService {
                 break;
             };
             enforce_stream_budget(&put_context, flight_stream_bytes.load(Ordering::Relaxed))?;
-            enforce_record_batch_budget(
-                "DoPut",
-                &batch,
-                self.config.resources.put_max_record_batch_bytes,
-            )?;
+            enforce_record_batch_budget("DoPut", &batch, put_context.max_record_batch_bytes)?;
 
             let seen = flight_stream_bytes.load(Ordering::Relaxed);
             let batch_flight_bytes = seen.saturating_sub(last_seen_flight_bytes);
@@ -1138,7 +1218,8 @@ impl FlightService for WorkerFlightService {
         let result = async {
             let ticket = parse_read_ticket(
                 &request.into_inner().ticket,
-                self.config.worker.require_structured_tickets,
+                &self.config.worker,
+                &self.config.security,
             )?;
             let key = ticket.key;
 
@@ -1159,8 +1240,15 @@ impl FlightService for WorkerFlightService {
             let read_batch_size = self
                 .config
                 .read_batch_size
-                .min(self.config.resources.read_max_batch_rows);
-            let max_record_batch_bytes = self.config.resources.read_max_record_batch_bytes;
+                .min(self.config.resources.read_max_batch_rows)
+                .min(ticket.max_batch_rows.unwrap_or(usize::MAX))
+                .max(1);
+            let max_record_batch_bytes = min_optional_u64(
+                Some(self.config.resources.read_max_record_batch_bytes),
+                ticket.max_record_batch_bytes,
+            )
+            .unwrap_or(self.config.resources.read_max_record_batch_bytes)
+            .max(1);
             let parquet_stream = builder
                 .with_batch_size(read_batch_size)
                 .build()
@@ -1287,6 +1375,13 @@ fn parse_put_options(app_metadata: &Bytes) -> Result<PutOptions, Status> {
         return Ok(PutOptions::default());
     }
 
+    if let Some(value) = parse_capability_envelope(app_metadata) {
+        return Ok(PutOptions {
+            capability: Some(value),
+            ..PutOptions::default()
+        });
+    }
+
     serde_json::from_slice(app_metadata).map_err(|err| {
         Status::invalid_argument(format!("invalid DoPut app_metadata options: {err}"))
     })
@@ -1367,6 +1462,30 @@ fn min_optional_u64(left: Option<u64>, right: Option<u64>) -> Option<u64> {
         (Some(left), Some(right)) => Some(left.min(right)),
         (Some(value), None) | (None, Some(value)) => Some(value),
         (None, None) => None,
+    }
+}
+
+fn min_optional_usize(left: Option<usize>, right: Option<usize>) -> Option<usize> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left.min(right)),
+        (Some(value), None) | (None, Some(value)) => Some(value),
+        (None, None) => None,
+    }
+}
+
+fn reconcile_optional_value(
+    name: &str,
+    request_value: Option<String>,
+    capability_value: Option<String>,
+) -> Result<Option<String>, Status> {
+    match (request_value, capability_value) {
+        (Some(request_value), Some(capability_value)) if request_value != capability_value => {
+            Err(Status::permission_denied(format!(
+                "{name} {request_value:?} does not match signed {name} {capability_value:?}"
+            )))
+        }
+        (Some(value), Some(_)) | (Some(value), None) | (None, Some(value)) => Ok(Some(value)),
+        (None, None) => Ok(None),
     }
 }
 

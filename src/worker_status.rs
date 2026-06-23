@@ -141,6 +141,9 @@ pub struct WorkerCapabilities {
     pub read_max_record_batch_bytes: u64,
     pub read_max_batch_rows: usize,
     pub flight_data_chunk_size: usize,
+    pub capability_version: u16,
+    pub signed_capabilities_required: bool,
+    pub capability_worker_binding_required: bool,
 }
 
 #[derive(Debug, Clone, Copy)]

@@ -10,6 +10,7 @@ pub struct AppConfig {
     pub parquet: ParquetTuning,
     pub worker: WorkerConfig,
     pub resources: ResourceConfig,
+    pub security: SecurityConfig,
     pub metadata: MetadataConfig,
     pub metrics: MetricsConfig,
     pub flight_max_message_size: usize,
@@ -72,6 +73,14 @@ pub struct WorkerConfig {
 }
 
 #[derive(Debug, Clone)]
+pub struct SecurityConfig {
+    pub require_signed_capabilities: bool,
+    pub capability_secret: Option<String>,
+    pub require_capability_worker_binding: bool,
+    pub max_capability_ttl_ms: u64,
+}
+
+#[derive(Debug, Clone)]
 pub struct ResourceConfig {
     pub worker_memory_bytes: u64,
     pub reserved_memory_bytes: u64,
@@ -104,6 +113,7 @@ impl AppConfig {
         let worker = WorkerConfig::from_env()?;
         let read_batch_size = env_usize("READ_BATCH_SIZE", 65_536)?;
         let resources = ResourceConfig::from_env(&worker, read_batch_size)?;
+        let security = SecurityConfig::from_env()?;
 
         Ok(Self {
             flight_addr,
@@ -111,6 +121,7 @@ impl AppConfig {
             parquet: ParquetTuning::from_env()?,
             worker,
             resources,
+            security,
             metadata: MetadataConfig::from_env(),
             metrics: MetricsConfig::from_env()?,
             flight_max_message_size: env_usize("FLIGHT_MAX_MESSAGE_SIZE", 256 * 1024 * 1024)?,
@@ -196,6 +207,29 @@ impl MetadataConfig {
             database_url: env_optional_string("METADATA_DATABASE_URL"),
             auto_migrate: env_bool("METADATA_DB_AUTO_MIGRATE", false),
         }
+    }
+}
+
+impl SecurityConfig {
+    pub fn from_env() -> Result<Self> {
+        let require_signed_capabilities = env_bool("WORKER_REQUIRE_SIGNED_CAPABILITIES", false);
+        let capability_secret = env_optional_string("WORKER_CAPABILITY_SECRET");
+        if require_signed_capabilities && capability_secret.is_none() {
+            anyhow::bail!(
+                "WORKER_CAPABILITY_SECRET must be set when WORKER_REQUIRE_SIGNED_CAPABILITIES=true"
+            );
+        }
+
+        Ok(Self {
+            require_signed_capabilities,
+            capability_secret,
+            require_capability_worker_binding: env_bool(
+                "WORKER_REQUIRE_CAPABILITY_WORKER_ID",
+                require_signed_capabilities,
+            ),
+            max_capability_ttl_ms: env_usize("WORKER_CAPABILITY_MAX_TTL_MS", 60 * 60 * 1000)?
+                as u64,
+        })
     }
 }
 

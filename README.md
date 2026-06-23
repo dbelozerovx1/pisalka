@@ -6,6 +6,7 @@ Rust Arrow Flight data-plane worker focused on high-throughput raw Parquet reads
 
 - `src/main.rs`: data-plane worker server and worker-registry heartbeat.
 - `src/flight_service.rs`: direct `DoPut` Arrow stream decode -> async Parquet writer -> S3, and direct `DoGet` Parquet -> Arrow Flight stream.
+- `src/capability.rs`: signed worker capability verification for coordinator-delegated physical work.
 - `src/put_model.rs`: worker `DoPut` result/profile/file contracts returned to the coordinator.
 - `src/admission.rs`: read/write admission guards.
 - `src/resource.rs`: weighted memory-budget limiter used by admission and scheduler signals.
@@ -156,6 +157,10 @@ Useful environment variables:
 - `WORKER_ZONE=` optional coordinator locality hint
 - `WORKER_FLIGHT_URI=http://127.0.0.1:50051`
 - `WORKER_REQUIRE_STRUCTURED_TICKETS=false`
+- `WORKER_REQUIRE_SIGNED_CAPABILITIES=false`
+- `WORKER_CAPABILITY_SECRET=`
+- `WORKER_REQUIRE_CAPABILITY_WORKER_ID=false`
+- `WORKER_CAPABILITY_MAX_TTL_MS=3600000`
 - `WORKER_HEARTBEAT_INTERVAL_MS=5000`
 - `WORKER_REGISTRY_TTL_MS=15000`
 - `METRICS_ENABLED=true`
@@ -257,6 +262,11 @@ Coordinator-facing worker status shape:
       "utilization_per_mille": 0,
       "selection_score": 5000
     }
+  },
+  "capabilities": {
+    "capability_version": 1,
+    "signed_capabilities_required": true,
+    "capability_worker_binding_required": true
   }
 }
 ```
@@ -265,7 +275,70 @@ The same scheduler fields are persisted into `worker_registry` as columns for si
 
 Metrics are exposed as Prometheus text at `http://127.0.0.1:9090/metrics`, with a cheap `/healthz` endpoint on the same listener. Metrics are intentionally low-cardinality and request-level only: no per-batch metrics, no object-path labels, and no upload-id labels. This keeps the hot path to a few atomic increments and one latency histogram update per completed operation.
 
-`DoGet` accepts direct worker tickets. For compatibility with local benchmarks, raw path tickets are allowed by default. For coordinator-driven environments, prefer structured JSON tickets and set `WORKER_REQUIRE_STRUCTURED_TICKETS=true`:
+## Worker Security Contract
+
+Trino/Ranger remains the user authorization authority. The Java coordinator checks the user's Trino token, plans Iceberg/control-plane work, then delegates only narrow physical work to Rust workers through signed capabilities. Workers do not call Ranger and do not make table-level auth decisions; they only verify that the coordinator signed this exact operation before touching S3.
+
+For local benchmarks, unsigned raw `DoGet` paths and unsigned `DoPut` metadata remain allowed by default. For production data-plane workers, set:
+
+```bash
+WORKER_REQUIRE_SIGNED_CAPABILITIES=true
+WORKER_CAPABILITY_SECRET=<shared-secret-from-secret-store>
+WORKER_REQUIRE_CAPABILITY_WORKER_ID=true
+WORKER_REQUIRE_STRUCTURED_TICKETS=true
+PUT_REQUIRE_STAGING_PREFIX=true
+```
+
+Signed capabilities use an HMAC-SHA256 envelope. The coordinator base64url-encodes the UTF-8 JSON payload without padding, signs that encoded payload string, and sends:
+
+```json
+{
+  "version": 1,
+  "alg": "HS256",
+  "payload": "<base64url-json-payload>",
+  "signature": "<base64url-hmac-sha256(payload)>"
+}
+```
+
+`DoPut` can send the envelope either as the whole Flight `app_metadata` body or inside existing metadata as `{"capability": { ... }}`. A production put payload should look like:
+
+```json
+{
+  "op": "put",
+  "operation_id": "op-123",
+  "attempt_id": "attempt-1",
+  "upload_id": "upload-123",
+  "stream_id": "stream-0",
+  "worker_id": "local-worker",
+  "issued_at_ms": 1781970000000,
+  "expires_at_ms": 1781970900000,
+  "allowed_output_prefix": "tables/db/table/.staging/op-123/",
+  "staging_prefix": "tables/db/table/.staging/op-123/",
+  "target_file_size": 536870912,
+  "max_stream_bytes": 10737418240,
+  "max_upload_streams": 4,
+  "max_record_batch_bytes": 268435456
+}
+```
+
+The worker rejects a `DoPut` unless the object key is inside `allowed_output_prefix`, optional client ids match the signed ids, requested limits do not exceed signed limits, the ticket is not expired, and the ticket is bound to this worker when worker binding is required. This prevents a user who learned a Flight URL from writing arbitrary S3 keys.
+
+`DoGet` receives the signed envelope as the Flight ticket. A production read payload is exact-file scoped:
+
+```json
+{
+  "op": "get",
+  "operation_id": "read-123",
+  "worker_id": "local-worker",
+  "issued_at_ms": 1781970000000,
+  "expires_at_ms": 1781970300000,
+  "path": "tables/db/table/data/part-00000.parquet",
+  "max_batch_rows": 65536,
+  "max_record_batch_bytes": 134217728
+}
+```
+
+For compatibility with local benchmarks, raw path tickets are still allowed when signed capabilities are not required:
 
 ```json
 {
@@ -275,7 +348,7 @@ Metrics are exposed as Prometheus text at `http://127.0.0.1:9090/metrics`, with 
 }
 ```
 
-This is a routing/expiry contract, not cryptographic authorization yet. Signed tickets or mTLS-bound tickets should be the next production hardening step.
+That compatibility mode should not be exposed outside a trusted local/dev network.
 
 Worker metadata DDL lives in `db/migrations/0001_worker_metadata.sql`. The worker can still run this migration for local experiments with `METADATA_DB_AUTO_MIGRATE=true`, but the default is `false`; production should apply migrations from the coordinator/control-plane release process.
 

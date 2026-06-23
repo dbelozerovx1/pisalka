@@ -1,5 +1,6 @@
 use arrow_array::RecordBatch;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 #[derive(Debug, Serialize)]
 pub(crate) struct PutSummary {
@@ -40,6 +41,7 @@ pub(crate) struct PutFileSummary {
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct WorkerPutSummary {
     pub(crate) worker_id: String,
+    pub(crate) operation_id: Option<String>,
     pub(crate) attempt_id: String,
     pub(crate) upload_id: Option<String>,
     pub(crate) stream_id: Option<String>,
@@ -121,6 +123,8 @@ pub(crate) struct DatasetPart {
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub(crate) struct PutOptions {
+    #[serde(default)]
+    pub(crate) capability: Option<Value>,
     pub(crate) attempt_id: Option<String>,
     pub(crate) upload_id: Option<String>,
     pub(crate) stream_id: Option<String>,
@@ -135,12 +139,14 @@ pub(crate) struct PutOptions {
 
 #[derive(Debug, Clone)]
 pub(crate) struct PutContext {
+    pub(crate) operation_id: Option<String>,
     pub(crate) attempt_id: String,
     pub(crate) upload_id: Option<String>,
     pub(crate) stream_id: Option<String>,
     pub(crate) staging_prefix: Option<String>,
     pub(crate) upload_stream_limit: Option<usize>,
     pub(crate) stream_budget_bytes: Option<u64>,
+    pub(crate) max_record_batch_bytes: u64,
 }
 
 pub(crate) struct PartBatch {
