@@ -1,15 +1,16 @@
-FROM eclipse-temurin:21-jdk AS build
+FROM maven:3.9-eclipse-temurin-21 AS build
 
 WORKDIR /app
+COPY pom.xml ./
+RUN mvn -q -DskipTests dependency:go-offline
 COPY src ./src
-RUN find src/main/java -name '*.java' -print > sources.txt \
-    && javac --release 21 -d out @sources.txt \
-    && jar --create --file coordinator.jar --main-class com.arrowflight.coordinator.CoordinatorApplication -C out .
+RUN mvn -q -DskipTests package
 
 FROM eclipse-temurin:21-jre
 
 WORKDIR /app
-COPY --from=build /app/coordinator.jar /app/coordinator.jar
+COPY --from=build /app/target/coordinator-0.1.0.jar /app/coordinator.jar
+COPY --from=build /app/target/dependency /app/dependency
 
 EXPOSE 8088
-CMD ["java", "-jar", "/app/coordinator.jar"]
+CMD ["java", "-cp", "/app/coordinator.jar:/app/dependency/*", "com.arrowflight.coordinator.CoordinatorApplication"]

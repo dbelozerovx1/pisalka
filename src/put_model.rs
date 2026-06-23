@@ -17,6 +17,7 @@ pub(crate) struct PutSummary {
     pub(crate) flight_stream_bytes: u64,
     pub(crate) parquet_object_bytes: Option<u64>,
     pub(crate) files: Vec<PutFileSummary>,
+    pub(crate) arrow_schema: serde_json::Value,
     pub(crate) target_file_size: Option<usize>,
     pub(crate) elapsed_ms: u128,
     pub(crate) compression: String,

@@ -21,9 +21,12 @@ export COORDINATOR_CAPABILITY_SECRET="${COORDINATOR_CAPABILITY_SECRET:-$WORKER_C
 export TRINO_URI="${TRINO_URI:-http://trino:8080}"
 
 json_field() {
-  python3 -c 'import json,sys; value=json.load(sys.stdin); 
+  python3 -c 'import json,sys; value=json.load(sys.stdin)
 for key in sys.argv[1].split("."):
-    value=value[key]
+    if isinstance(value, list):
+        value=value[int(key)]
+    else:
+        value=value[key]
 print(value)' "$1"
 }
 
@@ -36,16 +39,6 @@ for suffix, mult in units:
         print(int(float(raw[:-len(suffix)]) * mult))
         raise SystemExit
 print(int(raw))'
-}
-
-first_put_file() {
-  python3 -c 'import json,sys
-for line in sys.stdin:
-    if line.startswith("put_result="):
-        result = json.loads(line[len("put_result="):])
-        print(result["files"][0]["key"])
-        raise SystemExit(0)
-raise SystemExit("put_result line was not found")'
 }
 
 echo "starting_compose_stack=true"
@@ -73,13 +66,14 @@ print(json.dumps({
 }))'
 )"
 
-echo "requesting_put_ticket=$coordinator_uri/v1/flight/put-ticket"
-put_ticket="$(curl -fsS "$coordinator_uri/v1/flight/put-ticket" \
+echo "creating_upload=$coordinator_uri/v1/flight/create-upload"
+put_ticket="$(curl -fsS "$coordinator_uri/v1/flight/create-upload" \
   -H "content-type: application/json" \
   -d "$put_request")"
-descriptor_path="$(printf '%s' "$put_ticket" | json_field descriptorPath)"
-flight_uri="$(printf '%s' "$put_ticket" | json_field flightUri)"
-app_metadata="$(printf '%s' "$put_ticket" | json_field appMetadata)"
+upload_id="$(printf '%s' "$put_ticket" | json_field uploadId)"
+descriptor_path="$(printf '%s' "$put_ticket" | json_field tickets.0.descriptorPath)"
+flight_uri="$(printf '%s' "$put_ticket" | json_field tickets.0.flightUri)"
+app_metadata="$(printf '%s' "$put_ticket" | json_field tickets.0.appMetadata)"
 
 echo "running_doput=true descriptor_path=$descriptor_path"
 put_output="$(
@@ -92,7 +86,13 @@ put_output="$(
 )"
 printf '%s\n' "$put_output"
 
-first_file="$(printf '%s\n' "$put_output" | first_put_file)"
+echo "finishing_upload=$upload_id"
+finish_response="$(curl -fsS "$coordinator_uri/v1/flight/finish-upload" \
+  -H "content-type: application/json" \
+  -d "{\"uploadId\":\"$upload_id\"}")"
+echo "finish_upload=$finish_response"
+
+first_file="$(printf '%s' "$finish_response" | json_field files.0.filePath)"
 echo "first_written_file=$first_file"
 
 get_request="$(

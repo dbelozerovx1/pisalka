@@ -267,6 +267,25 @@ WHERE attempt_id = $1
         Ok(())
     }
 
+    pub async fn record_schema(&self, attempt_id: &str, arrow_schema_json: &Value) -> Result<()> {
+        self.client
+            .execute(
+                r#"
+UPDATE worker_put_streams
+SET arrow_schema_json = $2,
+    updated_at = now()
+WHERE attempt_id = $1
+"#,
+                &[&attempt_id, arrow_schema_json],
+            )
+            .await
+            .with_context(|| {
+                format!("failed to record Arrow schema for DoPut attempt {attempt_id}")
+            })?;
+
+        Ok(())
+    }
+
     pub async fn record_completed(&self, record: &PutStreamCompleteRecord) -> Result<()> {
         self.client
             .execute(

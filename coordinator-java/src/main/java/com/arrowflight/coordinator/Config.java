@@ -20,10 +20,14 @@ final class Config {
     final String workerFlightUri;
     final Optional<String> capabilitySecret;
     final Optional<String> adminToken;
+    final Optional<String> metadataDatabaseUrl;
     final long capabilityTtlMs;
     final long putCapabilityTtlMs;
     final long getCapabilityTtlMs;
+    final long uploadSessionTtlMs;
     final String stagingPrefixRoot;
+    final String objectStoreUriPrefix;
+    final int defaultUploadStreams;
     final long defaultTargetFileSizeBytes;
     final long defaultMaxStreamBytes;
     final int defaultMaxUploadStreams;
@@ -45,10 +49,14 @@ final class Config {
             String workerFlightUri,
             Optional<String> capabilitySecret,
             Optional<String> adminToken,
+            Optional<String> metadataDatabaseUrl,
             long capabilityTtlMs,
             long putCapabilityTtlMs,
             long getCapabilityTtlMs,
+            long uploadSessionTtlMs,
             String stagingPrefixRoot,
+            String objectStoreUriPrefix,
+            int defaultUploadStreams,
             long defaultTargetFileSizeBytes,
             long defaultMaxStreamBytes,
             int defaultMaxUploadStreams,
@@ -69,10 +77,14 @@ final class Config {
         this.workerFlightUri = workerFlightUri;
         this.capabilitySecret = capabilitySecret;
         this.adminToken = adminToken;
+        this.metadataDatabaseUrl = metadataDatabaseUrl;
         this.capabilityTtlMs = capabilityTtlMs;
         this.putCapabilityTtlMs = putCapabilityTtlMs;
         this.getCapabilityTtlMs = getCapabilityTtlMs;
+        this.uploadSessionTtlMs = uploadSessionTtlMs;
         this.stagingPrefixRoot = normalizePrefix(stagingPrefixRoot);
+        this.objectStoreUriPrefix = normalizeObjectStoreUriPrefix(objectStoreUriPrefix);
+        this.defaultUploadStreams = defaultUploadStreams;
         this.defaultTargetFileSizeBytes = defaultTargetFileSizeBytes;
         this.defaultMaxStreamBytes = defaultMaxStreamBytes;
         this.defaultMaxUploadStreams = defaultMaxUploadStreams;
@@ -97,10 +109,14 @@ final class Config {
                 env("WORKER_FLIGHT_URI", "http://flight-server:50051"),
                 envOptional("COORDINATOR_CAPABILITY_SECRET").or(() -> envOptional("WORKER_CAPABILITY_SECRET")),
                 envOptional("COORDINATOR_ADMIN_TOKEN"),
+                envOptional("COORDINATOR_METADATA_DATABASE_URL").or(() -> envOptional("METADATA_DATABASE_URL")),
                 capabilityTtlMs,
                 envLong("COORDINATOR_PUT_CAPABILITY_TTL_MS", capabilityTtlMs),
                 envLong("COORDINATOR_GET_CAPABILITY_TTL_MS", 5 * 60 * 1000L),
+                envLong("COORDINATOR_UPLOAD_SESSION_TTL_MS", 60 * 60 * 1000L),
                 env("COORDINATOR_STAGING_PREFIX_ROOT", "coordinator/staging"),
+                env("COORDINATOR_OBJECT_STORE_URI_PREFIX", "s3://arrow-flight"),
+                envInt("COORDINATOR_DEFAULT_UPLOAD_STREAMS", 1),
                 envLong("COORDINATOR_DEFAULT_TARGET_FILE_SIZE_BYTES", 512L * 1024 * 1024),
                 envLong("COORDINATOR_DEFAULT_MAX_STREAM_BYTES", 10L * 1024 * 1024 * 1024),
                 envInt("COORDINATOR_DEFAULT_MAX_UPLOAD_STREAMS", 4),
@@ -118,6 +134,15 @@ final class Config {
 
     String stagingPrefixForOperation(String operationId) {
         return stagingPrefixRoot + "/" + operationId;
+    }
+
+    String generatedUploadTable(String uploadId) {
+        String suffix = uploadId.replace("-", "_").replace(".", "_").replace(":", "_").toLowerCase(Locale.ROOT);
+        return ctasCatalog + "." + ctasSchema + "." + ctasTablePrefix + "_" + suffix;
+    }
+
+    String objectUriForPrefix(String prefix) {
+        return objectStoreUriPrefix + "/" + normalizePrefix(prefix);
     }
 
     private static InetSocketAddress parseListenAddress(String raw) {
@@ -163,6 +188,17 @@ final class Config {
         }
         String path = out.toString();
         return path.endsWith(".parquet") ? path : path + ".parquet";
+    }
+
+    private static String normalizeObjectStoreUriPrefix(String raw) {
+        String value = raw == null ? "" : raw.trim();
+        while (value.endsWith("/")) {
+            value = value.substring(0, value.length() - 1);
+        }
+        if (value.isBlank()) {
+            throw new IllegalArgumentException("COORDINATOR_OBJECT_STORE_URI_PREFIX must not be empty");
+        }
+        return value;
     }
 
     private static String env(String key, String defaultValue) {

@@ -99,7 +99,7 @@ Run a small end-to-end smoke:
 ./dev/smoke.sh
 ```
 
-Run the coordinator-first smoke path. This generates Arrow IPC data inside Docker, asks the coordinator for a signed `DoPut` ticket, writes to the worker, asks the coordinator for a signed exact-file `DoGet` ticket for one written Parquet file, and reads it back:
+Run the coordinator-first smoke path. This generates Arrow IPC data inside Docker, asks the coordinator to create an upload session, writes with the issued signed `DoPut` stream ticket, finishes the upload so the coordinator validates worker metadata and produces a Trino DDL preview, asks the coordinator for a signed exact-file `DoGet` ticket for one written Parquet file, and reads it back:
 
 ```bash
 ./dev/coordinator-smoke.sh
@@ -189,6 +189,10 @@ Useful environment variables:
 - `CTAS_DEFAULT_SCHEMA=arrow`
 - `COORDINATOR_CAPABILITY_SECRET=local-dev-secret`
 - `COORDINATOR_ADMIN_TOKEN=` optional token required by low-level ticket APIs when set
+- `COORDINATOR_METADATA_DATABASE_URL=postgres://flight:flight@metadata-db:5432/flight_metadata`
+- `COORDINATOR_UPLOAD_SESSION_TTL_MS=3600000`
+- `COORDINATOR_OBJECT_STORE_URI_PREFIX=s3://arrow-flight`
+- `COORDINATOR_DEFAULT_UPLOAD_STREAMS=1`
 - `S3_MULTIPART_PART_SIZE=67108864`
 - `S3_MULTIPART_MAX_CONCURRENCY=16`
 - `FLIGHT_MAX_MESSAGE_SIZE=268435456`
@@ -204,7 +208,11 @@ Defaults favor the fastest measured local write path: uncompressed Parquet, dict
 The coordinator intentionally stays small for the first full-system run:
 
 - `POST /v1/ctas`: accepts user SQL, wraps it as `CREATE TABLE ... AS <sql>`, forwards the caller's `Authorization` header and `X-Trino-User` to Trino, and returns Trino query metadata.
-- `POST /v1/flight/put-ticket`: mints a signed `DoPut` capability for a coordinator-controlled staging prefix. This is a low-level/internal API; set `COORDINATOR_ADMIN_TOKEN` when exposing it outside local dev.
+- `POST /v1/flight/create-upload`: creates a durable upload session, plans the expected stream count, persists planned stream attempts, and returns one signed `DoPut` ticket per stream.
+- `POST /v1/flight/upload-status`: returns the planned session, stream status joined with worker stream metadata, and written file rows.
+- `POST /v1/flight/finish-upload`: explicit finalization gate. It succeeds only when all planned streams are `SUCCEEDED`, reads DB-backed worker file/schema metadata, marks the upload `READY_TO_COMMIT`, and returns the file list plus a Trino `CREATE TABLE` DDL preview.
+- `POST /v1/flight/abort-upload`: marks an upload `ABORTED`. Staged-file cleanup is intentionally a separate follow-up task.
+- `POST /v1/flight/put-ticket`: mints one signed `DoPut` capability for a coordinator-controlled staging prefix. This remains a low-level/internal dev API; session uploads should use `create-upload`.
 - `POST /v1/flight/get-ticket`: mints a signed exact-file `DoGet` ticket. Also internal unless protected by `COORDINATOR_ADMIN_TOKEN`.
 - `GET /v1/config`: shows non-secret coordinator config.
 
@@ -221,12 +229,19 @@ curl -sS http://127.0.0.1:8088/v1/ctas \
 Example put capability:
 
 ```bash
-curl -sS http://127.0.0.1:8088/v1/flight/put-ticket \
+curl -sS http://127.0.0.1:8088/v1/flight/create-upload \
   -H 'content-type: application/json' \
-  -d '{"operationId":"op-1"}'
+  -d '{"operationId":"op-1","streams":2,"tableName":"iceberg.arrow.demo_upload"}'
 ```
 
-The returned `descriptorPath` is the Flight descriptor path and `appMetadata` is the signed JSON envelope to send as `DoPut` app metadata. For production, the coordinator should only mint these capabilities after Trino/Ranger has authorized the user's table operation.
+Each returned ticket contains a `descriptorPath` and `appMetadata` signed JSON envelope to send as `DoPut` app metadata. For production, the coordinator should only create upload sessions after Trino/Ranger has authorized the user's table operation.
+
+Commit/readiness flow:
+
+1. `create-upload` persists `coordinator_upload_sessions` and `coordinator_upload_streams` rows before data moves.
+2. Each worker `DoPut` persists its stream status, Arrow schema JSON from the first decoded batch, and written Parquet file rows in `worker_put_streams` / `worker_put_files`.
+3. `finish-upload` compares planned streams to actual worker outcomes. Missing, running, rejected, or failed streams block finalization.
+4. When all streams succeeded, the coordinator returns `READY_TO_COMMIT` with DB-backed file paths and a generated Trino DDL preview. Files are still staged until a later Iceberg commit/add-files step makes them table-visible.
 
 Without `--file-size` / `TARGET_FILE_SIZE`, `DoPut` writes one Parquet object at the requested path. With a target file size, `DoPut` writes multiple ordered part files under `<name>.parts/` and returns the file list in the `DoPut` result and metadata DB. `PUT_PARALLELISM` controls the maximum number of active part writers. `DoGet` accepts a direct physical Parquet path ticket and streams that file back.
 

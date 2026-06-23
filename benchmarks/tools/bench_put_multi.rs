@@ -9,7 +9,8 @@ use arrow_ipc::reader::StreamReader;
 use bytes::Bytes;
 use clap::Parser;
 use futures::{TryStreamExt, stream};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use tokio::{sync::mpsc, task::JoinHandle};
 use tonic::transport::Channel;
 
@@ -53,6 +54,12 @@ struct Args {
 
     #[arg(long, env = "PUT_PROFILE", default_value_t = false)]
     profile: bool,
+
+    #[arg(long, env = "PUT_TICKETS_JSON")]
+    tickets_json: Option<String>,
+
+    #[arg(long, env = "PUT_TICKETS_FILE")]
+    tickets_file: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -65,6 +72,15 @@ struct StreamUploadConfig {
     max_upload_streams: usize,
     max_stream_bytes: Option<u64>,
     profile: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TicketSpec {
+    stream_id: String,
+    descriptor_path: String,
+    flight_uri: String,
+    app_metadata: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -82,6 +98,7 @@ struct PutOptions {
 #[derive(Debug)]
 struct StreamResult {
     stream_id: String,
+    flight_uri: String,
     key: String,
     elapsed_ms: u128,
     put_results: Vec<String>,
@@ -92,7 +109,12 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     let config = BenchConfig::from_env()?;
     let uri = args.uri.unwrap_or(config.uri);
-    let requested_streams = args.streams.max(1);
+    let ticket_specs = read_ticket_specs(&args.tickets_json, &args.tickets_file)?;
+    let requested_streams = ticket_specs
+        .as_ref()
+        .map(|tickets| tickets.len())
+        .unwrap_or_else(|| args.streams.max(1))
+        .max(1);
     let client_queue_depth = args.client_queue_depth.max(1);
     let input_bytes = std::fs::metadata(&args.input)
         .with_context(|| format!("failed to stat {}", args.input.display()))?
@@ -149,17 +171,21 @@ async fn main() -> Result<()> {
         profile: args.profile,
     });
 
-    let channel = Channel::from_shared(uri.clone())?.connect().await?;
     let mut senders = Vec::with_capacity(active_streams);
     let mut handles: Vec<JoinHandle<Result<StreamResult>>> = Vec::with_capacity(active_streams);
 
     for stream_index in 0..active_streams {
         let (sender, receiver) = mpsc::channel(client_queue_depth);
         senders.push(sender);
+        let ticket_spec = ticket_specs
+            .as_ref()
+            .and_then(|tickets| tickets.get(stream_index))
+            .cloned();
         handles.push(tokio::spawn(run_put_stream(
-            channel.clone(),
+            uri.clone(),
             stream_config.clone(),
             stream_index,
+            ticket_spec,
             receiver,
         )));
     }
@@ -199,6 +225,9 @@ async fn main() -> Result<()> {
     println!("staging_prefix={staging_prefix}");
     println!("requested_streams={requested_streams}");
     println!("active_streams={active_streams}");
+    if ticket_specs.is_some() {
+        println!("tickets=provided");
+    }
     println!("client_queue_depth={client_queue_depth}");
     println!("batches_sent={batches_sent}");
     if let Some(target_file_size) = target_file_size {
@@ -216,6 +245,7 @@ async fn main() -> Result<()> {
     results.sort_by(|left, right| left.stream_id.cmp(&right.stream_id));
     for result in results {
         println!("stream_id={}", result.stream_id);
+        println!("stream_flight_uri={}", result.flight_uri);
         println!("stream_key={}", result.key);
         println!("stream_elapsed_ms={}", result.elapsed_ms);
         for put_result in result.put_results {
@@ -227,35 +257,50 @@ async fn main() -> Result<()> {
 }
 
 async fn run_put_stream(
-    channel: Channel,
+    default_uri: String,
     config: Arc<StreamUploadConfig>,
     stream_index: usize,
+    ticket_spec: Option<TicketSpec>,
     receiver: mpsc::Receiver<RecordBatch>,
 ) -> Result<StreamResult> {
-    let stream_id = format!("stream-{stream_index:05}");
-    let key = format!("{}/{}.parquet", config.staging_prefix, stream_id);
+    let stream_id = ticket_spec
+        .as_ref()
+        .map(|ticket| ticket.stream_id.clone())
+        .unwrap_or_else(|| format!("stream-{stream_index:05}"));
+    let key = ticket_spec
+        .as_ref()
+        .map(|ticket| ticket.descriptor_path.clone())
+        .unwrap_or_else(|| format!("{}/{}.parquet", config.staging_prefix, stream_id));
+    let flight_uri = ticket_spec
+        .as_ref()
+        .map(|ticket| ticket.flight_uri.clone())
+        .unwrap_or(default_uri);
     let batch_stream = stream::unfold(receiver, |mut receiver| async move {
         receiver
             .recv()
             .await
             .map(|batch| (Ok::<RecordBatch, FlightError>(batch), receiver))
     });
-    let metadata = serde_json::to_vec(&PutOptions {
-        upload_id: config.upload_id.clone(),
-        stream_id: stream_id.clone(),
-        staging_prefix: config.staging_prefix.clone(),
-        max_upload_streams: config.max_upload_streams,
-        max_stream_bytes: config.max_stream_bytes,
-        target_file_size: config.target_file_size,
-        input_file_bytes: None,
-        profile: config.profile,
-    })?;
+    let metadata = match ticket_spec {
+        Some(ticket) => ticket.app_metadata.into_bytes(),
+        None => serde_json::to_vec(&PutOptions {
+            upload_id: config.upload_id.clone(),
+            stream_id: stream_id.clone(),
+            staging_prefix: config.staging_prefix.clone(),
+            max_upload_streams: config.max_upload_streams,
+            max_stream_bytes: config.max_stream_bytes,
+            target_file_size: config.target_file_size,
+            input_file_bytes: None,
+            profile: config.profile,
+        })?,
+    };
     let flight_stream = FlightDataEncoderBuilder::new()
         .with_flight_descriptor(Some(FlightDescriptor::new_path(vec![key.clone()])))
         .with_max_flight_data_size(config.flight_data_chunk_size)
         .with_metadata(Bytes::from(metadata))
         .build(batch_stream);
 
+    let channel = Channel::from_shared(flight_uri.clone())?.connect().await?;
     let mut client = FlightClient::new_from_inner(
         arrow_flight::flight_service_client::FlightServiceClient::new(channel)
             .max_decoding_message_size(config.max_message_size)
@@ -271,8 +316,37 @@ async fn run_put_stream(
 
     Ok(StreamResult {
         stream_id,
+        flight_uri,
         key,
         elapsed_ms: started.elapsed().as_millis(),
         put_results,
     })
+}
+
+fn read_ticket_specs(
+    inline: &Option<String>,
+    file: &Option<PathBuf>,
+) -> Result<Option<Vec<TicketSpec>>> {
+    let Some(raw) = read_optional_text(inline, file)? else {
+        return Ok(None);
+    };
+    let value: Value = serde_json::from_str(&raw).context("failed to parse PUT_TICKETS_JSON")?;
+    let tickets_value = value.get("tickets").cloned().unwrap_or(value);
+    let tickets: Vec<TicketSpec> =
+        serde_json::from_value(tickets_value).context("failed to parse coordinator tickets")?;
+    anyhow::ensure!(!tickets.is_empty(), "coordinator ticket list is empty");
+    Ok(Some(tickets))
+}
+
+fn read_optional_text(inline: &Option<String>, file: &Option<PathBuf>) -> Result<Option<String>> {
+    match (inline, file) {
+        (Some(_), Some(_)) => {
+            anyhow::bail!("use only one of --tickets-json or --tickets-file")
+        }
+        (Some(value), None) => Ok(Some(value.clone())),
+        (None, Some(path)) => std::fs::read_to_string(path)
+            .with_context(|| format!("failed to read {}", path.display()))
+            .map(Some),
+        (None, None) => Ok(None),
+    }
 }

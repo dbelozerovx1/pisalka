@@ -59,6 +59,17 @@ final class Json {
         return Integer.parseInt(String.valueOf(value));
     }
 
+    static boolean boolValue(Map<String, Object> map, String key, boolean defaultValue) {
+        Object value = map.get(key);
+        if (value == null) {
+            return defaultValue;
+        }
+        if (value instanceof Boolean bool) {
+            return bool;
+        }
+        return Boolean.parseBoolean(String.valueOf(value));
+    }
+
     @SuppressWarnings("unchecked")
     static Map<String, Object> objectValue(Map<String, Object> map, String key) {
         Object value = map.get(key);
@@ -69,6 +80,18 @@ final class Json {
             return (Map<String, Object>) nested;
         }
         throw new IllegalArgumentException(key + " must be an object");
+    }
+
+    @SuppressWarnings("unchecked")
+    static List<Object> listValue(Map<String, Object> map, String key) {
+        Object value = map.get(key);
+        if (value == null) {
+            return List.of();
+        }
+        if (value instanceof List<?> list) {
+            return (List<Object>) list;
+        }
+        throw new IllegalArgumentException(key + " must be an array");
     }
 
     private static void writeValue(StringBuilder out, Object value) {

@@ -14,6 +14,7 @@ use arrow_flight::{
     HandshakeRequest, HandshakeResponse, PollInfo, PutResult, SchemaResult, Ticket,
     error::FlightError, flight_service_server::FlightService,
 };
+use arrow_schema::{DataType, Field, Schema, TimeUnit};
 use bytes::Bytes;
 use futures::{Stream, StreamExt, TryStreamExt, stream};
 use object_store::{ObjectStore, ObjectStoreExt, buffered::BufWriter, path::Path};
@@ -24,6 +25,7 @@ use parquet::{
     },
     file::properties::WriterProperties,
 };
+use serde_json::{Value, json};
 use tokio::{
     sync::{Semaphore, mpsc},
     task::JoinHandle,
@@ -637,6 +639,20 @@ impl WorkerFlightService {
             .map_err(status_from_context)
     }
 
+    async fn record_put_schema(
+        &self,
+        attempt_id: &str,
+        arrow_schema_json: &Value,
+    ) -> Result<(), Status> {
+        let Some(metadata_store) = self.metadata_store.as_ref() else {
+            return Ok(());
+        };
+        metadata_store
+            .record_schema(attempt_id, arrow_schema_json)
+            .await
+            .map_err(status_from_context)
+    }
+
     async fn record_put_completed(&self, summary: &PutSummary) -> Result<(), Status> {
         let Some(metadata_store) = self.metadata_store.as_ref() else {
             return Ok(());
@@ -744,6 +760,9 @@ impl WorkerFlightService {
                 .unwrap_or_default();
             let receive_decode_ms = first_batch_receive_decode_ms;
             let first_batch_flight_bytes = flight_stream_bytes.load(Ordering::Relaxed);
+            let arrow_schema_json = arrow_schema_to_json(first_batch.schema().as_ref());
+            self.record_put_schema(&attempt_id, &arrow_schema_json)
+                .await?;
 
             if let Some(target_file_size) = put_context.target_file_size {
                 return self
@@ -760,6 +779,7 @@ impl WorkerFlightService {
                         first_flight_data_message_ms,
                         first_batch_receive_decode_ms,
                         receive_decode_ms,
+                        arrow_schema_json,
                         profile_enabled,
                         put_context,
                         worker_summary,
@@ -779,6 +799,7 @@ impl WorkerFlightService {
                 first_flight_data_message_ms,
                 first_batch_receive_decode_ms,
                 receive_decode_ms,
+                arrow_schema_json,
                 profile_enabled,
                 put_context,
                 worker_summary,
@@ -813,6 +834,7 @@ impl WorkerFlightService {
         first_flight_data_message_ms: u128,
         first_batch_receive_decode_ms: u128,
         mut receive_decode_ms: u128,
+        arrow_schema: Value,
         profile_enabled: bool,
         put_context: PutContext,
         worker_summary: WorkerPutSummary,
@@ -927,6 +949,7 @@ impl WorkerFlightService {
             flight_stream_bytes,
             parquet_object_bytes,
             files,
+            arrow_schema,
             target_file_size: None,
             elapsed_ms,
             compression: self.config.parquet.compression_name.clone(),
@@ -973,6 +996,7 @@ impl WorkerFlightService {
         first_flight_data_message_ms: u128,
         first_batch_receive_decode_ms: u128,
         mut receive_decode_ms: u128,
+        arrow_schema: Value,
         profile_enabled: bool,
         put_context: PutContext,
         worker_summary: WorkerPutSummary,
@@ -1129,6 +1153,7 @@ impl WorkerFlightService {
             flight_stream_bytes: total_flight_stream_bytes,
             parquet_object_bytes: Some(parquet_object_bytes),
             files,
+            arrow_schema,
             target_file_size: Some(target_file_size),
             elapsed_ms,
             compression: self.config.parquet.compression_name.clone(),
@@ -1529,6 +1554,126 @@ fn record_batch_memory_bytes(batch: &RecordBatch) -> u64 {
         .iter()
         .map(|array| array.get_array_memory_size() as u64)
         .sum()
+}
+
+fn arrow_schema_to_json(schema: &Schema) -> Value {
+    json!({
+        "format": "arrow_schema_v1",
+        "fields": schema
+            .fields()
+            .iter()
+            .map(|field| arrow_field_to_json(field.as_ref()))
+            .collect::<Vec<_>>(),
+        "metadata": schema.metadata(),
+    })
+}
+
+fn arrow_field_to_json(field: &Field) -> Value {
+    json!({
+        "name": field.name(),
+        "nullable": field.is_nullable(),
+        "type": arrow_data_type_to_json(field.data_type()),
+        "metadata": field.metadata(),
+    })
+}
+
+fn arrow_data_type_to_json(data_type: &DataType) -> Value {
+    match data_type {
+        DataType::Null => json!({"kind": "Null"}),
+        DataType::Boolean => json!({"kind": "Boolean"}),
+        DataType::Int8 => json!({"kind": "Int8"}),
+        DataType::Int16 => json!({"kind": "Int16"}),
+        DataType::Int32 => json!({"kind": "Int32"}),
+        DataType::Int64 => json!({"kind": "Int64"}),
+        DataType::UInt8 => json!({"kind": "UInt8"}),
+        DataType::UInt16 => json!({"kind": "UInt16"}),
+        DataType::UInt32 => json!({"kind": "UInt32"}),
+        DataType::UInt64 => json!({"kind": "UInt64"}),
+        DataType::Float16 => json!({"kind": "Float16"}),
+        DataType::Float32 => json!({"kind": "Float32"}),
+        DataType::Float64 => json!({"kind": "Float64"}),
+        DataType::Timestamp(unit, timezone) => json!({
+            "kind": "Timestamp",
+            "unit": time_unit_name(*unit),
+            "timezone": timezone.as_ref().map(|value| value.to_string()),
+        }),
+        DataType::Date32 => json!({"kind": "Date32"}),
+        DataType::Date64 => json!({"kind": "Date64"}),
+        DataType::Time32(unit) => json!({"kind": "Time32", "unit": time_unit_name(*unit)}),
+        DataType::Time64(unit) => json!({"kind": "Time64", "unit": time_unit_name(*unit)}),
+        DataType::Duration(unit) => json!({"kind": "Duration", "unit": time_unit_name(*unit)}),
+        DataType::Interval(unit) => json!({"kind": "Interval", "unit": format!("{unit:?}")}),
+        DataType::Binary => json!({"kind": "Binary"}),
+        DataType::FixedSizeBinary(size) => json!({"kind": "FixedSizeBinary", "byte_width": size}),
+        DataType::LargeBinary => json!({"kind": "LargeBinary"}),
+        DataType::BinaryView => json!({"kind": "BinaryView"}),
+        DataType::Utf8 => json!({"kind": "Utf8"}),
+        DataType::LargeUtf8 => json!({"kind": "LargeUtf8"}),
+        DataType::Utf8View => json!({"kind": "Utf8View"}),
+        DataType::List(field) => {
+            json!({"kind": "List", "field": arrow_field_to_json(field.as_ref())})
+        }
+        DataType::ListView(field) => {
+            json!({"kind": "ListView", "field": arrow_field_to_json(field.as_ref())})
+        }
+        DataType::FixedSizeList(field, size) => json!({
+            "kind": "FixedSizeList",
+            "field": arrow_field_to_json(field.as_ref()),
+            "length": size,
+        }),
+        DataType::LargeList(field) => {
+            json!({"kind": "LargeList", "field": arrow_field_to_json(field.as_ref())})
+        }
+        DataType::LargeListView(field) => {
+            json!({"kind": "LargeListView", "field": arrow_field_to_json(field.as_ref())})
+        }
+        DataType::Struct(fields) => json!({
+            "kind": "Struct",
+            "fields": fields
+                .iter()
+                .map(|field| arrow_field_to_json(field.as_ref()))
+                .collect::<Vec<_>>(),
+        }),
+        DataType::Union(_, _) => {
+            json!({"kind": "Unsupported", "arrow_debug": format!("{data_type:?}")})
+        }
+        DataType::Dictionary(key_type, value_type) => json!({
+            "kind": "Dictionary",
+            "key": arrow_data_type_to_json(key_type),
+            "value": arrow_data_type_to_json(value_type),
+        }),
+        DataType::Decimal32(precision, scale) => {
+            json!({"kind": "Decimal32", "precision": precision, "scale": scale})
+        }
+        DataType::Decimal64(precision, scale) => {
+            json!({"kind": "Decimal64", "precision": precision, "scale": scale})
+        }
+        DataType::Decimal128(precision, scale) => {
+            json!({"kind": "Decimal128", "precision": precision, "scale": scale})
+        }
+        DataType::Decimal256(precision, scale) => {
+            json!({"kind": "Decimal256", "precision": precision, "scale": scale})
+        }
+        DataType::Map(field, sorted) => json!({
+            "kind": "Map",
+            "field": arrow_field_to_json(field.as_ref()),
+            "keys_sorted": sorted,
+        }),
+        DataType::RunEndEncoded(run_ends, values) => json!({
+            "kind": "RunEndEncoded",
+            "run_ends": arrow_field_to_json(run_ends.as_ref()),
+            "values": arrow_field_to_json(values.as_ref()),
+        }),
+    }
+}
+
+fn time_unit_name(unit: TimeUnit) -> &'static str {
+    match unit {
+        TimeUnit::Second => "second",
+        TimeUnit::Millisecond => "millisecond",
+        TimeUnit::Microsecond => "microsecond",
+        TimeUnit::Nanosecond => "nanosecond",
+    }
 }
 
 fn status_into_flight_error(status: Status) -> FlightError {
