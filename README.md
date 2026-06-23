@@ -1,6 +1,8 @@
 # Arrow Flight Raw Parquet Worker
 
-Rust Arrow Flight data-plane worker focused on high-throughput raw Parquet reads and writes against S3-compatible storage. The Java coordinator owns planning, auth, Iceberg commits, and `GetFlightInfo`; this worker accepts direct `DoPut` and `DoGet` calls for already-planned physical files.
+Rust Arrow Flight data-plane worker focused on high-throughput raw Parquet reads and writes against S3-compatible storage. The Java coordinator owns planning, auth, Iceberg commits, and `GetFlightInfo`; the worker accepts direct `DoPut` and `DoGet` calls for already-planned physical files.
+
+The MVP keeps worker and coordinator in one repo because their capability contract, Compose environment, and smoke tests are still evolving together. Once the coordinator contract stabilizes and release cadence diverges, splitting the Java coordinator into a separate repository will be straightforward.
 
 ## Layout
 
@@ -12,6 +14,7 @@ Rust Arrow Flight data-plane worker focused on high-throughput raw Parquet reads
 - `src/resource.rs`: weighted memory-budget limiter used by admission and scheduler signals.
 - `src/ticket.rs`: worker `DoGet` ticket parser.
 - `src/metrics.rs`: low-overhead Prometheus text metrics endpoint.
+- `coordinator-java/`: dependency-light Java coordinator MVP for Trino CTAS and signed worker capability minting.
 - `db/migrations/`: SQL DDL owned by the control plane/coordinator in production. Local Compose applies it with `metadata-migrate`.
 - `benchmarks/tools/`: benchmark/data-generation Rust binaries.
 - `benchmarks/tools/common/`: benchmark-only profiling/output helpers.
@@ -22,7 +25,7 @@ Rust Arrow Flight data-plane worker focused on high-throughput raw Parquet reads
 
 The repo pins Rust `1.88.0` in `rust-toolchain.toml` so the current Arrow, tonic, and object_store stack can be used. First build may ask `rustup` to install that toolchain.
 
-Docker is only needed for the MinIO/server compose environment.
+Docker is only needed for the local MinIO, Trino, Hive Metastore, coordinator, and worker compose environment.
 
 ## Fast Start
 
@@ -31,6 +34,10 @@ Start everything in Docker:
 ```bash
 ./dev/up.sh
 ```
+
+The Compose file contains MinIO, a standalone Hive Metastore, Trino with an Iceberg catalog, the Rust worker, and the Java coordinator. Trino is exposed on `http://127.0.0.1:8080`, the coordinator is exposed on `http://127.0.0.1:8088`, and the worker is exposed on `127.0.0.1:50051`.
+
+`trino-init` waits for Trino and best-effort creates the Iceberg schema. Keep `TRINO_INIT_REQUIRE_SCHEMA=false` for raw Flight worker smoke tests; set it to `true` when testing strict Iceberg schema bootstrap.
 
 Or run only MinIO in Docker and the server as a local release binary:
 
@@ -90,6 +97,12 @@ Run a small end-to-end smoke:
 
 ```bash
 ./dev/smoke.sh
+```
+
+Run the coordinator-first smoke path. This generates Arrow IPC data inside Docker, asks the coordinator for a signed `DoPut` ticket, writes to the worker, asks the coordinator for a signed exact-file `DoGet` ticket for one written Parquet file, and reads it back:
+
+```bash
+./dev/coordinator-smoke.sh
 ```
 
 Run a write parallelism matrix against the Docker Compose server:
@@ -165,6 +178,17 @@ Useful environment variables:
 - `WORKER_REGISTRY_TTL_MS=15000`
 - `METRICS_ENABLED=true`
 - `METRICS_ADDR=0.0.0.0:9090`
+- `COORDINATOR_ADDR=0.0.0.0:8088`
+- `TRINO_VERSION=481`
+- `HIVE_VERSION=4.1.0`
+- `TRINO_URI=http://trino:8080`
+- `TRINO_CATALOG=iceberg`
+- `TRINO_SCHEMA=arrow`
+- `ICEBERG_SCHEMA_LOCATION=s3://arrow-flight/iceberg/arrow`
+- `CTAS_DEFAULT_CATALOG=iceberg`
+- `CTAS_DEFAULT_SCHEMA=arrow`
+- `COORDINATOR_CAPABILITY_SECRET=local-dev-secret`
+- `COORDINATOR_ADMIN_TOKEN=` optional token required by low-level ticket APIs when set
 - `S3_MULTIPART_PART_SIZE=67108864`
 - `S3_MULTIPART_MAX_CONCURRENCY=16`
 - `FLIGHT_MAX_MESSAGE_SIZE=268435456`
@@ -174,6 +198,35 @@ Useful environment variables:
 - `PUT_PROFILE=true` to request optional benchmark/server profiling
 
 Defaults favor the fastest measured local write path: uncompressed Parquet, dictionary disabled, large Flight chunks, large gRPC message limits, 64 MiB S3 multipart uploads, and up to four active part writers when target-sized output is requested.
+
+## Java Coordinator MVP
+
+The coordinator intentionally stays small for the first full-system run:
+
+- `POST /v1/ctas`: accepts user SQL, wraps it as `CREATE TABLE ... AS <sql>`, forwards the caller's `Authorization` header and `X-Trino-User` to Trino, and returns Trino query metadata.
+- `POST /v1/flight/put-ticket`: mints a signed `DoPut` capability for a coordinator-controlled staging prefix. This is a low-level/internal API; set `COORDINATOR_ADMIN_TOKEN` when exposing it outside local dev.
+- `POST /v1/flight/get-ticket`: mints a signed exact-file `DoGet` ticket. Also internal unless protected by `COORDINATOR_ADMIN_TOKEN`.
+- `GET /v1/config`: shows non-secret coordinator config.
+
+Example CTAS call:
+
+```bash
+curl -sS http://127.0.0.1:8088/v1/ctas \
+  -H 'content-type: application/json' \
+  -H 'X-Trino-User: alice' \
+  -H 'Authorization: Bearer <trino-token>' \
+  -d '{"sql":"select * from source_table limit 10","targetTable":"iceberg.arrow.ctas_tmp_demo"}'
+```
+
+Example put capability:
+
+```bash
+curl -sS http://127.0.0.1:8088/v1/flight/put-ticket \
+  -H 'content-type: application/json' \
+  -d '{"operationId":"op-1"}'
+```
+
+The returned `descriptorPath` is the Flight descriptor path and `appMetadata` is the signed JSON envelope to send as `DoPut` app metadata. For production, the coordinator should only mint these capabilities after Trino/Ranger has authorized the user's table operation.
 
 Without `--file-size` / `TARGET_FILE_SIZE`, `DoPut` writes one Parquet object at the requested path. With a target file size, `DoPut` writes multiple ordered part files under `<name>.parts/` and returns the file list in the `DoPut` result and metadata DB. `PUT_PARALLELISM` controls the maximum number of active part writers. `DoGet` accepts a direct physical Parquet path ticket and streams that file back.
 

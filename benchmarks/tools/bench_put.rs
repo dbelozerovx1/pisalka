@@ -55,6 +55,12 @@ struct Args {
 
     #[arg(long, env = "PUT_MAX_STREAM_BYTES")]
     max_stream_bytes: Option<String>,
+
+    #[arg(long, env = "PUT_APP_METADATA_JSON")]
+    app_metadata_json: Option<String>,
+
+    #[arg(long, env = "PUT_APP_METADATA_FILE")]
+    app_metadata_file: Option<PathBuf>,
 }
 
 #[derive(Debug, Serialize)]
@@ -118,16 +124,19 @@ async fn main() -> Result<()> {
         .with_flight_descriptor(Some(FlightDescriptor::new_path(vec![args.path.clone()])))
         .with_max_flight_data_size(config.flight_data_chunk_size);
 
-    let metadata = serde_json::to_vec(&PutOptions {
-        upload_id: args.upload_id.clone(),
-        stream_id: args.stream_id.clone(),
-        staging_prefix: args.staging_prefix.clone(),
-        max_upload_streams: args.max_upload_streams,
-        max_stream_bytes,
-        target_file_size,
-        input_file_bytes: input_bytes,
-        profile: args.profile,
-    })?;
+    let metadata = match read_optional_text(&args.app_metadata_json, &args.app_metadata_file)? {
+        Some(metadata) => metadata.into_bytes(),
+        None => serde_json::to_vec(&PutOptions {
+            upload_id: args.upload_id.clone(),
+            stream_id: args.stream_id.clone(),
+            staging_prefix: args.staging_prefix.clone(),
+            max_upload_streams: args.max_upload_streams,
+            max_stream_bytes,
+            target_file_size,
+            input_file_bytes: input_bytes,
+            profile: args.profile,
+        })?,
+    };
     encoder = encoder.with_metadata(Bytes::from(metadata));
 
     let flight_stream = encoder.build(batch_stream);
@@ -172,6 +181,9 @@ async fn main() -> Result<()> {
         println!("max_stream_bytes={max_stream_bytes}");
         println!("max_stream_size={}", pretty_bytes(max_stream_bytes));
     }
+    if args.app_metadata_json.is_some() || args.app_metadata_file.is_some() {
+        println!("app_metadata=provided");
+    }
     println!("elapsed_ms={}", elapsed.as_millis());
     println!("throughput={}", throughput(input_bytes, elapsed));
     source_profile.print();
@@ -183,4 +195,17 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn read_optional_text(inline: &Option<String>, file: &Option<PathBuf>) -> Result<Option<String>> {
+    match (inline, file) {
+        (Some(_), Some(_)) => {
+            anyhow::bail!("use only one of --app-metadata-json or --app-metadata-file")
+        }
+        (Some(value), None) => Ok(Some(value.clone())),
+        (None, Some(path)) => std::fs::read_to_string(path)
+            .with_context(|| format!("failed to read {}", path.display()))
+            .map(Some),
+        (None, None) => Ok(None),
+    }
 }

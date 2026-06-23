@@ -304,17 +304,21 @@ impl WorkerFlightService {
             }
         }
 
-        if let Some(capability_target_file_size) = capability
+        let capability_target_file_size = capability
             .as_ref()
-            .and_then(|capability| capability.target_file_size)
-        {
-            if options.target_file_size != Some(capability_target_file_size) {
+            .and_then(|capability| capability.target_file_size);
+        if let Some(capability_target_file_size) = capability_target_file_size {
+            if options
+                .target_file_size
+                .is_some_and(|target_file_size| target_file_size != capability_target_file_size)
+            {
                 return Err(Status::permission_denied(format!(
                     "DoPut target_file_size {:?} does not match signed target_file_size {capability_target_file_size}",
                     options.target_file_size
                 )));
             }
         }
+        let target_file_size = options.target_file_size.or(capability_target_file_size);
 
         let upload_stream_limit = upload_id.as_ref().map(|_| {
             min_optional_usize(
@@ -361,6 +365,7 @@ impl WorkerFlightService {
             upload_id,
             stream_id,
             staging_prefix,
+            target_file_size,
             upload_stream_limit,
             stream_budget_bytes,
             max_record_batch_bytes,
@@ -552,9 +557,9 @@ impl WorkerFlightService {
             stream_id: context.stream_id.clone(),
             worker_id: self.config.worker.worker_id.clone(),
             key: key.to_owned(),
-            mode: Some(put_mode(options).to_owned()),
+            mode: Some(put_mode(context).to_owned()),
             staging_prefix: context.staging_prefix.clone(),
-            target_file_size: options.target_file_size.map(usize_to_i64),
+            target_file_size: context.target_file_size.map(usize_to_i64),
             client_input_file_bytes: options.input_file_bytes.map(u64_to_i64),
             stream_budget_bytes: context.stream_budget_bytes.map(u64_to_i64),
             global_put_stream_limit: usize_to_i32(self.config.worker.max_active_put_streams),
@@ -740,7 +745,7 @@ impl WorkerFlightService {
             let receive_decode_ms = first_batch_receive_decode_ms;
             let first_batch_flight_bytes = flight_stream_bytes.load(Ordering::Relaxed);
 
-            if let Some(target_file_size) = put_options.target_file_size {
+            if let Some(target_file_size) = put_context.target_file_size {
                 return self
                     .write_sized_dataset(
                         key,
@@ -1387,8 +1392,8 @@ fn parse_put_options(app_metadata: &Bytes) -> Result<PutOptions, Status> {
     })
 }
 
-fn put_mode(options: &PutOptions) -> &'static str {
-    if options.target_file_size.is_some() {
+fn put_mode(context: &PutContext) -> &'static str {
+    if context.target_file_size.is_some() {
         "sized_dataset"
     } else {
         "single"

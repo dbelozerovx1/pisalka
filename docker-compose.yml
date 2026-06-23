@@ -22,6 +22,54 @@ services:
       /usr/bin/mc anonymous set none local/arrow-flight;
       "
 
+  hive-metastore:
+    image: apache/hive:${HIVE_VERSION:-4.1.0}
+    depends_on:
+      minio-create-bucket:
+        condition: service_completed_successfully
+    environment:
+      SERVICE_NAME: metastore
+      HADOOP_CLASSPATH: "/opt/hadoop/share/hadoop/tools/lib/*"
+      SERVICE_OPTS: >-
+        -Dfs.s3.impl=org.apache.hadoop.fs.s3a.S3AFileSystem
+        -Dfs.s3a.impl=org.apache.hadoop.fs.s3a.S3AFileSystem
+        -Dfs.s3a.endpoint=http://minio:9000
+        -Dfs.s3a.access.key=minioadmin
+        -Dfs.s3a.secret.key=minioadmin
+        -Dfs.s3a.path.style.access=true
+        -Dfs.s3a.connection.ssl.enabled=false
+        -Dfs.s3a.aws.credentials.provider=org.apache.hadoop.fs.s3a.SimpleAWSCredentialsProvider
+    ports:
+      - "9083:9083"
+
+  trino:
+    image: trinodb/trino:${TRINO_VERSION:-481}
+    depends_on:
+      minio-create-bucket:
+        condition: service_completed_successfully
+      hive-metastore:
+        condition: service_started
+    volumes:
+      - ./trino/catalog:/etc/trino/catalog:ro
+    ports:
+      - "8080:8080"
+
+  trino-init:
+    image: python:3.12-alpine
+    depends_on:
+      trino:
+        condition: service_started
+    environment:
+      TRINO_URI: "${TRINO_URI:-http://trino:8080}"
+      TRINO_USER: "${TRINO_USER:-local}"
+      TRINO_CATALOG: "${TRINO_CATALOG:-iceberg}"
+      TRINO_SCHEMA: "${TRINO_SCHEMA:-arrow}"
+      ICEBERG_SCHEMA_LOCATION: "${ICEBERG_SCHEMA_LOCATION:-s3://arrow-flight/iceberg/arrow}"
+      TRINO_INIT_REQUIRE_SCHEMA: "${TRINO_INIT_REQUIRE_SCHEMA:-false}"
+    volumes:
+      - ./trino/init_schema.py:/init_schema.py:ro
+    command: ["python", "/init_schema.py"]
+
   metadata-db:
     image: postgres:16-alpine
     environment:
@@ -127,6 +175,40 @@ services:
     ports:
       - "50051:50051"
       - "9090:9090"
+
+  coordinator:
+    build:
+      context: ./coordinator-java
+    depends_on:
+      flight-server:
+        condition: service_started
+      trino-init:
+        condition: service_completed_successfully
+    environment:
+      COORDINATOR_ADDR: 0.0.0.0:8088
+      COORDINATOR_ADMIN_TOKEN: "${COORDINATOR_ADMIN_TOKEN:-}"
+      COORDINATOR_CAPABILITY_SECRET: "${COORDINATOR_CAPABILITY_SECRET:-local-dev-secret}"
+      COORDINATOR_CAPABILITY_TTL_MS: "${COORDINATOR_CAPABILITY_TTL_MS:-900000}"
+      COORDINATOR_PUT_CAPABILITY_TTL_MS: "${COORDINATOR_PUT_CAPABILITY_TTL_MS:-900000}"
+      COORDINATOR_GET_CAPABILITY_TTL_MS: "${COORDINATOR_GET_CAPABILITY_TTL_MS:-300000}"
+      COORDINATOR_STAGING_PREFIX_ROOT: "${COORDINATOR_STAGING_PREFIX_ROOT:-coordinator/staging}"
+      COORDINATOR_DEFAULT_TARGET_FILE_SIZE_BYTES: "${COORDINATOR_DEFAULT_TARGET_FILE_SIZE_BYTES:-536870912}"
+      COORDINATOR_DEFAULT_MAX_STREAM_BYTES: "${COORDINATOR_DEFAULT_MAX_STREAM_BYTES:-10737418240}"
+      COORDINATOR_DEFAULT_MAX_UPLOAD_STREAMS: "${COORDINATOR_DEFAULT_MAX_UPLOAD_STREAMS:-4}"
+      COORDINATOR_DEFAULT_PUT_MAX_RECORD_BATCH_BYTES: "${COORDINATOR_DEFAULT_PUT_MAX_RECORD_BATCH_BYTES:-268435456}"
+      COORDINATOR_DEFAULT_GET_MAX_BATCH_ROWS: "${COORDINATOR_DEFAULT_GET_MAX_BATCH_ROWS:-65536}"
+      COORDINATOR_DEFAULT_GET_MAX_RECORD_BATCH_BYTES: "${COORDINATOR_DEFAULT_GET_MAX_RECORD_BATCH_BYTES:-134217728}"
+      TRINO_URI: "${TRINO_URI:-http://trino:8080}"
+      TRINO_CATALOG: "${TRINO_CATALOG:-iceberg}"
+      TRINO_SCHEMA: "${TRINO_SCHEMA:-arrow}"
+      TRINO_SOURCE: "${TRINO_SOURCE:-arrow-flight-coordinator}"
+      CTAS_DEFAULT_CATALOG: "${CTAS_DEFAULT_CATALOG:-iceberg}"
+      CTAS_DEFAULT_SCHEMA: "${CTAS_DEFAULT_SCHEMA:-arrow}"
+      CTAS_TABLE_PREFIX: "${CTAS_TABLE_PREFIX:-ctas_tmp}"
+      WORKER_ID: "${WORKER_ID:-local-worker}"
+      WORKER_FLIGHT_URI: "${WORKER_FLIGHT_URI:-http://flight-server:50051}"
+    ports:
+      - "8088:8088"
 
   bench:
     profiles:

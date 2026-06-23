@@ -1,4 +1,4 @@
-use std::time::Instant;
+use std::{path::PathBuf, time::Instant};
 
 use anyhow::Result;
 use arrow_flight::{FlightClient, Ticket};
@@ -19,6 +19,12 @@ struct Args {
 
     #[arg(long, env = "FLIGHT_URI")]
     uri: Option<String>,
+
+    #[arg(long, env = "GET_TICKET_JSON")]
+    ticket_json: Option<String>,
+
+    #[arg(long, env = "GET_TICKET_FILE")]
+    ticket_file: Option<PathBuf>,
 }
 
 #[tokio::main(flavor = "multi_thread")]
@@ -34,8 +40,10 @@ async fn main() -> Result<()> {
             .max_encoding_message_size(config.max_message_size),
     );
 
+    let ticket_body = read_optional_text(&args.ticket_json, &args.ticket_file)?
+        .unwrap_or_else(|| args.path.clone());
     let ticket = Ticket {
-        ticket: Bytes::from(args.path.clone()),
+        ticket: Bytes::from(ticket_body),
     };
     let started = Instant::now();
     let mut stream = client.do_get(ticket).await?;
@@ -52,6 +60,9 @@ async fn main() -> Result<()> {
 
     println!("uri={uri}");
     println!("path={}", args.path);
+    if args.ticket_json.is_some() || args.ticket_file.is_some() {
+        println!("ticket=provided");
+    }
     println!("rows={rows}");
     println!("batches={batches}");
     println!("arrow_memory_bytes_estimate={arrow_memory_bytes_estimate}");
@@ -66,4 +77,13 @@ async fn main() -> Result<()> {
     );
 
     Ok(())
+}
+
+fn read_optional_text(inline: &Option<String>, file: &Option<PathBuf>) -> Result<Option<String>> {
+    match (inline, file) {
+        (Some(_), Some(_)) => anyhow::bail!("use only one of --ticket-json or --ticket-file"),
+        (Some(value), None) => Ok(Some(value.clone())),
+        (None, Some(path)) => std::fs::read_to_string(path).map(Some).map_err(Into::into),
+        (None, None) => Ok(None),
+    }
 }

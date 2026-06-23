@@ -144,6 +144,7 @@ pub(crate) struct PutContext {
     pub(crate) upload_id: Option<String>,
     pub(crate) stream_id: Option<String>,
     pub(crate) staging_prefix: Option<String>,
+    pub(crate) target_file_size: Option<usize>,
     pub(crate) upload_stream_limit: Option<usize>,
     pub(crate) stream_budget_bytes: Option<u64>,
     pub(crate) max_record_batch_bytes: u64,

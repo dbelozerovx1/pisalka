@@ -1,0 +1,187 @@
+package com.arrowflight.coordinator;
+
+import java.net.InetSocketAddress;
+import java.net.URI;
+import java.time.Duration;
+import java.util.Locale;
+import java.util.Optional;
+import java.util.UUID;
+
+final class Config {
+    final InetSocketAddress listenAddress;
+    final URI trinoUri;
+    final String trinoCatalog;
+    final String trinoSchema;
+    final String trinoSource;
+    final String ctasCatalog;
+    final String ctasSchema;
+    final String ctasTablePrefix;
+    final String workerId;
+    final String workerFlightUri;
+    final Optional<String> capabilitySecret;
+    final Optional<String> adminToken;
+    final long capabilityTtlMs;
+    final long putCapabilityTtlMs;
+    final long getCapabilityTtlMs;
+    final String stagingPrefixRoot;
+    final long defaultTargetFileSizeBytes;
+    final long defaultMaxStreamBytes;
+    final int defaultMaxUploadStreams;
+    final long defaultPutMaxRecordBatchBytes;
+    final int defaultGetMaxBatchRows;
+    final long defaultGetMaxRecordBatchBytes;
+    final Duration trinoRequestTimeout;
+
+    private Config(
+            InetSocketAddress listenAddress,
+            URI trinoUri,
+            String trinoCatalog,
+            String trinoSchema,
+            String trinoSource,
+            String ctasCatalog,
+            String ctasSchema,
+            String ctasTablePrefix,
+            String workerId,
+            String workerFlightUri,
+            Optional<String> capabilitySecret,
+            Optional<String> adminToken,
+            long capabilityTtlMs,
+            long putCapabilityTtlMs,
+            long getCapabilityTtlMs,
+            String stagingPrefixRoot,
+            long defaultTargetFileSizeBytes,
+            long defaultMaxStreamBytes,
+            int defaultMaxUploadStreams,
+            long defaultPutMaxRecordBatchBytes,
+            int defaultGetMaxBatchRows,
+            long defaultGetMaxRecordBatchBytes,
+            Duration trinoRequestTimeout
+    ) {
+        this.listenAddress = listenAddress;
+        this.trinoUri = trinoUri;
+        this.trinoCatalog = trinoCatalog;
+        this.trinoSchema = trinoSchema;
+        this.trinoSource = trinoSource;
+        this.ctasCatalog = ctasCatalog;
+        this.ctasSchema = ctasSchema;
+        this.ctasTablePrefix = ctasTablePrefix;
+        this.workerId = workerId;
+        this.workerFlightUri = workerFlightUri;
+        this.capabilitySecret = capabilitySecret;
+        this.adminToken = adminToken;
+        this.capabilityTtlMs = capabilityTtlMs;
+        this.putCapabilityTtlMs = putCapabilityTtlMs;
+        this.getCapabilityTtlMs = getCapabilityTtlMs;
+        this.stagingPrefixRoot = normalizePrefix(stagingPrefixRoot);
+        this.defaultTargetFileSizeBytes = defaultTargetFileSizeBytes;
+        this.defaultMaxStreamBytes = defaultMaxStreamBytes;
+        this.defaultMaxUploadStreams = defaultMaxUploadStreams;
+        this.defaultPutMaxRecordBatchBytes = defaultPutMaxRecordBatchBytes;
+        this.defaultGetMaxBatchRows = defaultGetMaxBatchRows;
+        this.defaultGetMaxRecordBatchBytes = defaultGetMaxRecordBatchBytes;
+        this.trinoRequestTimeout = trinoRequestTimeout;
+    }
+
+    static Config fromEnv() {
+        long capabilityTtlMs = envLong("COORDINATOR_CAPABILITY_TTL_MS", 15 * 60 * 1000L);
+        return new Config(
+                parseListenAddress(env("COORDINATOR_ADDR", "0.0.0.0:8088")),
+                URI.create(env("TRINO_URI", "http://host.docker.internal:8080")),
+                env("TRINO_CATALOG", "iceberg"),
+                env("TRINO_SCHEMA", "arrow"),
+                env("TRINO_SOURCE", "arrow-flight-coordinator"),
+                env("CTAS_DEFAULT_CATALOG", env("TRINO_CATALOG", "iceberg")),
+                env("CTAS_DEFAULT_SCHEMA", env("TRINO_SCHEMA", "arrow")),
+                env("CTAS_TABLE_PREFIX", "ctas_tmp"),
+                env("WORKER_ID", "local-worker"),
+                env("WORKER_FLIGHT_URI", "http://flight-server:50051"),
+                envOptional("COORDINATOR_CAPABILITY_SECRET").or(() -> envOptional("WORKER_CAPABILITY_SECRET")),
+                envOptional("COORDINATOR_ADMIN_TOKEN"),
+                capabilityTtlMs,
+                envLong("COORDINATOR_PUT_CAPABILITY_TTL_MS", capabilityTtlMs),
+                envLong("COORDINATOR_GET_CAPABILITY_TTL_MS", 5 * 60 * 1000L),
+                env("COORDINATOR_STAGING_PREFIX_ROOT", "coordinator/staging"),
+                envLong("COORDINATOR_DEFAULT_TARGET_FILE_SIZE_BYTES", 512L * 1024 * 1024),
+                envLong("COORDINATOR_DEFAULT_MAX_STREAM_BYTES", 10L * 1024 * 1024 * 1024),
+                envInt("COORDINATOR_DEFAULT_MAX_UPLOAD_STREAMS", 4),
+                envLong("COORDINATOR_DEFAULT_PUT_MAX_RECORD_BATCH_BYTES", 256L * 1024 * 1024),
+                envInt("COORDINATOR_DEFAULT_GET_MAX_BATCH_ROWS", 65_536),
+                envLong("COORDINATOR_DEFAULT_GET_MAX_RECORD_BATCH_BYTES", 128L * 1024 * 1024),
+                Duration.ofMillis(envLong("TRINO_REQUEST_TIMEOUT_MS", 30_000))
+        );
+    }
+
+    String generatedCtasTable() {
+        String suffix = UUID.randomUUID().toString().replace("-", "").toLowerCase(Locale.ROOT);
+        return ctasCatalog + "." + ctasSchema + "." + ctasTablePrefix + "_" + suffix;
+    }
+
+    String stagingPrefixForOperation(String operationId) {
+        return stagingPrefixRoot + "/" + operationId;
+    }
+
+    private static InetSocketAddress parseListenAddress(String raw) {
+        int split = raw.lastIndexOf(':');
+        if (split <= 0 || split == raw.length() - 1) {
+            throw new IllegalArgumentException("COORDINATOR_ADDR must look like 0.0.0.0:8088");
+        }
+        return new InetSocketAddress(raw.substring(0, split), Integer.parseInt(raw.substring(split + 1)));
+    }
+
+    static String normalizePrefix(String raw) {
+        String[] parts = raw.replace('\\', '/').split("/");
+        StringBuilder out = new StringBuilder();
+        for (String part : parts) {
+            if (part.isBlank() || part.equals(".") || part.equals("..")) {
+                continue;
+            }
+            if (!out.isEmpty()) {
+                out.append('/');
+            }
+            out.append(part);
+        }
+        if (out.isEmpty()) {
+            throw new IllegalArgumentException("prefix must not be empty");
+        }
+        return out.toString();
+    }
+
+    static String normalizePath(String raw) {
+        String[] parts = raw.replace('\\', '/').split("/");
+        StringBuilder out = new StringBuilder();
+        for (String part : parts) {
+            if (part.isBlank() || part.equals(".") || part.equals("..")) {
+                continue;
+            }
+            if (!out.isEmpty()) {
+                out.append('/');
+            }
+            out.append(part);
+        }
+        if (out.isEmpty()) {
+            throw new IllegalArgumentException("path must not be empty");
+        }
+        String path = out.toString();
+        return path.endsWith(".parquet") ? path : path + ".parquet";
+    }
+
+    private static String env(String key, String defaultValue) {
+        String value = System.getenv(key);
+        return value == null || value.isBlank() ? defaultValue : value.trim();
+    }
+
+    private static Optional<String> envOptional(String key) {
+        String value = System.getenv(key);
+        return value == null || value.isBlank() ? Optional.empty() : Optional.of(value.trim());
+    }
+
+    private static long envLong(String key, long defaultValue) {
+        String value = System.getenv(key);
+        return value == null || value.isBlank() ? defaultValue : Long.parseLong(value.trim());
+    }
+
+    private static int envInt(String key, int defaultValue) {
+        String value = System.getenv(key);
+        return value == null || value.isBlank() ? defaultValue : Integer.parseInt(value.trim());
+    }
+}
