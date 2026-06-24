@@ -56,7 +56,7 @@ final class CapabilitySigner {
         payload.put("attempt_id", attemptId);
         payload.put("upload_id", uploadId);
         payload.put("stream_id", streamId);
-        payload.put("worker_id", stringOrDefault(request, "workerId", config.workerId));
+        payload.put("worker_id", Json.requiredString(request, "workerId"));
         payload.put("issued_at_ms", now);
         payload.put("expires_at_ms", now + Json.longValue(request, "ttlMs", config.putCapabilityTtlMs));
         payload.put("allowed_output_prefix", stagingPrefix + "/");
@@ -69,7 +69,7 @@ final class CapabilitySigner {
         LinkedHashMap<String, Object> response = new LinkedHashMap<>();
         Map<String, Object> envelope = sign(payload);
         response.put("workerId", payload.get("worker_id"));
-        response.put("flightUri", stringOrDefault(request, "flightUri", config.workerFlightUri));
+        response.put("flightUri", Json.requiredString(request, "flightUri"));
         response.put("descriptorPath", path);
         response.put("operationId", operationId);
         response.put("attemptId", attemptId);
@@ -90,7 +90,7 @@ final class CapabilitySigner {
         LinkedHashMap<String, Object> payload = new LinkedHashMap<>();
         payload.put("op", "get");
         payload.put("operation_id", operationId);
-        payload.put("worker_id", stringOrDefault(request, "workerId", config.workerId));
+        payload.put("worker_id", Json.requiredString(request, "workerId"));
         payload.put("issued_at_ms", now);
         payload.put("expires_at_ms", now + Json.longValue(request, "ttlMs", config.getCapabilityTtlMs));
         payload.put("path", path);
@@ -100,7 +100,7 @@ final class CapabilitySigner {
         LinkedHashMap<String, Object> response = new LinkedHashMap<>();
         Map<String, Object> envelope = sign(payload);
         response.put("workerId", payload.get("worker_id"));
-        response.put("flightUri", stringOrDefault(request, "flightUri", config.workerFlightUri));
+        response.put("flightUri", Json.requiredString(request, "flightUri"));
         response.put("path", path);
         response.put("operationId", operationId);
         response.put("expiresAtMs", payload.get("expires_at_ms"));

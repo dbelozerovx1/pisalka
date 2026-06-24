@@ -112,6 +112,82 @@ final class CoordinatorMetadataStore {
         }
     }
 
+    List<WorkerAssignment> selectPutWorkers(int requestedStreams) {
+        requireEnabled();
+        try (Connection connection = connect()) {
+            List<WorkerRegistryEntry> workers = loadPutCandidates(connection);
+            ArrayList<WorkerAssignment> assignments = new ArrayList<>();
+            if (requestedStreams <= 0) {
+                return assignments;
+            }
+
+            while (assignments.size() < requestedStreams) {
+                boolean progressed = false;
+                for (WorkerRegistryEntry worker : workers) {
+                    if (assignments.size() >= requestedStreams) {
+                        break;
+                    }
+                    if (worker.remainingPutStreams() <= 0) {
+                        continue;
+                    }
+                    assignments.add(worker.assignPut());
+                    progressed = true;
+                }
+                if (!progressed) {
+                    break;
+                }
+            }
+
+            if (assignments.isEmpty()) {
+                throw new HttpSupport.HttpError(503, "no live data-plane worker has available DoPut capacity");
+            }
+            return assignments;
+        } catch (SQLException error) {
+            throw new IllegalStateException("failed to select DoPut workers from registry", error);
+        }
+    }
+
+    WorkerAssignment selectReadWorker() {
+        requireEnabled();
+        try (Connection connection = connect();
+             PreparedStatement statement = connection.prepareStatement("""
+                     SELECT worker_id,
+                            flight_uri,
+                            read_recommended_streams,
+                            read_selection_score,
+                            read_utilization_per_mille,
+                            read_admission_wait_ms_ewma,
+                            read_throughput_bytes_per_sec_ewma,
+                            last_heartbeat_at
+                     FROM worker_registry
+                     WHERE state = 'ACTIVE'
+                       AND draining = false
+                       AND read_recommended_streams > 0
+                       AND extract(epoch FROM (now() - last_heartbeat_at)) * 1000 <= registry_ttl_ms
+                     ORDER BY read_selection_score DESC,
+                              read_recommended_streams DESC,
+                              read_admission_wait_ms_ewma ASC,
+                              last_heartbeat_at DESC
+                     LIMIT 1
+                     """)) {
+            try (ResultSet rows = statement.executeQuery()) {
+                if (!rows.next()) {
+                    throw new HttpSupport.HttpError(503, "no live data-plane worker has available DoGet capacity");
+                }
+                return new WorkerAssignment(
+                        rows.getString("worker_id"),
+                        rows.getString("flight_uri"),
+                        rows.getLong("read_selection_score"),
+                        rows.getInt("read_utilization_per_mille"),
+                        rows.getLong("read_admission_wait_ms_ewma"),
+                        rows.getLong("read_throughput_bytes_per_sec_ewma")
+                );
+            }
+        } catch (SQLException error) {
+            throw new IllegalStateException("failed to select DoGet worker from registry", error);
+        }
+    }
+
     void markRunning(String uploadId) {
         updateStatus(uploadId, "RUNNING", Optional.empty(), Optional.empty(), false);
     }
@@ -205,6 +281,44 @@ final class CoordinatorMetadataStore {
                         rows.getTimestamp("expires_at").toInstant(),
                         Optional.ofNullable(rows.getTimestamp("completed_at")).map(Timestamp::toInstant)
                 );
+            }
+        }
+    }
+
+    private List<WorkerRegistryEntry> loadPutCandidates(Connection connection) throws SQLException {
+        try (PreparedStatement statement = connection.prepareStatement("""
+                SELECT worker_id,
+                       flight_uri,
+                       put_recommended_streams,
+                       put_selection_score,
+                       put_utilization_per_mille,
+                       put_admission_wait_ms_ewma,
+                       put_throughput_bytes_per_sec_ewma,
+                       last_heartbeat_at
+                FROM worker_registry
+                WHERE state = 'ACTIVE'
+                  AND draining = false
+                  AND put_recommended_streams > 0
+                  AND extract(epoch FROM (now() - last_heartbeat_at)) * 1000 <= registry_ttl_ms
+                ORDER BY put_selection_score DESC,
+                         put_recommended_streams DESC,
+                         put_admission_wait_ms_ewma ASC,
+                         last_heartbeat_at DESC
+                """)) {
+            try (ResultSet rows = statement.executeQuery()) {
+                ArrayList<WorkerRegistryEntry> workers = new ArrayList<>();
+                while (rows.next()) {
+                    workers.add(new WorkerRegistryEntry(
+                            rows.getString("worker_id"),
+                            rows.getString("flight_uri"),
+                            rows.getInt("put_recommended_streams"),
+                            rows.getLong("put_selection_score"),
+                            rows.getInt("put_utilization_per_mille"),
+                            rows.getLong("put_admission_wait_ms_ewma"),
+                            rows.getLong("put_throughput_bytes_per_sec_ewma")
+                    ));
+                }
+                return workers;
             }
         }
     }
@@ -516,6 +630,70 @@ record UploadSnapshot(
         body.put("streams", streams.stream().map(UploadStreamState::toJson).toList());
         body.put("files", files.stream().map(UploadFile::toJson).toList());
         body.put("allStreamsSucceeded", allStreamsSucceeded());
+        return body;
+    }
+}
+
+final class WorkerRegistryEntry {
+    private final String workerId;
+    private final String flightUri;
+    private int remainingPutStreams;
+    private final long selectionScore;
+    private final int utilizationPerMille;
+    private final long admissionWaitMsEwma;
+    private final long throughputBytesPerSecEwma;
+
+    WorkerRegistryEntry(
+            String workerId,
+            String flightUri,
+            int remainingPutStreams,
+            long selectionScore,
+            int utilizationPerMille,
+            long admissionWaitMsEwma,
+            long throughputBytesPerSecEwma
+    ) {
+        this.workerId = workerId;
+        this.flightUri = flightUri;
+        this.remainingPutStreams = remainingPutStreams;
+        this.selectionScore = selectionScore;
+        this.utilizationPerMille = utilizationPerMille;
+        this.admissionWaitMsEwma = admissionWaitMsEwma;
+        this.throughputBytesPerSecEwma = throughputBytesPerSecEwma;
+    }
+
+    int remainingPutStreams() {
+        return remainingPutStreams;
+    }
+
+    WorkerAssignment assignPut() {
+        remainingPutStreams--;
+        return new WorkerAssignment(
+                workerId,
+                flightUri,
+                selectionScore,
+                utilizationPerMille,
+                admissionWaitMsEwma,
+                throughputBytesPerSecEwma
+        );
+    }
+}
+
+record WorkerAssignment(
+        String workerId,
+        String flightUri,
+        long selectionScore,
+        int utilizationPerMille,
+        long admissionWaitMsEwma,
+        long throughputBytesPerSecEwma
+) {
+    Map<String, Object> toJson() {
+        LinkedHashMap<String, Object> body = new LinkedHashMap<>();
+        body.put("workerId", workerId);
+        body.put("flightUri", flightUri);
+        body.put("selectionScore", selectionScore);
+        body.put("utilizationPerMille", utilizationPerMille);
+        body.put("admissionWaitMsEwma", admissionWaitMsEwma);
+        body.put("throughputBytesPerSecEwma", throughputBytesPerSecEwma);
         return body;
     }
 }

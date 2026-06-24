@@ -7,6 +7,7 @@ import java.io.IOException;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
@@ -42,11 +43,10 @@ public final class CoordinatorApplication {
         server.start();
 
         System.out.printf(
-                "coordinator listening on %s, trino=%s, worker=%s %s%n",
+                "coordinator listening on %s, trino=%s, metadata_db=%s%n",
                 config.listenAddress,
                 config.trinoUri,
-                config.workerId,
-                config.workerFlightUri
+                app.metadataStore.enabled()
         );
     }
 
@@ -83,8 +83,6 @@ public final class CoordinatorApplication {
         body.put("trinoSchema", config.trinoSchema);
         body.put("ctasCatalog", config.ctasCatalog);
         body.put("ctasSchema", config.ctasSchema);
-        body.put("workerId", config.workerId);
-        body.put("workerFlightUri", config.workerFlightUri);
         body.put("capabilitySigningConfigured", config.capabilitySecret.isPresent());
         body.put("adminTokenConfigured", config.adminToken.isPresent());
         body.put("metadataDatabaseConfigured", metadataStore.enabled());
@@ -118,7 +116,11 @@ public final class CoordinatorApplication {
         HttpSupport.requireMethod(exchange, "POST");
         HttpSupport.requireAdminIfConfigured(exchange, config);
         Map<String, Object> request = HttpSupport.readJson(exchange);
-        HttpSupport.sendJson(exchange, 200, capabilitySigner.putPayload(request));
+        WorkerAssignment worker = metadataStore.selectPutWorkers(1).get(0);
+        LinkedHashMap<String, Object> signedRequest = new LinkedHashMap<>(request);
+        signedRequest.put("workerId", worker.workerId());
+        signedRequest.put("flightUri", worker.flightUri());
+        HttpSupport.sendJson(exchange, 200, capabilitySigner.putPayload(signedRequest));
     }
 
     private void handleCreateUpload(HttpExchange exchange) throws IOException {
@@ -133,10 +135,12 @@ public final class CoordinatorApplication {
                 : config.stagingPrefixForOperation(operationId);
         Optional<String> tableName = Optional.ofNullable(Json.string(request, "tableName"))
                 .filter(value -> !value.isBlank());
-        int streams = Math.max(1, Math.min(
+        int requestedStreams = Math.max(1, Math.min(
                 Json.intValue(request, "streams", config.defaultUploadStreams),
                 config.defaultMaxUploadStreams
         ));
+        List<WorkerAssignment> workerAssignments = metadataStore.selectPutWorkers(requestedStreams);
+        int streams = workerAssignments.size();
         long targetFileSize = Json.longValue(request, "targetFileSizeBytes", config.defaultTargetFileSizeBytes);
         Optional<Long> maxStreamBytes = optionalLong(request, "maxStreamBytes", config.defaultMaxStreamBytes);
         Optional<Long> maxRecordBatchBytes = optionalLong(
@@ -153,6 +157,7 @@ public final class CoordinatorApplication {
         ArrayList<PlannedUploadStream> plannedStreams = new ArrayList<>();
         ArrayList<Map<String, Object>> ticketBodies = new ArrayList<>();
         for (int index = 0; index < streams; index++) {
+            WorkerAssignment worker = workerAssignments.get(index);
             String streamId = "stream-%05d".formatted(index);
             String attemptId = UUID.randomUUID().toString();
             String descriptorPath = stagingPrefix + "/" + streamId + ".parquet";
@@ -161,8 +166,8 @@ public final class CoordinatorApplication {
             ticketRequest.put("attemptId", attemptId);
             ticketRequest.put("uploadId", uploadId);
             ticketRequest.put("streamId", streamId);
-            ticketRequest.put("workerId", config.workerId);
-            ticketRequest.put("flightUri", config.workerFlightUri);
+            ticketRequest.put("workerId", worker.workerId());
+            ticketRequest.put("flightUri", worker.flightUri());
             ticketRequest.put("stagingPrefix", stagingPrefix);
             ticketRequest.put("path", descriptorPath);
             ticketRequest.put("targetFileSizeBytes", targetFileSize);
@@ -175,8 +180,8 @@ public final class CoordinatorApplication {
             plannedStreams.add(new PlannedUploadStream(
                     streamId,
                     attemptId,
-                    config.workerId,
-                    config.workerFlightUri,
+                    worker.workerId(),
+                    worker.flightUri(),
                     descriptorPath,
                     ticket
             ));
@@ -201,10 +206,13 @@ public final class CoordinatorApplication {
         body.put("operationId", operationId);
         tableName.ifPresent(value -> body.put("tableName", value));
         body.put("status", "PLANNED");
+        body.put("requestedStreams", requestedStreams);
+        body.put("grantedStreams", streams);
         body.put("expectedStreams", streams);
         body.put("stagingPrefix", stagingPrefix + "/");
         body.put("targetFileSizeBytes", targetFileSize);
         body.put("expiresAtMs", expiresAt.toEpochMilli());
+        body.put("selectedWorkers", workerAssignments.stream().map(WorkerAssignment::toJson).toList());
         body.put("tickets", ticketBodies);
         HttpSupport.sendJson(exchange, 200, body);
     }
@@ -283,7 +291,13 @@ public final class CoordinatorApplication {
         HttpSupport.requireMethod(exchange, "POST");
         HttpSupport.requireAdminIfConfigured(exchange, config);
         Map<String, Object> request = HttpSupport.readJson(exchange);
-        HttpSupport.sendJson(exchange, 200, capabilitySigner.getPayload(request));
+        WorkerAssignment worker = metadataStore.selectReadWorker();
+        LinkedHashMap<String, Object> signedRequest = new LinkedHashMap<>(request);
+        signedRequest.put("workerId", worker.workerId());
+        signedRequest.put("flightUri", worker.flightUri());
+        Map<String, Object> response = new LinkedHashMap<>(capabilitySigner.getPayload(signedRequest));
+        response.put("selectedWorker", worker.toJson());
+        HttpSupport.sendJson(exchange, 200, response);
     }
 
     private static String stringOrDefault(Map<String, Object> request, String key, String defaultValue) {

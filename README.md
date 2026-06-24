@@ -168,7 +168,7 @@ Useful environment variables:
 - `READ_SCHEDULER_RESERVED_SLOTS=0`
 - `READ_SLOT_WAIT_MS=30000`
 - `WORKER_ZONE=` optional coordinator locality hint
-- `WORKER_FLIGHT_URI=http://127.0.0.1:50051`
+- `WORKER_FLIGHT_URI=http://127.0.0.1:50051` worker-published URI stored in `worker_registry`; in Docker Compose this defaults to `http://flight-server:50051`
 - `WORKER_REQUIRE_STRUCTURED_TICKETS=false`
 - `WORKER_REQUIRE_SIGNED_CAPABILITIES=false`
 - `WORKER_CAPABILITY_SECRET=`
@@ -208,12 +208,12 @@ Defaults favor the fastest measured local write path: uncompressed Parquet, dict
 The coordinator intentionally stays small for the first full-system run:
 
 - `POST /v1/ctas`: accepts user SQL, wraps it as `CREATE TABLE ... AS <sql>`, forwards the caller's `Authorization` header and `X-Trino-User` to Trino, and returns Trino query metadata.
-- `POST /v1/flight/create-upload`: creates a durable upload session, plans the expected stream count, persists planned stream attempts, and returns one signed `DoPut` ticket per stream.
+- `POST /v1/flight/create-upload`: creates a durable upload session, selects workers from `worker_registry`, persists planned stream attempts, and returns one signed `DoPut` ticket per granted stream.
 - `POST /v1/flight/upload-status`: returns the planned session, stream status joined with worker stream metadata, and written file rows.
 - `POST /v1/flight/finish-upload`: explicit finalization gate. It succeeds only when all planned streams are `SUCCEEDED`, reads DB-backed worker file/schema metadata, marks the upload `READY_TO_COMMIT`, and returns the file list plus a Trino `CREATE TABLE` DDL preview.
 - `POST /v1/flight/abort-upload`: marks an upload `ABORTED`. Staged-file cleanup is intentionally a separate follow-up task.
-- `POST /v1/flight/put-ticket`: mints one signed `DoPut` capability for a coordinator-controlled staging prefix. This remains a low-level/internal dev API; session uploads should use `create-upload`.
-- `POST /v1/flight/get-ticket`: mints a signed exact-file `DoGet` ticket. Also internal unless protected by `COORDINATOR_ADMIN_TOKEN`.
+- `POST /v1/flight/put-ticket`: selects a write-capable worker from `worker_registry` and mints one signed `DoPut` capability for a coordinator-controlled staging prefix. This remains a low-level/internal dev API; session uploads should use `create-upload`.
+- `POST /v1/flight/get-ticket`: selects a read-capable worker from `worker_registry` and mints a signed exact-file `DoGet` ticket. Also internal unless protected by `COORDINATOR_ADMIN_TOKEN`.
 - `GET /v1/config`: shows non-secret coordinator config.
 
 Example CTAS call:
@@ -238,10 +238,12 @@ Each returned ticket contains a `descriptorPath` and `appMetadata` signed JSON e
 
 Commit/readiness flow:
 
-1. `create-upload` persists `coordinator_upload_sessions` and `coordinator_upload_streams` rows before data moves.
-2. Each worker `DoPut` persists its stream status, Arrow schema JSON from the first decoded batch, and written Parquet file rows in `worker_put_streams` / `worker_put_files`.
-3. `finish-upload` compares planned streams to actual worker outcomes. Missing, running, rejected, or failed streams block finalization.
-4. When all streams succeeded, the coordinator returns `READY_TO_COMMIT` with DB-backed file paths and a generated Trino DDL preview. Files are still staged until a later Iceberg commit/add-files step makes them table-visible.
+1. Workers publish `worker_registry` heartbeats with their Flight URI, live read/write capacity, memory-derived recommended streams, utilization, EWMA wait/throughput, and selection score.
+2. `create-upload` selects active, non-draining, heartbeat-fresh workers from `worker_registry`; coordinator has no configured worker id/url.
+3. `create-upload` persists `coordinator_upload_sessions` and `coordinator_upload_streams` rows before data moves.
+4. Each worker `DoPut` persists its stream status, Arrow schema JSON from the first decoded batch, and written Parquet file rows in `worker_put_streams` / `worker_put_files`.
+5. `finish-upload` compares planned streams to actual worker outcomes. Missing, running, rejected, or failed streams block finalization.
+6. When all streams succeeded, the coordinator returns `READY_TO_COMMIT` with DB-backed file paths and a generated Trino DDL preview. Files are still staged until a later Iceberg commit/add-files step makes them table-visible.
 
 Without `--file-size` / `TARGET_FILE_SIZE`, `DoPut` writes one Parquet object at the requested path. With a target file size, `DoPut` writes multiple ordered part files under `<name>.parts/` and returns the file list in the `DoPut` result and metadata DB. `PUT_PARALLELISM` controls the maximum number of active part writers. `DoGet` accepts a direct physical Parquet path ticket and streams that file back.
 

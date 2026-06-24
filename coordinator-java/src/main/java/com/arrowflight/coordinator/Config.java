@@ -16,8 +16,6 @@ final class Config {
     final String ctasCatalog;
     final String ctasSchema;
     final String ctasTablePrefix;
-    final String workerId;
-    final String workerFlightUri;
     final Optional<String> capabilitySecret;
     final Optional<String> adminToken;
     final Optional<String> metadataDatabaseUrl;
@@ -45,8 +43,6 @@ final class Config {
             String ctasCatalog,
             String ctasSchema,
             String ctasTablePrefix,
-            String workerId,
-            String workerFlightUri,
             Optional<String> capabilitySecret,
             Optional<String> adminToken,
             Optional<String> metadataDatabaseUrl,
@@ -73,8 +69,6 @@ final class Config {
         this.ctasCatalog = ctasCatalog;
         this.ctasSchema = ctasSchema;
         this.ctasTablePrefix = ctasTablePrefix;
-        this.workerId = workerId;
-        this.workerFlightUri = workerFlightUri;
         this.capabilitySecret = capabilitySecret;
         this.adminToken = adminToken;
         this.metadataDatabaseUrl = metadataDatabaseUrl;
@@ -105,8 +99,6 @@ final class Config {
                 env("CTAS_DEFAULT_CATALOG", env("TRINO_CATALOG", "iceberg")),
                 env("CTAS_DEFAULT_SCHEMA", env("TRINO_SCHEMA", "arrow")),
                 env("CTAS_TABLE_PREFIX", "ctas_tmp"),
-                env("WORKER_ID", "local-worker"),
-                env("WORKER_FLIGHT_URI", "http://flight-server:50051"),
                 envOptional("COORDINATOR_CAPABILITY_SECRET").or(() -> envOptional("WORKER_CAPABILITY_SECRET")),
                 envOptional("COORDINATOR_ADMIN_TOKEN"),
                 envOptional("COORDINATOR_METADATA_DATABASE_URL").or(() -> envOptional("METADATA_DATABASE_URL")),
