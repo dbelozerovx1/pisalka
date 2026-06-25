@@ -9,6 +9,7 @@ import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Timestamp;
+import java.sql.Types;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
@@ -16,6 +17,8 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Properties;
+
+import org.postgresql.util.PGobject;
 
 final class CoordinatorMetadataStore {
     private final Optional<JdbcTarget> jdbcTarget;
@@ -30,7 +33,7 @@ final class CoordinatorMetadataStore {
 
     void requireEnabled() {
         if (jdbcTarget.isEmpty()) {
-            throw new HttpSupport.HttpError(503, "coordinator metadata database is not configured");
+            throw new CoordinatorException(503, "coordinator metadata database is not configured");
         }
     }
 
@@ -139,7 +142,7 @@ final class CoordinatorMetadataStore {
             }
 
             if (assignments.isEmpty()) {
-                throw new HttpSupport.HttpError(503, "no live data-plane worker has available DoPut capacity");
+                throw new CoordinatorException(503, "no live data-plane worker has available DoPut capacity");
             }
             return assignments;
         } catch (SQLException error) {
@@ -172,7 +175,7 @@ final class CoordinatorMetadataStore {
                      """)) {
             try (ResultSet rows = statement.executeQuery()) {
                 if (!rows.next()) {
-                    throw new HttpSupport.HttpError(503, "no live data-plane worker has available DoGet capacity");
+                    throw new CoordinatorException(503, "no live data-plane worker has available DoGet capacity");
                 }
                 return new WorkerAssignment(
                         rows.getString("worker_id"),
@@ -185,6 +188,233 @@ final class CoordinatorMetadataStore {
             }
         } catch (SQLException error) {
             throw new IllegalStateException("failed to select DoGet worker from registry", error);
+        }
+    }
+
+    void createQuery(QueryRegistryRecord record) {
+        requireEnabled();
+        try (Connection connection = connect();
+             PreparedStatement statement = connection.prepareStatement("""
+                     INSERT INTO coordinator_query_registry (
+                         query_id,
+                         query_type,
+                         status,
+                         descriptor_json,
+                         target_table,
+                         submitted_sql,
+                         trino_user,
+                         trino_query_id,
+                         trino_info_uri,
+                         trino_next_uri,
+                         trino_stats_json,
+                         progress,
+                         error_message,
+                         result_flight_info_json,
+                         result_tickets_json,
+                         result_files_json,
+                         expires_at,
+                         completed_at,
+                         updated_at
+                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, now())
+                     """)) {
+            statement.setString(1, record.queryId());
+            statement.setString(2, record.queryType());
+            statement.setString(3, record.status());
+            statement.setObject(4, jsonb(record.descriptorJson()), Types.OTHER);
+            statement.setString(5, record.targetTable().orElse(null));
+            statement.setString(6, record.submittedSql().orElse(null));
+            statement.setString(7, record.trinoUser().orElse(null));
+            statement.setString(8, record.trinoQueryId().orElse(null));
+            statement.setString(9, record.trinoInfoUri().orElse(null));
+            statement.setString(10, record.trinoNextUri().orElse(null));
+            statement.setObject(11, jsonb(record.trinoStatsJson()), Types.OTHER);
+            setNullableDouble(statement, 12, record.progress());
+            statement.setString(13, record.errorMessage().orElse(null));
+            statement.setObject(14, jsonb(record.resultFlightInfoJson()), Types.OTHER);
+            statement.setObject(15, jsonb(record.resultTicketsJson()), Types.OTHER);
+            statement.setObject(16, jsonb(record.resultFilesJson()), Types.OTHER);
+            statement.setTimestamp(17, Timestamp.from(record.expiresAt()));
+            statement.setTimestamp(18, record.completedAt().map(Timestamp::from).orElse(null));
+            statement.executeUpdate();
+        } catch (SQLException error) {
+            throw new IllegalStateException("failed to create query registry row", error);
+        }
+    }
+
+    QueryRegistryRecord loadQuery(String queryId) {
+        requireEnabled();
+        try (Connection connection = connect();
+             PreparedStatement statement = connection.prepareStatement("""
+                     SELECT query_id,
+                            query_type,
+                            status,
+                            descriptor_json::text AS descriptor_json,
+                            target_table,
+                            submitted_sql,
+                            trino_user,
+                            trino_query_id,
+                            trino_info_uri,
+                            trino_next_uri,
+                            trino_stats_json::text AS trino_stats_json,
+                            progress,
+                            error_message,
+                            result_flight_info_json::text AS result_flight_info_json,
+                            result_tickets_json::text AS result_tickets_json,
+                            result_files_json::text AS result_files_json,
+                            created_at,
+                            updated_at,
+                            expires_at,
+                            completed_at
+                     FROM coordinator_query_registry
+                     WHERE query_id = ?
+                     """)) {
+            statement.setString(1, queryId);
+            try (ResultSet rows = statement.executeQuery()) {
+                if (!rows.next()) {
+                    throw new CoordinatorException(404, "query registry row was not found");
+                }
+                return queryRecord(rows);
+            }
+        } catch (SQLException error) {
+            throw new IllegalStateException("failed to load query registry row", error);
+        }
+    }
+
+    void markQueryRunning(
+            String queryId,
+            Optional<String> trinoQueryId,
+            Optional<String> trinoInfoUri,
+            Optional<String> trinoNextUri,
+            Optional<Map<String, Object>> trinoStatsJson,
+            Optional<Double> progress
+    ) {
+        markQueryRunning(
+                queryId,
+                trinoQueryId,
+                trinoInfoUri,
+                trinoNextUri,
+                trinoStatsJson,
+                progress,
+                Optional.empty(),
+                Optional.empty()
+        );
+    }
+
+    void markQueryRunning(
+            String queryId,
+            Optional<String> trinoQueryId,
+            Optional<String> trinoInfoUri,
+            Optional<String> trinoNextUri,
+            Optional<Map<String, Object>> trinoStatsJson,
+            Optional<Double> progress,
+            Optional<Map<String, Object>> resultFlightInfoJson,
+            Optional<Map<String, Object>> resultFilesJson
+    ) {
+        requireEnabled();
+        try (Connection connection = connect();
+             PreparedStatement statement = connection.prepareStatement("""
+                     UPDATE coordinator_query_registry
+                     SET status = 'RUNNING',
+                         trino_query_id = COALESCE(?, trino_query_id),
+                         trino_info_uri = COALESCE(?, trino_info_uri),
+                         trino_next_uri = ?,
+                         trino_stats_json = COALESCE(?, trino_stats_json),
+                         progress = COALESCE(?, progress),
+                         error_message = NULL,
+                         result_flight_info_json = COALESCE(?, result_flight_info_json),
+                         result_files_json = COALESCE(?, result_files_json),
+                         updated_at = now()
+                     WHERE query_id = ?
+                     """)) {
+            statement.setString(1, trinoQueryId.orElse(null));
+            statement.setString(2, trinoInfoUri.orElse(null));
+            statement.setString(3, trinoNextUri.orElse(null));
+            statement.setObject(4, jsonb(trinoStatsJson), Types.OTHER);
+            setNullableDouble(statement, 5, progress);
+            statement.setObject(6, jsonb(resultFlightInfoJson), Types.OTHER);
+            statement.setObject(7, jsonb(resultFilesJson), Types.OTHER);
+            statement.setString(8, queryId);
+            if (statement.executeUpdate() == 0) {
+                throw new CoordinatorException(404, "query registry row was not found");
+            }
+        } catch (SQLException error) {
+            throw new IllegalStateException("failed to mark query running", error);
+        }
+    }
+
+    void markQuerySucceeded(
+            String queryId,
+            Map<String, Object> resultFlightInfoJson,
+            Map<String, Object> resultTicketsJson,
+            Map<String, Object> resultFilesJson,
+            Optional<Map<String, Object>> trinoStatsJson,
+            Optional<Double> progress
+    ) {
+        requireEnabled();
+        try (Connection connection = connect();
+             PreparedStatement statement = connection.prepareStatement("""
+                     UPDATE coordinator_query_registry
+                     SET status = 'SUCCEEDED',
+                         trino_next_uri = NULL,
+                         trino_stats_json = COALESCE(?, trino_stats_json),
+                         progress = COALESCE(?, 1.0),
+                         error_message = NULL,
+                         result_flight_info_json = ?,
+                         result_tickets_json = ?,
+                         result_files_json = ?,
+                         updated_at = now(),
+                         completed_at = COALESCE(completed_at, now())
+                     WHERE query_id = ?
+                     """)) {
+            statement.setObject(1, jsonb(trinoStatsJson), Types.OTHER);
+            setNullableDouble(statement, 2, progress);
+            statement.setObject(3, jsonb(Optional.of(resultFlightInfoJson)), Types.OTHER);
+            statement.setObject(4, jsonb(Optional.of(resultTicketsJson)), Types.OTHER);
+            statement.setObject(5, jsonb(Optional.of(resultFilesJson)), Types.OTHER);
+            statement.setString(6, queryId);
+            if (statement.executeUpdate() == 0) {
+                throw new CoordinatorException(404, "query registry row was not found");
+            }
+        } catch (SQLException error) {
+            throw new IllegalStateException("failed to mark query succeeded", error);
+        }
+    }
+
+    void markQueryFailed(String queryId, String errorMessage, Optional<Map<String, Object>> trinoStatsJson) {
+        requireEnabled();
+        try (Connection connection = connect();
+             PreparedStatement statement = connection.prepareStatement("""
+                     UPDATE coordinator_query_registry
+                     SET status = 'FAILED',
+                         trino_next_uri = NULL,
+                         trino_stats_json = COALESCE(?, trino_stats_json),
+                         error_message = ?,
+                         updated_at = now(),
+                         completed_at = COALESCE(completed_at, now())
+                     WHERE query_id = ?
+                     """)) {
+            statement.setObject(1, jsonb(trinoStatsJson), Types.OTHER);
+            statement.setString(2, errorMessage);
+            statement.setString(3, queryId);
+            if (statement.executeUpdate() == 0) {
+                throw new CoordinatorException(404, "query registry row was not found");
+            }
+        } catch (SQLException error) {
+            throw new IllegalStateException("failed to mark query failed", error);
+        }
+    }
+
+    int cleanupExpiredQueries(Instant now) {
+        requireEnabled();
+        try (Connection connection = connect();
+             PreparedStatement statement = connection.prepareStatement("""
+                     DELETE FROM coordinator_query_registry
+                     WHERE expires_at < ?
+                     """)) {
+            statement.setTimestamp(1, Timestamp.from(now));
+            return statement.executeUpdate();
+        } catch (SQLException error) {
+            throw new IllegalStateException("failed to cleanup expired query registry rows", error);
         }
     }
 
@@ -232,7 +462,7 @@ final class CoordinatorMetadataStore {
             statement.setBoolean(4, completed);
             statement.setString(5, uploadId);
             if (statement.executeUpdate() == 0) {
-                throw new HttpSupport.HttpError(404, "upload session was not found");
+                throw new CoordinatorException(404, "upload session was not found");
             }
         } catch (SQLException error) {
             throw new IllegalStateException("failed to update upload session metadata", error);
@@ -262,7 +492,7 @@ final class CoordinatorMetadataStore {
             statement.setString(1, uploadId);
             try (ResultSet rows = statement.executeQuery()) {
                 if (!rows.next()) {
-                    throw new HttpSupport.HttpError(404, "upload session was not found");
+                    throw new CoordinatorException(404, "upload session was not found");
                 }
                 return new UploadSessionRecord(
                         rows.getString("upload_id"),
@@ -461,6 +691,111 @@ final class CoordinatorMetadataStore {
         long value = rows.getLong(name);
         return rows.wasNull() ? Optional.empty() : Optional.of(value);
     }
+
+    private static Optional<Double> nullableDouble(ResultSet rows, String name) throws SQLException {
+        double value = rows.getDouble(name);
+        return rows.wasNull() ? Optional.empty() : Optional.of(value);
+    }
+
+    private static void setNullableDouble(PreparedStatement statement, int index, Optional<Double> value) throws SQLException {
+        if (value.isPresent()) {
+            statement.setDouble(index, value.get());
+        } else {
+            statement.setObject(index, null);
+        }
+    }
+
+    private static PGobject jsonb(Optional<Map<String, Object>> value) throws SQLException {
+        if (value.isEmpty()) {
+            return null;
+        }
+        return jsonb(value.get());
+    }
+
+    private static PGobject jsonb(Map<String, Object> value) throws SQLException {
+        PGobject object = new PGobject();
+        object.setType("jsonb");
+        object.setValue(Json.stringify(value));
+        return object;
+    }
+
+    private static Optional<Map<String, Object>> nullableJsonObject(ResultSet rows, String name) throws SQLException {
+        String value = rows.getString(name);
+        if (value == null || value.isBlank()) {
+            return Optional.empty();
+        }
+        return Optional.of(Json.parseObject(value));
+    }
+
+    private static QueryRegistryRecord queryRecord(ResultSet rows) throws SQLException {
+        return new QueryRegistryRecord(
+                rows.getString("query_id"),
+                rows.getString("query_type"),
+                rows.getString("status"),
+                Json.parseObject(rows.getString("descriptor_json")),
+                Optional.ofNullable(rows.getString("target_table")),
+                Optional.ofNullable(rows.getString("submitted_sql")),
+                Optional.ofNullable(rows.getString("trino_user")),
+                Optional.ofNullable(rows.getString("trino_query_id")),
+                Optional.ofNullable(rows.getString("trino_info_uri")),
+                Optional.ofNullable(rows.getString("trino_next_uri")),
+                nullableJsonObject(rows, "trino_stats_json"),
+                nullableDouble(rows, "progress"),
+                Optional.ofNullable(rows.getString("error_message")),
+                nullableJsonObject(rows, "result_flight_info_json"),
+                nullableJsonObject(rows, "result_tickets_json"),
+                nullableJsonObject(rows, "result_files_json"),
+                rows.getTimestamp("created_at").toInstant(),
+                rows.getTimestamp("updated_at").toInstant(),
+                rows.getTimestamp("expires_at").toInstant(),
+                Optional.ofNullable(rows.getTimestamp("completed_at")).map(Timestamp::toInstant)
+        );
+    }
+}
+
+record QueryRegistryRecord(
+        String queryId,
+        String queryType,
+        String status,
+        Map<String, Object> descriptorJson,
+        Optional<String> targetTable,
+        Optional<String> submittedSql,
+        Optional<String> trinoUser,
+        Optional<String> trinoQueryId,
+        Optional<String> trinoInfoUri,
+        Optional<String> trinoNextUri,
+        Optional<Map<String, Object>> trinoStatsJson,
+        Optional<Double> progress,
+        Optional<String> errorMessage,
+        Optional<Map<String, Object>> resultFlightInfoJson,
+        Optional<Map<String, Object>> resultTicketsJson,
+        Optional<Map<String, Object>> resultFilesJson,
+        Instant createdAt,
+        Instant updatedAt,
+        Instant expiresAt,
+        Optional<Instant> completedAt
+) {
+    boolean terminal() {
+        return status.equals("SUCCEEDED") || status.equals("FAILED") || status.equals("EXPIRED");
+    }
+
+    Map<String, Object> statusJson() {
+        LinkedHashMap<String, Object> body = new LinkedHashMap<>();
+        body.put("queryId", queryId);
+        body.put("queryType", queryType);
+        body.put("status", status);
+        targetTable.ifPresent(value -> body.put("targetTable", value));
+        submittedSql.ifPresent(value -> body.put("submittedSql", value));
+        trinoQueryId.ifPresent(value -> body.put("trinoQueryId", value));
+        trinoInfoUri.ifPresent(value -> body.put("trinoInfoUri", value));
+        progress.ifPresent(value -> body.put("progress", value));
+        errorMessage.ifPresent(value -> body.put("errorMessage", value));
+        body.put("createdAtMs", createdAt.toEpochMilli());
+        body.put("updatedAtMs", updatedAt.toEpochMilli());
+        body.put("expiresAtMs", expiresAt.toEpochMilli());
+        completedAt.ifPresent(value -> body.put("completedAtMs", value.toEpochMilli()));
+        return body;
+    }
 }
 
 record PlannedUploadSession(
@@ -616,10 +951,10 @@ record UploadSnapshot(
                 .distinct()
                 .toList();
         if (schemas.isEmpty()) {
-            throw new HttpSupport.HttpError(409, "upload has no persisted Arrow schema yet");
+            throw new CoordinatorException(409, "upload has no persisted Arrow schema yet");
         }
         if (schemas.size() > 1) {
-            throw new HttpSupport.HttpError(409, "upload streams produced different Arrow schemas");
+            throw new CoordinatorException(409, "upload streams produced different Arrow schemas");
         }
         return schemas.getFirst();
     }

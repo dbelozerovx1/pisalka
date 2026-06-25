@@ -12,5 +12,7 @@ WORKDIR /app
 COPY --from=build /app/target/coordinator-0.1.0.jar /app/coordinator.jar
 COPY --from=build /app/target/dependency /app/dependency
 
+ENV JAVA_TOOL_OPTIONS="--add-opens=java.base/java.nio=ALL-UNNAMED"
+
 EXPOSE 8088
 CMD ["java", "-cp", "/app/coordinator.jar:/app/dependency/*", "com.arrowflight.coordinator.CoordinatorApplication"]

@@ -4,10 +4,28 @@ final class SqlPlanner {
     private SqlPlanner() {
     }
 
-    static String buildCtas(String targetTable, String sql) {
+    static String buildCtas(String targetTable, String sql, String location) {
         String normalizedTarget = validateTableName(targetTable);
         String sourceSql = normalizeSourceSql(sql);
-        return "CREATE TABLE " + normalizedTarget + " AS " + sourceSql;
+        return "CREATE TABLE "
+                + normalizedTarget
+                + " WITH (location = '"
+                + escapeSqlString(location)
+                + "') AS "
+                + sourceSql;
+    }
+
+    static String buildIcebergFilesQuery(String targetTable) {
+        String[] parts = validateTableName(targetTable).split("\\.");
+        if (parts.length != 3) {
+            throw new IllegalArgumentException("targetTable must be catalog.schema.table to query Iceberg files");
+        }
+        return "SELECT file_path, record_count, file_size_in_bytes FROM "
+                + quoteIdentifier(parts[0])
+                + "."
+                + quoteIdentifier(parts[1])
+                + "."
+                + quoteIdentifier(parts[2] + "$files");
     }
 
     static String normalizeSourceSql(String sql) {
@@ -26,6 +44,17 @@ final class SqlPlanner {
             throw new IllegalArgumentException("sql must contain a single statement");
         }
         return trimmed;
+    }
+
+    private static String quoteIdentifier(String value) {
+        return "\"" + value.replace("\"", "\"\"") + "\"";
+    }
+
+    private static String escapeSqlString(String value) {
+        if (value == null || value.isBlank()) {
+            throw new IllegalArgumentException("location is required");
+        }
+        return value.replace("'", "''");
     }
 
     static String validateTableName(String tableName) {

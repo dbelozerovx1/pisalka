@@ -6,7 +6,6 @@ import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
-import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Optional;
 
@@ -22,35 +21,23 @@ final class TrinoClient {
                 .build();
     }
 
-    QueryResult executeStatement(String sql, String trinoUser, Optional<String> authorization)
+    QueryHandle submitStatement(String sql, String trinoUser, Optional<String> authorization)
             throws IOException, InterruptedException {
         HttpRequest request = baseRequest(config.trinoUri.resolve("/v1/statement"), trinoUser, authorization)
                 .POST(HttpRequest.BodyPublishers.ofString(sql, StandardCharsets.UTF_8))
                 .header("content-type", "text/plain; charset=utf-8")
                 .build();
         HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
-        Map<String, Object> first = parseTrinoResponse(response);
-        String id = Json.string(first, "id");
-        String infoUri = Json.string(first, "infoUri");
-        Map<String, Object> last = first;
+        return queryHandle(parseTrinoResponse(response));
+    }
 
-        String nextUri = Json.string(first, "nextUri");
-        while (nextUri != null && !nextUri.isBlank()) {
-            HttpRequest nextRequest = baseRequest(URI.create(nextUri), trinoUser, authorization)
-                    .GET()
-                    .build();
-            HttpResponse<String> nextResponse = httpClient.send(nextRequest, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
-            last = parseTrinoResponse(nextResponse);
-            if (id == null) {
-                id = Json.string(last, "id");
-            }
-            if (infoUri == null) {
-                infoUri = Json.string(last, "infoUri");
-            }
-            nextUri = Json.string(last, "nextUri");
-        }
-
-        return new QueryResult(id, infoUri, Json.objectValue(last, "stats"), last);
+    QueryHandle pollNext(String nextUri, String trinoUser, Optional<String> authorization)
+            throws IOException, InterruptedException {
+        HttpRequest request = baseRequest(URI.create(nextUri), trinoUser, authorization)
+                .GET()
+                .build();
+        HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+        return queryHandle(parseTrinoResponse(response));
     }
 
     private HttpRequest.Builder baseRequest(URI uri, String trinoUser, Optional<String> authorization) {
@@ -78,13 +65,28 @@ final class TrinoClient {
         return body;
     }
 
-    record QueryResult(String queryId, String infoUri, Map<String, Object> stats, Map<String, Object> finalResponse) {
-        Map<String, Object> toJson() {
-            LinkedHashMap<String, Object> out = new LinkedHashMap<>();
-            out.put("queryId", queryId);
-            out.put("infoUri", infoUri);
-            out.put("stats", stats);
-            return out;
-        }
+    private static QueryHandle queryHandle(Map<String, Object> response) {
+        String nextUri = Json.string(response, "nextUri");
+        return new QueryHandle(
+                Optional.ofNullable(Json.string(response, "id")).filter(value -> !value.isBlank()),
+                Optional.ofNullable(Json.string(response, "infoUri")).filter(value -> !value.isBlank()),
+                Optional.ofNullable(nextUri).filter(value -> !value.isBlank()),
+                optionalObject(response, "stats"),
+                response
+        );
+    }
+
+    private static Optional<Map<String, Object>> optionalObject(Map<String, Object> response, String key) {
+        Map<String, Object> value = Json.objectValue(response, key);
+        return value.isEmpty() ? Optional.empty() : Optional.of(value);
+    }
+
+    record QueryHandle(
+            Optional<String> queryId,
+            Optional<String> infoUri,
+            Optional<String> nextUri,
+            Optional<Map<String, Object>> stats,
+            Map<String, Object> response
+    ) {
     }
 }

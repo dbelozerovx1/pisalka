@@ -23,6 +23,8 @@ final class Config {
     final long putCapabilityTtlMs;
     final long getCapabilityTtlMs;
     final long uploadSessionTtlMs;
+    final long queryRegistryTtlMs;
+    final long queryRegistryCleanupIntervalMs;
     final String stagingPrefixRoot;
     final String objectStoreUriPrefix;
     final int defaultUploadStreams;
@@ -32,6 +34,7 @@ final class Config {
     final long defaultPutMaxRecordBatchBytes;
     final int defaultGetMaxBatchRows;
     final long defaultGetMaxRecordBatchBytes;
+    final int flightMaxMessageSize;
     final Duration trinoRequestTimeout;
 
     private Config(
@@ -50,6 +53,8 @@ final class Config {
             long putCapabilityTtlMs,
             long getCapabilityTtlMs,
             long uploadSessionTtlMs,
+            long queryRegistryTtlMs,
+            long queryRegistryCleanupIntervalMs,
             String stagingPrefixRoot,
             String objectStoreUriPrefix,
             int defaultUploadStreams,
@@ -59,6 +64,7 @@ final class Config {
             long defaultPutMaxRecordBatchBytes,
             int defaultGetMaxBatchRows,
             long defaultGetMaxRecordBatchBytes,
+            int flightMaxMessageSize,
             Duration trinoRequestTimeout
     ) {
         this.listenAddress = listenAddress;
@@ -76,6 +82,8 @@ final class Config {
         this.putCapabilityTtlMs = putCapabilityTtlMs;
         this.getCapabilityTtlMs = getCapabilityTtlMs;
         this.uploadSessionTtlMs = uploadSessionTtlMs;
+        this.queryRegistryTtlMs = queryRegistryTtlMs;
+        this.queryRegistryCleanupIntervalMs = queryRegistryCleanupIntervalMs;
         this.stagingPrefixRoot = normalizePrefix(stagingPrefixRoot);
         this.objectStoreUriPrefix = normalizeObjectStoreUriPrefix(objectStoreUriPrefix);
         this.defaultUploadStreams = defaultUploadStreams;
@@ -85,6 +93,7 @@ final class Config {
         this.defaultPutMaxRecordBatchBytes = defaultPutMaxRecordBatchBytes;
         this.defaultGetMaxBatchRows = defaultGetMaxBatchRows;
         this.defaultGetMaxRecordBatchBytes = defaultGetMaxRecordBatchBytes;
+        this.flightMaxMessageSize = flightMaxMessageSize;
         this.trinoRequestTimeout = trinoRequestTimeout;
     }
 
@@ -106,6 +115,8 @@ final class Config {
                 envLong("COORDINATOR_PUT_CAPABILITY_TTL_MS", capabilityTtlMs),
                 envLong("COORDINATOR_GET_CAPABILITY_TTL_MS", 5 * 60 * 1000L),
                 envLong("COORDINATOR_UPLOAD_SESSION_TTL_MS", 60 * 60 * 1000L),
+                envLong("COORDINATOR_QUERY_REGISTRY_TTL_MS", 60 * 60 * 1000L),
+                envLong("COORDINATOR_QUERY_REGISTRY_CLEANUP_INTERVAL_MS", 5 * 60 * 1000L),
                 env("COORDINATOR_STAGING_PREFIX_ROOT", "coordinator/staging"),
                 env("COORDINATOR_OBJECT_STORE_URI_PREFIX", "s3://arrow-flight"),
                 envInt("COORDINATOR_DEFAULT_UPLOAD_STREAMS", 1),
@@ -115,6 +126,7 @@ final class Config {
                 envLong("COORDINATOR_DEFAULT_PUT_MAX_RECORD_BATCH_BYTES", 256L * 1024 * 1024),
                 envInt("COORDINATOR_DEFAULT_GET_MAX_BATCH_ROWS", 65_536),
                 envLong("COORDINATOR_DEFAULT_GET_MAX_RECORD_BATCH_BYTES", 128L * 1024 * 1024),
+                envInt("FLIGHT_MAX_MESSAGE_SIZE", 256 * 1024 * 1024),
                 Duration.ofMillis(envLong("TRINO_REQUEST_TIMEOUT_MS", 30_000))
         );
     }

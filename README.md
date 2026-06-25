@@ -35,7 +35,7 @@ Start everything in Docker:
 ./dev/up.sh
 ```
 
-The Compose file contains MinIO, a standalone Hive Metastore, Trino with an Iceberg catalog, the Rust worker, and the Java coordinator. Trino is exposed on `http://127.0.0.1:8080`, the coordinator is exposed on `http://127.0.0.1:8088`, and the worker is exposed on `127.0.0.1:50051`.
+The Compose file contains MinIO, a standalone Hive Metastore, Trino with an Iceberg catalog, the Rust worker, and the Java coordinator. Trino is exposed on `http://127.0.0.1:8080`, the coordinator Arrow Flight service is exposed at `http://127.0.0.1:8088`, and the worker Arrow Flight service is exposed at `http://127.0.0.1:50051`.
 
 `trino-init` waits for Trino and best-effort creates the Iceberg schema. Keep `TRINO_INIT_REQUIRE_SCHEMA=false` for raw Flight worker smoke tests; set it to `true` when testing strict Iceberg schema bootstrap.
 
@@ -99,10 +99,17 @@ Run a small end-to-end smoke:
 ./dev/smoke.sh
 ```
 
-Run the coordinator-first smoke path. This generates Arrow IPC data inside Docker, asks the coordinator to create an upload session, writes with the issued signed `DoPut` stream ticket, finishes the upload so the coordinator validates worker metadata and produces a Trino DDL preview, asks the coordinator for a signed exact-file `DoGet` ticket for one written Parquet file, and reads it back:
+Run the coordinator-first smoke path. This generates Arrow IPC data inside Docker and then runs the Rust `bench-coordinator` example client. That client asks the coordinator to create an upload session, writes with every issued signed `DoPut` ticket, finishes the upload so the coordinator validates worker metadata and produces a Trino DDL preview, asks the coordinator for signed exact-file `DoGet` ticket(s), and reads the data back:
 
 ```bash
 ./dev/coordinator-smoke.sh
+```
+
+Useful knobs:
+
+```bash
+SMOKE_STREAMS=4 SMOKE_SIZE=256mb SMOKE_TARGET_FILE_SIZE=64mb ./dev/coordinator-smoke.sh
+SMOKE_READ_BACK=all SMOKE_READ_MAX_FILES=4 ./dev/coordinator-smoke.sh
 ```
 
 Run a write parallelism matrix against the Docker Compose server:
@@ -116,6 +123,7 @@ Run the benchmark client and data generator inside Docker as well:
 ```bash
 BENCH_SIZE=2gb BENCH_MODE=single BENCH_FILE_SIZE=512mb ./dev/bench-docker.sh
 BENCH_SIZE=2gb BENCH_MODE=multi PUT_STREAMS=6 BENCH_FILE_SIZE=512mb ./dev/bench-docker.sh
+BENCH_SIZE=2gb BENCH_MODE=coordinator UPLOAD_STREAMS=4 BENCH_FILE_SIZE=512mb ./dev/bench-docker.sh
 ```
 
 The Docker benchmark service stores generated Arrow IPC files in a named Docker volume at `/bench-data`, so repeated runs can reuse the same input without reading it from the host filesystem. Force regeneration with:
@@ -184,14 +192,16 @@ Useful environment variables:
 - `TRINO_URI=http://trino:8080`
 - `TRINO_CATALOG=iceberg`
 - `TRINO_SCHEMA=arrow`
-- `ICEBERG_SCHEMA_LOCATION=s3://arrow-flight/iceberg/arrow`
+- `ICEBERG_SCHEMA_LOCATION=s3a://arrow-flight/iceberg/arrow` in local Compose because Hive Metastore uses Hadoop `s3a`
 - `CTAS_DEFAULT_CATALOG=iceberg`
 - `CTAS_DEFAULT_SCHEMA=arrow`
 - `COORDINATOR_CAPABILITY_SECRET=local-dev-secret`
 - `COORDINATOR_ADMIN_TOKEN=` optional token required by low-level ticket APIs when set
 - `COORDINATOR_METADATA_DATABASE_URL=postgres://flight:flight@metadata-db:5432/flight_metadata`
 - `COORDINATOR_UPLOAD_SESSION_TTL_MS=3600000`
-- `COORDINATOR_OBJECT_STORE_URI_PREFIX=s3://arrow-flight`
+- `COORDINATOR_QUERY_REGISTRY_TTL_MS=3600000`
+- `COORDINATOR_QUERY_REGISTRY_CLEANUP_INTERVAL_MS=300000`
+- `COORDINATOR_OBJECT_STORE_URI_PREFIX=s3a://arrow-flight` in local Compose; production can use the scheme accepted by its Iceberg/Hadoop stack
 - `COORDINATOR_DEFAULT_UPLOAD_STREAMS=1`
 - `S3_MULTIPART_PART_SIZE=67108864`
 - `S3_MULTIPART_MAX_CONCURRENCY=16`
@@ -205,36 +215,28 @@ Defaults favor the fastest measured local write path: uncompressed Parquet, dict
 
 ## Java Coordinator MVP
 
-The coordinator intentionally stays small for the first full-system run:
+The coordinator is itself an Arrow Flight service. It does not expose REST endpoints. Standard Flight calls own query planning and polling; non-standard coordinator operations are Flight actions.
 
-- `POST /v1/ctas`: accepts user SQL, wraps it as `CREATE TABLE ... AS <sql>`, forwards the caller's `Authorization` header and `X-Trino-User` to Trino, and returns Trino query metadata.
-- `POST /v1/flight/create-upload`: creates a durable upload session, selects workers from `worker_registry`, persists planned stream attempts, and returns one signed `DoPut` ticket per granted stream.
-- `POST /v1/flight/upload-status`: returns the planned session, stream status joined with worker stream metadata, and written file rows.
-- `POST /v1/flight/finish-upload`: explicit finalization gate. It succeeds only when all planned streams are `SUCCEEDED`, reads DB-backed worker file/schema metadata, marks the upload `READY_TO_COMMIT`, and returns the file list plus a Trino `CREATE TABLE` DDL preview.
-- `POST /v1/flight/abort-upload`: marks an upload `ABORTED`. Staged-file cleanup is intentionally a separate follow-up task.
-- `POST /v1/flight/put-ticket`: selects a write-capable worker from `worker_registry` and mints one signed `DoPut` capability for a coordinator-controlled staging prefix. This remains a low-level/internal dev API; session uploads should use `create-upload`.
-- `POST /v1/flight/get-ticket`: selects a read-capable worker from `worker_registry` and mints a signed exact-file `DoGet` ticket. Also internal unless protected by `COORDINATOR_ADMIN_TOKEN`.
-- `GET /v1/config`: shows non-secret coordinator config.
+Standard Flight methods:
 
-Example CTAS call:
+- `GetFlightInfo` with command `{"type":"ctas","sql":"select ...","targetTable":"iceberg.arrow.tmp","user":"alice","authorization":"Bearer ..."}` creates a durable query row, submits one Trino CTAS request, and returns a `FlightInfo` with `app_metadata.queryId`.
+- `PollFlightInfo` with command `{"type":"poll","queryId":"ctas-..."}` loads that row and advances one Trino cursor step. When CTAS finishes, polling switches to Iceberg `$files` discovery, persists discovered file rows, and finally returns `FlightInfo.endpoints` with worker `DoGet` tickets.
+- `GetFlightInfo` with command `{"type":"read","path":"bench/file.parquet"}` is a low-level exact-file read planner. When `COORDINATOR_ADMIN_TOKEN` is configured this command must include `adminToken`.
 
-```bash
-curl -sS http://127.0.0.1:8088/v1/ctas \
-  -H 'content-type: application/json' \
-  -H 'X-Trino-User: alice' \
-  -H 'Authorization: Bearer <trino-token>' \
-  -d '{"sql":"select * from source_table limit 10","targetTable":"iceberg.arrow.ctas_tmp_demo"}'
-```
+Flight actions:
 
-Example put capability:
+- `coordinator.create-upload`: creates a durable upload session, selects workers from `worker_registry`, persists planned stream attempts, and returns one signed `DoPut` ticket per granted stream.
+- `coordinator.upload-status`: returns the planned session, stream status joined with worker stream metadata, and written file rows.
+- `coordinator.finish-upload`: explicit finalization gate. It succeeds only when all planned streams are `SUCCEEDED`, reads DB-backed worker file/schema metadata, marks the upload `READY_TO_COMMIT`, and returns the file list plus a Trino `CREATE TABLE` DDL preview.
+- `coordinator.abort-upload`: marks an upload `ABORTED`. Staged-file cleanup is intentionally a separate follow-up task.
+- `coordinator.put-ticket` and `coordinator.get-ticket`: low-level internal/dev ticket minting actions.
+- `coordinator.config`: returns non-secret coordinator config.
 
-```bash
-curl -sS http://127.0.0.1:8088/v1/flight/create-upload \
-  -H 'content-type: application/json' \
-  -d '{"operationId":"op-1","streams":2,"tableName":"iceberg.arrow.demo_upload"}'
-```
+Each upload ticket contains a `descriptorPath` and `appMetadata` signed JSON envelope to send as `DoPut` app metadata. For production, the coordinator should only create upload sessions after Trino/Ranger has authorized the user's table operation.
 
-Each returned ticket contains a `descriptorPath` and `appMetadata` signed JSON envelope to send as `DoPut` app metadata. For production, the coordinator should only create upload sessions after Trino/Ranger has authorized the user's table operation.
+Query polling is client-driven. `GetFlightInfo` always creates a new `queryId`; the client stores that id and polls at its own cadence. The coordinator persists status, progress, failure message, Trino cursor URI, final tickets, final file list, timestamps, and expiry in `coordinator_query_registry`. Expired rows are cleaned opportunistically by coordinator requests according to `COORDINATOR_QUERY_REGISTRY_CLEANUP_INTERVAL_MS`.
+
+The coordinator does not store bearer tokens in the registry. If Trino requires per-user auth on cursor polling, pass the user's `authorization` value on every `PollFlightInfo` call or use a future service-token model.
 
 Commit/readiness flow:
 

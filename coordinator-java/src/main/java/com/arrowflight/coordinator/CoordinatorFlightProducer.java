@@ -1,0 +1,187 @@
+package com.arrowflight.coordinator;
+
+import org.apache.arrow.flight.Action;
+import org.apache.arrow.flight.ActionType;
+import org.apache.arrow.flight.CallStatus;
+import org.apache.arrow.flight.Criteria;
+import org.apache.arrow.flight.FlightDescriptor;
+import org.apache.arrow.flight.FlightEndpoint;
+import org.apache.arrow.flight.FlightInfo;
+import org.apache.arrow.flight.FlightProducer;
+import org.apache.arrow.flight.FlightStream;
+import org.apache.arrow.flight.Location;
+import org.apache.arrow.flight.PollInfo;
+import org.apache.arrow.flight.PutResult;
+import org.apache.arrow.flight.Result;
+import org.apache.arrow.flight.Ticket;
+import org.apache.arrow.vector.ipc.message.IpcOption;
+import org.apache.arrow.vector.types.pojo.Schema;
+
+import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+
+final class CoordinatorFlightProducer implements FlightProducer {
+    private static final Schema EMPTY_SCHEMA = new Schema(List.of());
+
+    private final Config config;
+    private final CoordinatorService coordinator;
+
+    CoordinatorFlightProducer(Config config, CoordinatorService coordinator) {
+        this.config = config;
+        this.coordinator = coordinator;
+    }
+
+    @Override
+    public void getStream(CallContext context, Ticket ticket, ServerStreamListener listener) {
+        listener.error(CallStatus.UNIMPLEMENTED
+                .withDescription("coordinator only plans Flight endpoints; redeem DoGet tickets on worker locations")
+                .toRuntimeException());
+    }
+
+    @Override
+    public void listFlights(CallContext context, Criteria criteria, StreamListener<FlightInfo> listener) {
+        listener.onCompleted();
+    }
+
+    @Override
+    public FlightInfo getFlightInfo(CallContext context, FlightDescriptor descriptor) {
+        try {
+            return flightInfo(coordinator.startFlight(descriptorRequest(descriptor)), false);
+        } catch (RuntimeException error) {
+            throw toFlight(error);
+        }
+    }
+
+    @Override
+    public PollInfo pollFlightInfo(CallContext context, FlightDescriptor descriptor) {
+        try {
+            PollResult result = coordinator.pollFlight(descriptorRequest(descriptor));
+            FlightDescriptor nextDescriptor = result.complete()
+                    ? null
+                    : FlightDescriptor.command(jsonBytes(Map.of("type", "poll", "queryId", result.plan().queryId())));
+            return new PollInfo(
+                    flightInfo(result.plan(), result.complete()),
+                    nextDescriptor,
+                    result.progress().orElse(null),
+                    result.complete() ? null : result.expiresAt()
+            );
+        } catch (RuntimeException error) {
+            throw toFlight(error);
+        }
+    }
+
+    @Override
+    public Runnable acceptPut(CallContext context, FlightStream flightStream, StreamListener<PutResult> listener) {
+        throw CallStatus.UNIMPLEMENTED
+                .withDescription("coordinator does not accept DoPut; use coordinator.create-upload action and worker tickets")
+                .toRuntimeException();
+    }
+
+    @Override
+    public void doAction(CallContext context, Action action, StreamListener<Result> listener) {
+        try {
+            Map<String, Object> request = actionBody(action);
+            Map<String, Object> response = switch (action.getType()) {
+                case "coordinator.config" -> coordinator.configJson();
+                case "coordinator.create-upload" -> coordinator.createUpload(request);
+                case "coordinator.upload-status" -> coordinator.uploadStatus(request);
+                case "coordinator.finish-upload" -> coordinator.finishUpload(request);
+                case "coordinator.abort-upload" -> coordinator.abortUpload(request);
+                case "coordinator.put-ticket" -> coordinator.putTicket(request);
+                case "coordinator.get-ticket" -> coordinator.getTicket(request);
+                default -> throw new CoordinatorException(400, "unknown coordinator action: " + action.getType());
+            };
+            listener.onNext(new Result(jsonBytes(response)));
+            listener.onCompleted();
+        } catch (RuntimeException error) {
+            listener.onError(toFlight(error));
+        }
+    }
+
+    @Override
+    public void listActions(CallContext context, StreamListener<ActionType> listener) {
+        listener.onNext(new ActionType("coordinator.config", "Return non-secret coordinator configuration"));
+        listener.onNext(new ActionType("coordinator.create-upload", "Create a durable upload session and signed DoPut tickets"));
+        listener.onNext(new ActionType("coordinator.upload-status", "Return upload session and worker stream status"));
+        listener.onNext(new ActionType("coordinator.finish-upload", "Validate completed upload streams and return files/DDL"));
+        listener.onNext(new ActionType("coordinator.abort-upload", "Mark an upload session aborted"));
+        listener.onNext(new ActionType("coordinator.put-ticket", "Low-level signed DoPut ticket for internal/dev use"));
+        listener.onNext(new ActionType("coordinator.get-ticket", "Low-level signed DoGet ticket for internal/dev use"));
+        listener.onCompleted();
+    }
+
+    private FlightInfo flightInfo(FlightPlan plan, boolean finalResult) {
+        FlightDescriptor descriptor = finalResult
+                ? FlightDescriptor.command(jsonBytes(Map.of("type", "complete", "queryId", plan.queryId())))
+                : FlightDescriptor.command(jsonBytes(Map.of("type", "poll", "queryId", plan.queryId())));
+        return FlightInfo.builder(EMPTY_SCHEMA, descriptor, endpoints(plan))
+                .setBytes(plan.totalBytes())
+                .setRecords(plan.totalRecords())
+                .setOrdered(false)
+                .setOption(IpcOption.DEFAULT)
+                .setAppMetadata(jsonBytes(plan.metadata()))
+                .build();
+    }
+
+    private List<FlightEndpoint> endpoints(FlightPlan plan) {
+        ArrayList<FlightEndpoint> endpoints = new ArrayList<>();
+        for (Map<String, Object> endpoint : plan.endpoints()) {
+            String ticket = Json.requiredString(endpoint, "ticket");
+            String flightUri = Json.requiredString(endpoint, "flightUri");
+            try {
+                endpoints.add(FlightEndpoint
+                        .builder(new Ticket(ticket.getBytes(StandardCharsets.UTF_8)), new Location(flightUri))
+                        .setAppMetadata(jsonBytes(endpoint))
+                        .build());
+            } catch (Exception error) {
+                throw new CoordinatorException(500, "failed to build Flight endpoint for " + flightUri, error);
+            }
+        }
+        return endpoints;
+    }
+
+    private Map<String, Object> descriptorRequest(FlightDescriptor descriptor) {
+        if (descriptor.isCommand()) {
+            String raw = new String(descriptor.getCommand(), StandardCharsets.UTF_8);
+            return Json.parseObject(raw);
+        }
+        List<String> path = descriptor.getPath();
+        if (path.size() >= 2 && path.getFirst().equalsIgnoreCase("read")) {
+            return Map.of("type", "read", "path", String.join("/", path.subList(1, path.size())));
+        }
+        if (path.size() >= 2 && path.getFirst().equalsIgnoreCase("poll")) {
+            return Map.of("type", "poll", "queryId", path.get(1));
+        }
+        throw new CoordinatorException(400, "FlightDescriptor must be a JSON command or path read/<path>");
+    }
+
+    private Map<String, Object> actionBody(Action action) {
+        byte[] body = action.getBody();
+        if (body.length == 0) {
+            return Map.of();
+        }
+        return Json.parseObject(new String(body, StandardCharsets.UTF_8));
+    }
+
+    private byte[] jsonBytes(Object value) {
+        return Json.stringify(value).getBytes(StandardCharsets.UTF_8);
+    }
+
+    private RuntimeException toFlight(RuntimeException error) {
+        if (error instanceof CoordinatorException coordinatorError) {
+            return switch (coordinatorError.status) {
+                case 400, 409 -> CallStatus.INVALID_ARGUMENT.withDescription(error.getMessage()).toRuntimeException();
+                case 403 -> CallStatus.UNAUTHORIZED.withDescription(error.getMessage()).toRuntimeException();
+                case 404 -> CallStatus.NOT_FOUND.withDescription(error.getMessage()).toRuntimeException();
+                case 503 -> CallStatus.UNAVAILABLE.withDescription(error.getMessage()).toRuntimeException();
+                default -> CallStatus.INTERNAL.withDescription(error.getMessage()).withCause(error).toRuntimeException();
+            };
+        }
+        if (error instanceof IllegalArgumentException) {
+            return CallStatus.INVALID_ARGUMENT.withDescription(error.getMessage()).withCause(error).toRuntimeException();
+        }
+        return CallStatus.INTERNAL.withDescription(error.getMessage()).withCause(error).toRuntimeException();
+    }
+}

@@ -10,7 +10,9 @@ RUN cargo build --release \
     --bin gen-arrow \
     --bin bench-put \
     --bin bench-put-multi \
-    --bin bench-get
+    --bin bench-get \
+    --bin bench-coordinator \
+    --bin coordinator-query
 
 FROM debian:bookworm-slim AS runtime
 
@@ -26,6 +28,8 @@ COPY --from=builder /app/target/release/gen-arrow /usr/local/bin/gen-arrow
 COPY --from=builder /app/target/release/bench-put /usr/local/bin/bench-put
 COPY --from=builder /app/target/release/bench-put-multi /usr/local/bin/bench-put-multi
 COPY --from=builder /app/target/release/bench-get /usr/local/bin/bench-get
+COPY --from=builder /app/target/release/bench-coordinator /usr/local/bin/bench-coordinator
+COPY --from=builder /app/target/release/coordinator-query /usr/local/bin/coordinator-query
 COPY benchmarks/docker/bench.sh /usr/local/bin/bench-docker
 
 RUN chmod +x /usr/local/bin/bench-docker

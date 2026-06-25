@@ -1,0 +1,7 @@
+/target
+/data
+/.git
+/.idea
+/docs
+*.log
+./coordinator-java/target

@@ -158,6 +158,13 @@ async fn main() -> Result<()> {
         !first_batches.is_empty(),
         "input did not contain any Arrow batches"
     );
+    if ticket_specs.is_some() {
+        anyhow::ensure!(
+            first_batches.len() == requested_streams,
+            "coordinator provided {requested_streams} upload tickets but input only has {} Arrow batches; request fewer streams or generate smaller batches",
+            first_batches.len()
+        );
+    }
 
     let active_streams = first_batches.len();
     let stream_config = Arc::new(StreamUploadConfig {

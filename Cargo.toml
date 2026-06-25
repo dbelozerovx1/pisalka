@@ -24,6 +24,14 @@ path = "benchmarks/tools/bench_put_multi.rs"
 name = "bench-get"
 path = "benchmarks/tools/bench_get.rs"
 
+[[bin]]
+name = "bench-coordinator"
+path = "benchmarks/tools/bench_coordinator.rs"
+
+[[bin]]
+name = "coordinator-query"
+path = "benchmarks/tools/coordinator_query.rs"
+
 [dependencies]
 anyhow = "1"
 arrow-array = "=58.3.0"
