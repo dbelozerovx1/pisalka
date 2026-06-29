@@ -419,28 +419,99 @@ final class CoordinatorMetadataStore {
     }
 
     void markRunning(String uploadId) {
-        updateStatus(uploadId, "RUNNING", Optional.empty(), Optional.empty(), false);
+        updateStatus(uploadId, "RUNNING", Optional.empty(), Optional.empty(), Optional.empty(), false);
     }
 
-    void markReadyToCommit(String uploadId, String createTableSql) {
-        updateStatus(uploadId, "READY_TO_COMMIT", Optional.of(createTableSql), Optional.empty(), true);
+    void markReadyToCommit(String uploadId, String tableName, String createTableSql) {
+        requireEnabled();
+        try (Connection connection = connect();
+             PreparedStatement statement = connection.prepareStatement("""
+                     UPDATE coordinator_upload_sessions
+                     SET status = 'READY_TO_COMMIT',
+                         table_name = COALESCE(?, table_name),
+                         create_table_sql = COALESCE(?, create_table_sql),
+                         error_message = NULL,
+                         updated_at = now(),
+                         completed_at = COALESCE(completed_at, now())
+                     WHERE upload_id = ?
+                       AND status NOT IN ('COMMITTED', 'COMMITTING', 'ABORTED')
+                     """)) {
+            statement.setString(1, tableName);
+            statement.setString(2, createTableSql);
+            statement.setString(3, uploadId);
+            statement.executeUpdate();
+        } catch (SQLException error) {
+            throw new IllegalStateException("failed to mark upload session ready to commit", error);
+        }
     }
 
-    void markCommitted(String uploadId) {
-        updateStatus(uploadId, "COMMITTED", Optional.empty(), Optional.empty(), true);
+    boolean tryMarkCommitting(String uploadId, String tableName, String createTableSql) {
+        requireEnabled();
+        try (Connection connection = connect();
+             PreparedStatement statement = connection.prepareStatement("""
+                     UPDATE coordinator_upload_sessions
+                     SET status = 'COMMITTING',
+                         table_name = COALESCE(?, table_name),
+                         create_table_sql = COALESCE(?, create_table_sql),
+                         error_message = NULL,
+                         updated_at = now()
+                     WHERE upload_id = ?
+                       AND status NOT IN ('COMMITTED', 'COMMITTING', 'ABORTED')
+                     """)) {
+            statement.setString(1, tableName);
+            statement.setString(2, createTableSql);
+            statement.setString(3, uploadId);
+            return statement.executeUpdate() == 1;
+        } catch (SQLException error) {
+            throw new IllegalStateException("failed to mark upload session committing", error);
+        }
+    }
+
+    void markCommitted(String uploadId, CommitMetadata metadata) {
+        requireEnabled();
+        try (Connection connection = connect();
+             PreparedStatement statement = connection.prepareStatement("""
+                     UPDATE coordinator_upload_sessions
+                     SET status = 'COMMITTED',
+                         table_name = COALESCE(?, table_name),
+                         create_table_sql = COALESCE(?, create_table_sql),
+                         error_message = NULL,
+                         commit_mode = ?,
+                         commit_table_name = ?,
+                         commit_snapshot_id = ?,
+                         commit_summary_json = ?,
+                         committed_at = now(),
+                         updated_at = now(),
+                         completed_at = COALESCE(completed_at, now())
+                     WHERE upload_id = ?
+                     """)) {
+            statement.setString(1, metadata.tableName());
+            statement.setString(2, metadata.createTableSql().orElse(null));
+            statement.setString(3, metadata.mode());
+            statement.setString(4, metadata.tableName());
+            statement.setLong(5, metadata.snapshotId());
+            statement.setObject(6, jsonb(metadata.summary()), Types.OTHER);
+            statement.setString(7, uploadId);
+            if (statement.executeUpdate() == 0) {
+                throw new CoordinatorException(404, "upload session was not found");
+            }
+        } catch (SQLException error) {
+            throw new IllegalStateException("failed to mark upload session committed", error);
+        }
     }
 
     void markFailed(String uploadId, String errorMessage) {
-        updateStatus(uploadId, "FAILED", Optional.empty(), Optional.of(errorMessage), true);
+        updateStatus(uploadId, "FAILED", Optional.empty(), Optional.empty(), Optional.of(errorMessage), true);
     }
 
     void markAborted(String uploadId, String errorMessage) {
-        updateStatus(uploadId, "ABORTED", Optional.empty(), Optional.of(errorMessage), true);
+        updateStatus(uploadId, "ABORTED", Optional.empty(), Optional.empty(), Optional.of(errorMessage), true);
     }
 
     private void updateStatus(
             String uploadId,
             String status,
+            Optional<String> tableName,
             Optional<String> createTableSql,
             Optional<String> errorMessage,
             boolean completed
@@ -450,6 +521,7 @@ final class CoordinatorMetadataStore {
              PreparedStatement statement = connection.prepareStatement("""
                      UPDATE coordinator_upload_sessions
                      SET status = ?,
+                         table_name = COALESCE(?, table_name),
                          create_table_sql = COALESCE(?, create_table_sql),
                          error_message = ?,
                          updated_at = now(),
@@ -457,10 +529,11 @@ final class CoordinatorMetadataStore {
                      WHERE upload_id = ?
                      """)) {
             statement.setString(1, status);
-            statement.setString(2, createTableSql.orElse(null));
-            statement.setString(3, errorMessage.orElse(null));
-            statement.setBoolean(4, completed);
-            statement.setString(5, uploadId);
+            statement.setString(2, tableName.orElse(null));
+            statement.setString(3, createTableSql.orElse(null));
+            statement.setString(4, errorMessage.orElse(null));
+            statement.setBoolean(5, completed);
+            statement.setString(6, uploadId);
             if (statement.executeUpdate() == 0) {
                 throw new CoordinatorException(404, "upload session was not found");
             }
@@ -481,10 +554,15 @@ final class CoordinatorMetadataStore {
                        max_stream_bytes,
                        max_record_batch_bytes,
                        create_table_sql,
+                       commit_mode,
+                       commit_table_name,
+                       commit_snapshot_id,
+                       commit_summary_json::text AS commit_summary_json,
                        error_message,
                        created_at,
                        updated_at,
                        expires_at,
+                       committed_at,
                        completed_at
                 FROM coordinator_upload_sessions
                 WHERE upload_id = ?
@@ -505,10 +583,15 @@ final class CoordinatorMetadataStore {
                         nullableLong(rows, "max_stream_bytes"),
                         nullableLong(rows, "max_record_batch_bytes"),
                         Optional.ofNullable(rows.getString("create_table_sql")),
+                        Optional.ofNullable(rows.getString("commit_mode")),
+                        Optional.ofNullable(rows.getString("commit_table_name")),
+                        nullableLong(rows, "commit_snapshot_id"),
+                        nullableJsonObject(rows, "commit_summary_json"),
                         Optional.ofNullable(rows.getString("error_message")),
                         rows.getTimestamp("created_at").toInstant(),
                         rows.getTimestamp("updated_at").toInstant(),
                         rows.getTimestamp("expires_at").toInstant(),
+                        Optional.ofNullable(rows.getTimestamp("committed_at")).map(Timestamp::toInstant),
                         Optional.ofNullable(rows.getTimestamp("completed_at")).map(Timestamp::toInstant)
                 );
             }
@@ -832,10 +915,15 @@ record UploadSessionRecord(
         Optional<Long> maxStreamBytes,
         Optional<Long> maxRecordBatchBytes,
         Optional<String> createTableSql,
+        Optional<String> commitMode,
+        Optional<String> commitTableName,
+        Optional<Long> commitSnapshotId,
+        Optional<Map<String, Object>> commitSummary,
         Optional<String> errorMessage,
         Instant createdAt,
         Instant updatedAt,
         Instant expiresAt,
+        Optional<Instant> committedAt,
         Optional<Instant> completedAt
 ) {
     Map<String, Object> toJson() {
@@ -850,13 +938,27 @@ record UploadSessionRecord(
         maxStreamBytes.ifPresent(value -> body.put("maxStreamBytes", value));
         maxRecordBatchBytes.ifPresent(value -> body.put("maxRecordBatchBytes", value));
         createTableSql.ifPresent(value -> body.put("createTableSql", value));
+        commitMode.ifPresent(value -> body.put("commitMode", value));
+        commitTableName.ifPresent(value -> body.put("commitTableName", value));
+        commitSnapshotId.ifPresent(value -> body.put("commitSnapshotId", value));
+        commitSummary.ifPresent(value -> body.put("commitSummary", value));
         errorMessage.ifPresent(value -> body.put("errorMessage", value));
         body.put("createdAtMs", createdAt.toEpochMilli());
         body.put("updatedAtMs", updatedAt.toEpochMilli());
         body.put("expiresAtMs", expiresAt.toEpochMilli());
+        committedAt.ifPresent(value -> body.put("committedAtMs", value.toEpochMilli()));
         completedAt.ifPresent(value -> body.put("completedAtMs", value.toEpochMilli()));
         return body;
     }
+}
+
+record CommitMetadata(
+        String tableName,
+        String mode,
+        long snapshotId,
+        Optional<String> createTableSql,
+        Map<String, Object> summary
+) {
 }
 
 record UploadStreamState(

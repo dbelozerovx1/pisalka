@@ -11,6 +11,9 @@ read_back="${SMOKE_READ_BACK:-first}"
 input="${SMOKE_INPUT:-/bench-data/coordinator-smoke-${size}.arrow}"
 operation_id="${SMOKE_OPERATION_ID:-smoke-$(date +%Y%m%d-%H%M%S)}"
 staging_prefix="${SMOKE_STAGING_PREFIX:-coordinator/smoke/${operation_id}}"
+commit_mode="${SMOKE_COMMIT_MODE:-append}"
+table_suffix="$(printf '%s' "$operation_id" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9_' '_')"
+table_name="${SMOKE_TABLE_NAME:-iceberg.arrow.smoke_${table_suffix}}"
 
 export WORKER_REQUIRE_SIGNED_CAPABILITIES="${WORKER_REQUIRE_SIGNED_CAPABILITIES:-true}"
 export WORKER_CAPABILITY_SECRET="${WORKER_CAPABILITY_SECRET:-local-dev-secret}"
@@ -23,7 +26,17 @@ export TRINO_URI="${TRINO_URI:-http://trino:8080}"
 
 echo "starting_compose_stack=true"
 docker compose --profile bench build bench flight-server coordinator
-docker compose --profile bench up -d --build flight-server coordinator trino-init
+docker compose --profile bench up -d --build --force-recreate \
+  minio \
+  minio-create-bucket \
+  metadata-db \
+  metadata-migrate \
+  hive-metastore \
+  trino \
+  trino-init \
+  flight-server \
+  coordinator
+docker compose run --rm metadata-migrate
 
 echo "generating_input=$input size=$size"
 docker compose run --rm --entrypoint gen-arrow bench \
@@ -44,6 +57,12 @@ args=(
 
 if [[ -n "${SMOKE_TABLE_NAME:-}" ]]; then
   args+=(--table-name "$SMOKE_TABLE_NAME")
+elif [[ "$commit_mode" != "none" ]]; then
+  args+=(--table-name "$table_name")
+fi
+
+if [[ "$commit_mode" != "none" ]]; then
+  args+=(--commit-mode "$commit_mode")
 fi
 
 if [[ -n "${SMOKE_READ_MAX_FILES:-}" ]]; then
@@ -58,6 +77,7 @@ docker compose run --rm \
   -u COORDINATOR_UPLOAD_ID \
   -u COORDINATOR_STAGING_PREFIX \
   -u COORDINATOR_TABLE_NAME \
+  -u COORDINATOR_COMMIT_MODE \
   -u PUT_MAX_STREAM_BYTES \
   -u PUT_MAX_RECORD_BATCH_BYTES \
   -u COORDINATOR_UPLOAD_TTL_MS \
@@ -66,3 +86,11 @@ docker compose run --rm \
   -u GET_MAX_RECORD_BATCH_BYTES \
   bench-coordinator \
   "${args[@]}"
+
+if [[ "$commit_mode" != "none" ]]; then
+  echo "verifying_trino_select=true table=$table_name"
+  docker compose run --rm --entrypoint python trino-init \
+    /run_sql.py "SELECT count(*) AS row_count FROM $table_name"
+  docker compose run --rm --entrypoint python trino-init \
+    /run_sql.py "SELECT * FROM $table_name LIMIT 1"
+fi

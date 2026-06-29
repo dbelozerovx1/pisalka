@@ -99,7 +99,7 @@ Run a small end-to-end smoke:
 ./dev/smoke.sh
 ```
 
-Run the coordinator-first smoke path. This generates Arrow IPC data inside Docker and then runs the Rust `bench-coordinator` example client. That client asks the coordinator to create an upload session, writes with every issued signed `DoPut` ticket, finishes the upload so the coordinator validates worker metadata and produces a Trino DDL preview, asks the coordinator for signed exact-file `DoGet` ticket(s), and reads the data back:
+Run the coordinator-first smoke path. This generates Arrow IPC data inside Docker and then runs the Rust `bench-coordinator` example client. That client asks the coordinator to create an upload session, writes with every issued signed `DoPut` ticket, finishes the upload so the coordinator validates worker metadata, commits the worker-written Parquet files into Iceberg through the Java API, asks the coordinator for signed exact-file `DoGet` ticket(s), reads the data back, and verifies `SELECT count(*)` plus `SELECT * LIMIT 1` through Trino:
 
 ```bash
 ./dev/coordinator-smoke.sh
@@ -110,6 +110,8 @@ Useful knobs:
 ```bash
 SMOKE_STREAMS=4 SMOKE_SIZE=256mb SMOKE_TARGET_FILE_SIZE=64mb ./dev/coordinator-smoke.sh
 SMOKE_READ_BACK=all SMOKE_READ_MAX_FILES=4 ./dev/coordinator-smoke.sh
+SMOKE_COMMIT_MODE=overwrite ./dev/coordinator-smoke.sh
+SMOKE_COMMIT_MODE=none ./dev/coordinator-smoke.sh
 ```
 
 Run a write parallelism matrix against the Docker Compose server:
@@ -124,6 +126,7 @@ Run the benchmark client and data generator inside Docker as well:
 BENCH_SIZE=2gb BENCH_MODE=single BENCH_FILE_SIZE=512mb ./dev/bench-docker.sh
 BENCH_SIZE=2gb BENCH_MODE=multi PUT_STREAMS=6 BENCH_FILE_SIZE=512mb ./dev/bench-docker.sh
 BENCH_SIZE=2gb BENCH_MODE=coordinator UPLOAD_STREAMS=4 BENCH_FILE_SIZE=512mb ./dev/bench-docker.sh
+BENCH_MODE=coordinator COORDINATOR_COMMIT_MODE=append COORDINATOR_TABLE_NAME=iceberg.arrow.bench_upload ./dev/bench-docker.sh
 ```
 
 The Docker benchmark service stores generated Arrow IPC files in a named Docker volume at `/bench-data`, so repeated runs can reuse the same input without reading it from the host filesystem. Force regeneration with:
@@ -187,12 +190,16 @@ Useful environment variables:
 - `METRICS_ENABLED=true`
 - `METRICS_ADDR=0.0.0.0:9090`
 - `COORDINATOR_ADDR=0.0.0.0:8088`
-- `TRINO_VERSION=481`
-- `HIVE_VERSION=4.1.0`
+- `TRINO_VERSION=476`
+- `HIVE_VERSION=3.1.3`
+- `HIVE_PLATFORM=linux/amd64`
 - `TRINO_URI=http://trino:8080`
 - `TRINO_CATALOG=iceberg`
 - `TRINO_SCHEMA=arrow`
-- `ICEBERG_SCHEMA_LOCATION=s3a://arrow-flight/iceberg/arrow` in local Compose because Hive Metastore uses Hadoop `s3a`
+- `ICEBERG_SCHEMA_LOCATION=s3a://arrow-flight/iceberg/arrow`
+- `ICEBERG_CATALOG_NAME=iceberg`
+- `ICEBERG_CATALOG_URI=thrift://hive-metastore:9083`
+- `ICEBERG_WAREHOUSE=s3a://arrow-flight/iceberg`
 - `CTAS_DEFAULT_CATALOG=iceberg`
 - `CTAS_DEFAULT_SCHEMA=arrow`
 - `COORDINATOR_CAPABILITY_SECRET=local-dev-secret`
@@ -201,7 +208,7 @@ Useful environment variables:
 - `COORDINATOR_UPLOAD_SESSION_TTL_MS=3600000`
 - `COORDINATOR_QUERY_REGISTRY_TTL_MS=3600000`
 - `COORDINATOR_QUERY_REGISTRY_CLEANUP_INTERVAL_MS=300000`
-- `COORDINATOR_OBJECT_STORE_URI_PREFIX=s3a://arrow-flight` in local Compose; production can use the scheme accepted by its Iceberg/Hadoop stack
+- `COORDINATOR_OBJECT_STORE_URI_PREFIX=s3a://arrow-flight`
 - `COORDINATOR_DEFAULT_UPLOAD_STREAMS=1`
 - `S3_MULTIPART_PART_SIZE=67108864`
 - `S3_MULTIPART_MAX_CONCURRENCY=16`
@@ -210,6 +217,7 @@ Useful environment variables:
 - `READ_BATCH_SIZE=65536`
 - `TARGET_FILE_SIZE=256mb` for client-side benchmark scripts
 - `PUT_PROFILE=true` to request optional benchmark/server profiling
+- `COMPOSE_NETWORK_NAME=arrow-flight-local` keeps the local Docker network name URI-safe for the Hive 3 metastore client.
 
 Defaults favor the fastest measured local write path: uncompressed Parquet, dictionary disabled, large Flight chunks, large gRPC message limits, 64 MiB S3 multipart uploads, and up to four active part writers when target-sized output is requested.
 
@@ -228,6 +236,8 @@ Flight actions:
 - `coordinator.create-upload`: creates a durable upload session, selects workers from `worker_registry`, persists planned stream attempts, and returns one signed `DoPut` ticket per granted stream.
 - `coordinator.upload-status`: returns the planned session, stream status joined with worker stream metadata, and written file rows.
 - `coordinator.finish-upload`: explicit finalization gate. It succeeds only when all planned streams are `SUCCEEDED`, reads DB-backed worker file/schema metadata, marks the upload `READY_TO_COMMIT`, and returns the file list plus a Trino `CREATE TABLE` DDL preview.
+- `coordinator.commit-upload`: explicit commit gate. It reruns the same upload validation, executes `CREATE TABLE IF NOT EXISTS` through Trino with the caller's user/auth token, loads the table through the Iceberg Hive catalog, collects Parquet footer metrics, and commits the DB-backed file list with `append` or full-table `overwrite`.
+- `coordinator.do-commit`: compatibility alias for `coordinator.commit-upload`.
 - `coordinator.abort-upload`: marks an upload `ABORTED`. Staged-file cleanup is intentionally a separate follow-up task.
 - `coordinator.put-ticket` and `coordinator.get-ticket`: low-level internal/dev ticket minting actions.
 - `coordinator.config`: returns non-secret coordinator config.
@@ -245,7 +255,8 @@ Commit/readiness flow:
 3. `create-upload` persists `coordinator_upload_sessions` and `coordinator_upload_streams` rows before data moves.
 4. Each worker `DoPut` persists its stream status, Arrow schema JSON from the first decoded batch, and written Parquet file rows in `worker_put_streams` / `worker_put_files`.
 5. `finish-upload` compares planned streams to actual worker outcomes. Missing, running, rejected, or failed streams block finalization.
-6. When all streams succeeded, the coordinator returns `READY_TO_COMMIT` with DB-backed file paths and a generated Trino DDL preview. Files are still staged until a later Iceberg commit/add-files step makes them table-visible.
+6. `commit-upload` can be called after `finish-upload`, or directly after all worker streams finish. It uses Trino DDL as the permission/table-creation gate and then appends or overwrites Iceberg with the exact files stored in `worker_put_files`.
+7. A successful commit stores mode, table name, snapshot id, and commit summary on the upload session. Repeating `commit-upload` for an already committed upload returns the stored result instead of appending the same files again.
 
 Without `--file-size` / `TARGET_FILE_SIZE`, `DoPut` writes one Parquet object at the requested path. With a target file size, `DoPut` writes multiple ordered part files under `<name>.parts/` and returns the file list in the `DoPut` result and metadata DB. `PUT_PARALLELISM` controls the maximum number of active part writers. `DoGet` accepts a direct physical Parquet path ticket and streams that file back.
 

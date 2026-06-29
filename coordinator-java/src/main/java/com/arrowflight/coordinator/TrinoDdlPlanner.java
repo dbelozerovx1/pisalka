@@ -10,6 +10,15 @@ final class TrinoDdlPlanner {
     }
 
     static String createTableSql(String tableName, Map<String, Object> arrowSchema, String location) {
+        return createTableSql(tableName, arrowSchema, location, false);
+    }
+
+    static String createTableSql(
+            String tableName,
+            Map<String, Object> arrowSchema,
+            String location,
+            boolean ifNotExists
+    ) {
         List<Object> fields = Json.listValue(arrowSchema, "fields");
         if (fields.isEmpty()) {
             throw new IllegalArgumentException("Arrow schema does not contain fields");
@@ -27,7 +36,8 @@ final class TrinoDdlPlanner {
             columns.add("    " + quoteIdentifier(name) + " " + trinoType(type));
         }
 
-        return "CREATE TABLE " + normalizeTableName(tableName) + " (\n"
+        String create = ifNotExists ? "CREATE TABLE IF NOT EXISTS " : "CREATE TABLE ";
+        return create + normalizeTableName(tableName) + " (\n"
                 + String.join(",\n", columns)
                 + "\n) WITH (\n"
                 + "    format = 'PARQUET',\n"

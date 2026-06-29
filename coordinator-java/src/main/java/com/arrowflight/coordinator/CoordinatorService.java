@@ -16,6 +16,7 @@ final class CoordinatorService {
 
     private final Config config;
     private final TrinoClient trinoClient;
+    private final IcebergCommitter icebergCommitter;
     private final CapabilitySigner capabilitySigner;
     private final CoordinatorMetadataStore metadataStore;
     private final AtomicLong lastQueryCleanupMs = new AtomicLong(0);
@@ -23,6 +24,7 @@ final class CoordinatorService {
     CoordinatorService(Config config) {
         this.config = config;
         this.trinoClient = new TrinoClient(config);
+        this.icebergCommitter = new IcebergCommitter(config);
         this.capabilitySigner = new CapabilitySigner(config);
         this.metadataStore = new CoordinatorMetadataStore(config);
     }
@@ -39,6 +41,9 @@ final class CoordinatorService {
         body.put("trinoSchema", config.trinoSchema);
         body.put("ctasCatalog", config.ctasCatalog);
         body.put("ctasSchema", config.ctasSchema);
+        body.put("icebergCatalogName", config.icebergCatalogName);
+        body.put("icebergCatalogUri", config.icebergCatalogUri);
+        body.put("icebergWarehouse", config.icebergWarehouse);
         body.put("capabilitySigningConfigured", config.capabilitySecret.isPresent());
         body.put("adminTokenConfigured", config.adminToken.isPresent());
         body.put("metadataDatabaseConfigured", metadataStore.enabled());
@@ -148,7 +153,82 @@ final class CoordinatorService {
         requireAdminIfConfigured(request);
         String uploadId = Json.requiredString(request, "uploadId");
         UploadSnapshot snapshot = metadataStore.loadUpload(uploadId);
+        if (snapshot.session().status().equals("COMMITTED")) {
+            return committedUploadResponse(snapshot);
+        }
+        if (snapshot.session().status().equals("COMMITTING") || snapshot.session().status().equals("ABORTED")) {
+            throw new CoordinatorException(
+                    409,
+                    "upload session " + uploadId + " cannot be finalized; status=" + snapshot.session().status()
+            );
+        }
+        UploadReadyPlan plan = uploadReadyPlan(snapshot, request);
+        metadataStore.markReadyToCommit(uploadId, plan.tableName(), plan.createTableSql());
+        return readyUploadResponse(plan);
+    }
 
+    Map<String, Object> commitUpload(Map<String, Object> request) {
+        requireAdminIfConfigured(request);
+        String uploadId = Json.requiredString(request, "uploadId");
+        UploadSnapshot snapshot = metadataStore.loadUpload(uploadId);
+        if (snapshot.session().status().equals("COMMITTED")) {
+            return committedUploadResponse(snapshot);
+        }
+        if (snapshot.session().status().equals("COMMITTING") || snapshot.session().status().equals("ABORTED")) {
+            throw new CoordinatorException(
+                    409,
+                    "upload session " + uploadId + " is not available for commit; status=" + snapshot.session().status()
+            );
+        }
+
+        UploadReadyPlan plan = uploadReadyPlan(snapshot, request);
+        metadataStore.markReadyToCommit(uploadId, plan.tableName(), plan.createTableSql());
+        if (!metadataStore.tryMarkCommitting(uploadId, plan.tableName(), plan.createTableSql())) {
+            UploadSnapshot current = metadataStore.loadUpload(uploadId);
+            if (current.session().status().equals("COMMITTED")) {
+                return committedUploadResponse(current);
+            }
+            throw new CoordinatorException(
+                    409,
+                    "upload session " + uploadId + " is not available for commit; status=" + current.session().status()
+            );
+        }
+
+        String mode = Optional.ofNullable(Json.string(request, "mode"))
+                .or(() -> Optional.ofNullable(Json.string(request, "commitMode")))
+                .filter(value -> !value.isBlank())
+                .orElse("append");
+        String trinoUser = stringOrDefault(request, "user", "anonymous");
+        Optional<String> authorization = authorizationFrom(request);
+        try {
+            TrinoClient.QueryHandle ddl = trinoClient.runStatement(plan.createTableSql(), trinoUser, authorization);
+            CommitOutcome outcome = icebergCommitter.commit(uploadId, plan.tableName(), mode, snapshot.files());
+            LinkedHashMap<String, Object> summary = new LinkedHashMap<>(outcome.summary());
+            ddl.queryId().ifPresent(value -> summary.put("trinoDdlQueryId", value));
+            metadataStore.markCommitted(uploadId, new CommitMetadata(
+                    plan.tableName(),
+                    outcome.mode(),
+                    outcome.snapshotId(),
+                    Optional.of(plan.createTableSql()),
+                    summary
+            ));
+
+            LinkedHashMap<String, Object> body = readyUploadResponse(plan);
+            body.put("status", "COMMITTED");
+            body.put("mode", outcome.mode());
+            body.put("snapshotId", outcome.snapshotId());
+            body.put("recordCount", outcome.recordCount());
+            body.put("parquetObjectBytes", outcome.parquetObjectBytes());
+            body.put("commitSummary", summary);
+            return body;
+        } catch (Exception error) {
+            metadataStore.markFailed(uploadId, error.getMessage());
+            throw new CoordinatorException(500, "failed to commit upload " + uploadId + ": " + error.getMessage(), error);
+        }
+    }
+
+    private UploadReadyPlan uploadReadyPlan(UploadSnapshot snapshot, Map<String, Object> request) {
+        String uploadId = snapshot.session().uploadId();
         Optional<UploadStreamState> failed = snapshot.firstFailedStream();
         if (failed.isPresent()) {
             String message = "upload stream " + failed.get().streamId() + " failed with status " + failed.get().status()
@@ -171,23 +251,62 @@ final class CoordinatorService {
         String tableName = Optional.ofNullable(Json.string(request, "tableName"))
                 .filter(value -> !value.isBlank())
                 .or(() -> snapshot.session().tableName())
+                .or(() -> snapshot.session().commitTableName())
                 .orElseGet(() -> config.generatedUploadTable(uploadId));
         Map<String, Object> arrowSchema = Json.parseObject(snapshot.canonicalSchemaJson());
         String createTableSql = TrinoDdlPlanner.createTableSql(
                 tableName,
                 arrowSchema,
-                config.objectUriForPrefix(snapshot.session().stagingPrefix())
+                tableLocation(tableName),
+                true
         );
-        metadataStore.markReadyToCommit(uploadId, createTableSql);
+        return new UploadReadyPlan(snapshot, tableName, createTableSql, arrowSchema);
+    }
 
+    private String tableLocation(String tableName) {
+        String[] parts = SqlPlanner.validateTableName(tableName).split("\\.");
+        String schema;
+        String table;
+        if (parts.length == 1) {
+            schema = config.ctasSchema;
+            table = parts[0];
+        } else if (parts.length == 2) {
+            schema = parts[0];
+            table = parts[1];
+        } else if (parts.length == 3) {
+            schema = parts[1];
+            table = parts[2];
+        } else {
+            throw new CoordinatorException(400, "tableName must be table, schema.table, or catalog.schema.table");
+        }
+        return config.icebergWarehouse + "/" + schema + "/" + table;
+    }
+
+    private LinkedHashMap<String, Object> readyUploadResponse(UploadReadyPlan plan) {
         LinkedHashMap<String, Object> body = new LinkedHashMap<>();
-        body.put("uploadId", uploadId);
+        body.put("uploadId", plan.snapshot().session().uploadId());
         body.put("status", "READY_TO_COMMIT");
-        body.put("tableName", tableName);
-        body.put("createTableSql", createTableSql);
+        body.put("tableName", plan.tableName());
+        body.put("createTableSql", plan.createTableSql());
+        body.put("files", plan.snapshot().files().stream().map(UploadFile::toJson).toList());
+        body.put("streams", plan.snapshot().streams().stream().map(UploadStreamState::toJson).toList());
+        body.put("arrowSchema", plan.arrowSchema());
+        return body;
+    }
+
+    private LinkedHashMap<String, Object> committedUploadResponse(UploadSnapshot snapshot) {
+        UploadSessionRecord session = snapshot.session();
+        LinkedHashMap<String, Object> body = new LinkedHashMap<>();
+        body.put("uploadId", session.uploadId());
+        body.put("status", "COMMITTED");
+        session.commitTableName().or(session::tableName).ifPresent(value -> body.put("tableName", value));
+        session.createTableSql().ifPresent(value -> body.put("createTableSql", value));
+        session.commitMode().ifPresent(value -> body.put("mode", value));
+        session.commitSnapshotId().ifPresent(value -> body.put("snapshotId", value));
+        session.commitSummary().ifPresent(value -> body.put("commitSummary", value));
         body.put("files", snapshot.files().stream().map(UploadFile::toJson).toList());
         body.put("streams", snapshot.streams().stream().map(UploadStreamState::toJson).toList());
-        body.put("arrowSchema", arrowSchema);
+        body.put("alreadyCommitted", true);
         return body;
     }
 
@@ -810,5 +929,13 @@ record PollResult(
         boolean complete,
         Optional<Double> progress,
         Instant expiresAt
+) {
+}
+
+record UploadReadyPlan(
+        UploadSnapshot snapshot,
+        String tableName,
+        String createTableSql,
+        Map<String, Object> arrowSchema
 ) {
 }

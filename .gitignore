@@ -1,4 +1,5 @@
 /target/
+/coordinator-java/target/
 /data/*.arrow
 /data/*.ipc
 /data/*.parquet

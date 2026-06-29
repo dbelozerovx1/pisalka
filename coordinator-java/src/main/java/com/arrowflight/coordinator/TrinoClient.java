@@ -31,6 +31,15 @@ final class TrinoClient {
         return queryHandle(parseTrinoResponse(response));
     }
 
+    QueryHandle runStatement(String sql, String trinoUser, Optional<String> authorization)
+            throws IOException, InterruptedException {
+        QueryHandle handle = submitStatement(sql, trinoUser, authorization);
+        while (handle.nextUri().isPresent()) {
+            handle = pollNext(handle.nextUri().orElseThrow(), trinoUser, authorization);
+        }
+        return handle;
+    }
+
     QueryHandle pollNext(String nextUri, String trinoUser, Optional<String> authorization)
             throws IOException, InterruptedException {
         HttpRequest request = baseRequest(URI.create(nextUri), trinoUser, authorization)

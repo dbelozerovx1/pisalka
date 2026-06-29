@@ -88,6 +88,7 @@ final class CoordinatorFlightProducer implements FlightProducer {
                 case "coordinator.create-upload" -> coordinator.createUpload(request);
                 case "coordinator.upload-status" -> coordinator.uploadStatus(request);
                 case "coordinator.finish-upload" -> coordinator.finishUpload(request);
+                case "coordinator.commit-upload", "coordinator.do-commit" -> coordinator.commitUpload(request);
                 case "coordinator.abort-upload" -> coordinator.abortUpload(request);
                 case "coordinator.put-ticket" -> coordinator.putTicket(request);
                 case "coordinator.get-ticket" -> coordinator.getTicket(request);
@@ -106,6 +107,8 @@ final class CoordinatorFlightProducer implements FlightProducer {
         listener.onNext(new ActionType("coordinator.create-upload", "Create a durable upload session and signed DoPut tickets"));
         listener.onNext(new ActionType("coordinator.upload-status", "Return upload session and worker stream status"));
         listener.onNext(new ActionType("coordinator.finish-upload", "Validate completed upload streams and return files/DDL"));
+        listener.onNext(new ActionType("coordinator.commit-upload", "Execute Trino DDL gate and Iceberg append/overwrite commit"));
+        listener.onNext(new ActionType("coordinator.do-commit", "Alias for coordinator.commit-upload"));
         listener.onNext(new ActionType("coordinator.abort-upload", "Mark an upload session aborted"));
         listener.onNext(new ActionType("coordinator.put-ticket", "Low-level signed DoPut ticket for internal/dev use"));
         listener.onNext(new ActionType("coordinator.get-ticket", "Low-level signed DoGet ticket for internal/dev use"));

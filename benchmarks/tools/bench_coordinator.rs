@@ -55,6 +55,15 @@ struct Args {
     #[arg(long, alias = "table", env = "COORDINATOR_TABLE_NAME")]
     table_name: Option<String>,
 
+    #[arg(long, env = "COORDINATOR_COMMIT_MODE", value_enum, default_value = "none")]
+    commit_mode: CommitMode,
+
+    #[arg(long, env = "TRINO_USER")]
+    trino_user: Option<String>,
+
+    #[arg(long, env = "TRINO_AUTHORIZATION")]
+    trino_authorization: Option<String>,
+
     #[arg(long, env = "UPLOAD_STREAMS", default_value_t = 1)]
     streams: usize,
 
@@ -95,6 +104,13 @@ enum ReadBackMode {
     None,
     First,
     All,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, ValueEnum)]
+enum CommitMode {
+    None,
+    Append,
+    Overwrite,
 }
 
 struct CoordinatorClient {
@@ -143,6 +159,24 @@ struct FinishUploadResponse {
     streams: Vec<Value>,
     #[serde(default)]
     arrow_schema: Value,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CommitUploadResponse {
+    upload_id: String,
+    status: String,
+    table_name: String,
+    mode: String,
+    snapshot_id: u64,
+    #[serde(default)]
+    record_count: u64,
+    #[serde(default)]
+    parquet_object_bytes: u64,
+    #[serde(default)]
+    commit_summary: Value,
+    #[serde(default)]
+    already_committed: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -344,6 +378,27 @@ async fn main() -> Result<()> {
         );
     }
 
+    if args.commit_mode != CommitMode::None {
+        let commit = coordinator
+            .commit_upload(
+                &create_upload.upload_id,
+                &args.commit_mode,
+                Some(finish.table_name.clone()),
+                args.trino_user.clone(),
+                args.trino_authorization.clone(),
+            )
+            .await?;
+        println!("commit_upload_id={}", commit.upload_id);
+        println!("commit_status={}", commit.status);
+        println!("commit_table_name={}", commit.table_name);
+        println!("commit_mode={}", commit.mode);
+        println!("commit_snapshot_id={}", commit.snapshot_id);
+        println!("commit_record_count={}", commit.record_count);
+        println!("commit_parquet_object_bytes={}", commit.parquet_object_bytes);
+        println!("commit_already_committed={}", commit.already_committed);
+        println!("commit_summary={}", serde_json::to_string(&commit.commit_summary)?);
+    }
+
     let read_files = files_to_read(&finish.files, &args.read_back, args.read_max_files);
     if read_files.is_empty() {
         println!("read_back=none");
@@ -462,6 +517,28 @@ impl CoordinatorClient {
         let mut body = Map::new();
         body.insert("uploadId".to_owned(), Value::String(upload_id.to_owned()));
         self.action_json("coordinator.finish-upload", body).await
+    }
+
+    async fn commit_upload(
+        &mut self,
+        upload_id: &str,
+        mode: &CommitMode,
+        table_name: Option<String>,
+        user: Option<String>,
+        authorization: Option<String>,
+    ) -> Result<CommitUploadResponse> {
+        let mode = match mode {
+            CommitMode::None => anyhow::bail!("commit_upload called with CommitMode::None"),
+            CommitMode::Append => "append",
+            CommitMode::Overwrite => "overwrite",
+        };
+        let mut body = Map::new();
+        body.insert("uploadId".to_owned(), Value::String(upload_id.to_owned()));
+        body.insert("mode".to_owned(), Value::String(mode.to_owned()));
+        insert_string(&mut body, "tableName", table_name);
+        insert_string(&mut body, "user", user);
+        insert_string(&mut body, "authorization", authorization);
+        self.action_json("coordinator.commit-upload", body).await
     }
 
     async fn abort_upload(&mut self, upload_id: &str, reason: &str) -> Result<Value> {

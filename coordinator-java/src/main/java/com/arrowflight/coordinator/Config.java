@@ -16,6 +16,15 @@ final class Config {
     final String ctasCatalog;
     final String ctasSchema;
     final String ctasTablePrefix;
+    final String icebergCatalogName;
+    final String icebergCatalogUri;
+    final String icebergWarehouse;
+    final Optional<String> s3Endpoint;
+    final String s3Region;
+    final Optional<String> s3AccessKey;
+    final Optional<String> s3SecretKey;
+    final boolean s3PathStyleAccess;
+    final boolean s3AllowHttp;
     final Optional<String> capabilitySecret;
     final Optional<String> adminToken;
     final Optional<String> metadataDatabaseUrl;
@@ -46,6 +55,15 @@ final class Config {
             String ctasCatalog,
             String ctasSchema,
             String ctasTablePrefix,
+            String icebergCatalogName,
+            String icebergCatalogUri,
+            String icebergWarehouse,
+            Optional<String> s3Endpoint,
+            String s3Region,
+            Optional<String> s3AccessKey,
+            Optional<String> s3SecretKey,
+            boolean s3PathStyleAccess,
+            boolean s3AllowHttp,
             Optional<String> capabilitySecret,
             Optional<String> adminToken,
             Optional<String> metadataDatabaseUrl,
@@ -75,6 +93,15 @@ final class Config {
         this.ctasCatalog = ctasCatalog;
         this.ctasSchema = ctasSchema;
         this.ctasTablePrefix = ctasTablePrefix;
+        this.icebergCatalogName = icebergCatalogName;
+        this.icebergCatalogUri = icebergCatalogUri;
+        this.icebergWarehouse = normalizeObjectStoreUriPrefix(icebergWarehouse);
+        this.s3Endpoint = s3Endpoint;
+        this.s3Region = s3Region;
+        this.s3AccessKey = s3AccessKey;
+        this.s3SecretKey = s3SecretKey;
+        this.s3PathStyleAccess = s3PathStyleAccess;
+        this.s3AllowHttp = s3AllowHttp;
         this.capabilitySecret = capabilitySecret;
         this.adminToken = adminToken;
         this.metadataDatabaseUrl = metadataDatabaseUrl;
@@ -108,6 +135,15 @@ final class Config {
                 env("CTAS_DEFAULT_CATALOG", env("TRINO_CATALOG", "iceberg")),
                 env("CTAS_DEFAULT_SCHEMA", env("TRINO_SCHEMA", "arrow")),
                 env("CTAS_TABLE_PREFIX", "ctas_tmp"),
+                env("ICEBERG_CATALOG_NAME", env("TRINO_CATALOG", "iceberg")),
+                env("ICEBERG_CATALOG_URI", "thrift://host.docker.internal:9083"),
+                env("ICEBERG_WAREHOUSE", env("COORDINATOR_OBJECT_STORE_URI_PREFIX", "s3://arrow-flight") + "/iceberg"),
+                envOptional("S3_ENDPOINT"),
+                env("AWS_REGION", env("S3_REGION", "us-east-1")),
+                envOptional("AWS_ACCESS_KEY_ID"),
+                envOptional("AWS_SECRET_ACCESS_KEY"),
+                envBool("S3_PATH_STYLE_ACCESS", true),
+                envBool("AWS_ALLOW_HTTP", false),
                 envOptional("COORDINATOR_CAPABILITY_SECRET").or(() -> envOptional("WORKER_CAPABILITY_SECRET")),
                 envOptional("COORDINATOR_ADMIN_TOKEN"),
                 envOptional("COORDINATOR_METADATA_DATABASE_URL").or(() -> envOptional("METADATA_DATABASE_URL")),
@@ -223,5 +259,17 @@ final class Config {
     private static int envInt(String key, int defaultValue) {
         String value = System.getenv(key);
         return value == null || value.isBlank() ? defaultValue : Integer.parseInt(value.trim());
+    }
+
+    private static boolean envBool(String key, boolean defaultValue) {
+        String value = System.getenv(key);
+        if (value == null || value.isBlank()) {
+            return defaultValue;
+        }
+        return switch (value.trim().toLowerCase(Locale.ROOT)) {
+            case "1", "true", "yes", "on" -> true;
+            case "0", "false", "no", "off" -> false;
+            default -> throw new IllegalArgumentException(key + " must be a boolean value");
+        };
     }
 }

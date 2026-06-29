@@ -113,13 +113,25 @@ case "$mode" in
     if [[ -n "${COORDINATOR_TABLE_NAME:-}" ]]; then
       args+=(--table-name "$COORDINATOR_TABLE_NAME")
     fi
+    if [[ -n "${COORDINATOR_COMMIT_MODE:-}" ]]; then
+      args+=(--commit-mode "$COORDINATOR_COMMIT_MODE")
+    fi
+    if [[ -n "${TRINO_USER:-}" ]]; then
+      args+=(--trino-user "$TRINO_USER")
+    fi
+    if [[ -n "${TRINO_AUTHORIZATION:-}" ]]; then
+      args+=(--trino-authorization "$TRINO_AUTHORIZATION")
+    fi
 
     for optional_env in \
       COORDINATOR_TABLE_NAME \
+      COORDINATOR_COMMIT_MODE \
       GET_MAX_BATCH_ROWS \
       GET_MAX_RECORD_BATCH_BYTES \
       PUT_MAX_RECORD_BATCH_BYTES \
-      READ_MAX_FILES
+      READ_MAX_FILES \
+      TRINO_USER \
+      TRINO_AUTHORIZATION
     do
       if [[ -z "${!optional_env:-}" ]]; then
         unset "$optional_env"
