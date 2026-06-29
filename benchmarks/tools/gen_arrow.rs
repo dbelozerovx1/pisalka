@@ -2,12 +2,12 @@ use std::{fs::File, path::PathBuf, sync::Arc, time::Instant};
 
 use anyhow::{Context, Result};
 use arrow_array::{
-    ArrayRef, Float64Array, Int64Array, RecordBatch, UInt32Array, UInt64Array,
+    ArrayRef, Float64Array, Int32Array, Int64Array, RecordBatch, UInt32Array, UInt64Array,
     builder::FixedSizeBinaryBuilder,
 };
 use arrow_ipc::writer::StreamWriter;
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 
 use arrow_flight_s3_mvp::util::{parse_size, pretty_bytes, throughput};
 
@@ -24,6 +24,20 @@ struct Args {
 
     #[arg(long, default_value_t = 64)]
     payload_bytes: usize,
+
+    #[arg(
+        long,
+        env = "GEN_ARROW_INTEGER_KIND",
+        value_enum,
+        default_value = "unsigned"
+    )]
+    integer_kind: IntegerKind,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum IntegerKind {
+    Unsigned,
+    Signed,
 }
 
 fn main() -> Result<()> {
@@ -37,7 +51,7 @@ fn main() -> Result<()> {
             .with_context(|| format!("failed to create {}", parent.display()))?;
     }
 
-    let schema = schema(args.payload_bytes);
+    let schema = schema(args.payload_bytes, args.integer_kind);
     let file = File::create(&args.output)
         .with_context(|| format!("failed to create {:?}", args.output))?;
     let mut writer = StreamWriter::try_new(file, &schema)?;
@@ -55,6 +69,7 @@ fn main() -> Result<()> {
             written_rows as u64,
             rows,
             args.payload_bytes,
+            args.integer_kind,
         )?;
         writer.write(&batch)?;
         written_rows += rows;
@@ -76,12 +91,20 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn schema(payload_bytes: usize) -> SchemaRef {
+fn schema(payload_bytes: usize, integer_kind: IntegerKind) -> SchemaRef {
+    let id_type = match integer_kind {
+        IntegerKind::Unsigned => DataType::UInt64,
+        IntegerKind::Signed => DataType::Int64,
+    };
+    let bucket_type = match integer_kind {
+        IntegerKind::Unsigned => DataType::UInt32,
+        IntegerKind::Signed => DataType::Int32,
+    };
     Arc::new(Schema::new(vec![
-        Field::new("id", DataType::UInt64, false),
+        Field::new("id", id_type, false),
         Field::new("ts_ns", DataType::Int64, false),
         Field::new("value", DataType::Float64, false),
-        Field::new("bucket", DataType::UInt32, false),
+        Field::new("bucket", bucket_type, false),
         Field::new(
             "payload",
             DataType::FixedSizeBinary(payload_bytes as i32),
@@ -95,14 +118,12 @@ fn make_batch(
     start: u64,
     rows: usize,
     payload_bytes: usize,
+    integer_kind: IntegerKind,
 ) -> Result<RecordBatch> {
-    let ids = UInt64Array::from_iter_values(start..start + rows as u64);
     let ts = Int64Array::from_iter_values((0..rows).map(|i| (start + i as u64) as i64 * 1_000));
     let values = Float64Array::from_iter_values(
         (0..rows).map(|i| ((start + i as u64) % 10_000) as f64 * 0.001),
     );
-    let buckets =
-        UInt32Array::from_iter_values((0..rows).map(|i| ((start as usize + i) % 1024) as u32));
 
     let mut payload = FixedSizeBinaryBuilder::with_capacity(rows, payload_bytes as i32);
     let mut bytes = vec![0u8; payload_bytes];
@@ -116,11 +137,28 @@ fn make_batch(
         payload.append_value(&bytes)?;
     }
 
+    let (ids, buckets): (ArrayRef, ArrayRef) = match integer_kind {
+        IntegerKind::Unsigned => (
+            Arc::new(UInt64Array::from_iter_values(start..start + rows as u64)),
+            Arc::new(UInt32Array::from_iter_values(
+                (0..rows).map(|i| ((start as usize + i) % 1024) as u32),
+            )),
+        ),
+        IntegerKind::Signed => (
+            Arc::new(Int64Array::from_iter_values(
+                (0..rows).map(|i| (start + i as u64) as i64),
+            )),
+            Arc::new(Int32Array::from_iter_values(
+                (0..rows).map(|i| ((start as usize + i) % 1024) as i32),
+            )),
+        ),
+    };
+
     let columns: Vec<ArrayRef> = vec![
-        Arc::new(ids),
+        ids,
         Arc::new(ts),
         Arc::new(values),
-        Arc::new(buckets),
+        buckets,
         Arc::new(payload.finish()),
     ];
 

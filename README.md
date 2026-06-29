@@ -4,6 +4,8 @@ Rust Arrow Flight data-plane worker focused on high-throughput raw Parquet reads
 
 The MVP keeps worker and coordinator in one repo because their capability contract, Compose environment, and smoke tests are still evolving together. Once the coordinator contract stabilizes and release cadence diverges, splitting the Java coordinator into a separate repository will be straightforward.
 
+Current MVP readiness, intentional Flight boundaries, and first Kubernetes test notes live in [docs/current-state.md](docs/current-state.md).
+
 ## Layout
 
 - `src/main.rs`: data-plane worker server and worker-registry heartbeat.
@@ -97,6 +99,22 @@ Run a small end-to-end smoke:
 
 ```bash
 ./dev/smoke.sh
+```
+
+Run the simpler user-facing local E2E path. The write script accepts `schema.table` or `catalog.schema.table`, generates example Arrow data in Docker, uploads it through coordinator-issued worker `DoPut` tickets, commits the result into Iceberg, and verifies the table through Trino:
+
+```bash
+./dev/e2e-write-table.sh arrow.example_events
+E2E_SIZE=1gb E2E_STREAMS=4 E2E_TARGET_FILE_SIZE=512mb ./dev/e2e-write-table.sh arrow.example_events
+E2E_COMMIT_MODE=append ./dev/e2e-write-table.sh arrow.example_events
+```
+
+Then read it back through the coordinator CTAS planning path. The coordinator runs CTAS, polls Trino, discovers Iceberg files, returns worker `DoGet` tickets, and the client prints a small Arrow table preview:
+
+```bash
+./dev/e2e-read-table.sh arrow.example_events
+E2E_READ_LIMIT=100 E2E_PREVIEW_ROWS=20 ./dev/e2e-read-table.sh arrow.example_events
+E2E_READ_SQL='SELECT id, bucket, value FROM iceberg.arrow.example_events WHERE bucket < 3 LIMIT 20' ./dev/e2e-read-table.sh arrow.example_events
 ```
 
 Run the coordinator-first smoke path. This generates Arrow IPC data inside Docker and then runs the Rust `bench-coordinator` example client. That client asks the coordinator to create an upload session, writes with every issued signed `DoPut` ticket, finishes the upload so the coordinator validates worker metadata, commits the worker-written Parquet files into Iceberg through the Java API, asks the coordinator for signed exact-file `DoGet` ticket(s), reads the data back, and verifies `SELECT count(*)` plus `SELECT * LIMIT 1` through Trino:

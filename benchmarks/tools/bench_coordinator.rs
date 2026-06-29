@@ -55,7 +55,12 @@ struct Args {
     #[arg(long, alias = "table", env = "COORDINATOR_TABLE_NAME")]
     table_name: Option<String>,
 
-    #[arg(long, env = "COORDINATOR_COMMIT_MODE", value_enum, default_value = "none")]
+    #[arg(
+        long,
+        env = "COORDINATOR_COMMIT_MODE",
+        value_enum,
+        default_value = "none"
+    )]
     commit_mode: CommitMode,
 
     #[arg(long, env = "TRINO_USER")]
@@ -394,9 +399,15 @@ async fn main() -> Result<()> {
         println!("commit_mode={}", commit.mode);
         println!("commit_snapshot_id={}", commit.snapshot_id);
         println!("commit_record_count={}", commit.record_count);
-        println!("commit_parquet_object_bytes={}", commit.parquet_object_bytes);
+        println!(
+            "commit_parquet_object_bytes={}",
+            commit.parquet_object_bytes
+        );
         println!("commit_already_committed={}", commit.already_committed);
-        println!("commit_summary={}", serde_json::to_string(&commit.commit_summary)?);
+        println!(
+            "commit_summary={}",
+            serde_json::to_string(&commit.commit_summary)?
+        );
     }
 
     let read_files = files_to_read(&finish.files, &args.read_back, args.read_max_files);

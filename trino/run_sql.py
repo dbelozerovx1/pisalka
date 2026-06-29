@@ -26,11 +26,23 @@ def request_json(url, data=None):
 
 def run_sql(sql):
     body = request_json(f"{TRINO_URI}/v1/statement", sql)
+    columns = body.get("columns")
+    data = []
+    if body.get("data"):
+        data.extend(body["data"])
     while body.get("nextUri"):
         body = request_json(body["nextUri"])
+        if body.get("columns"):
+            columns = body["columns"]
+        if body.get("data"):
+            data.extend(body["data"])
     if body.get("error"):
         error = body["error"]
         raise RuntimeError(f"{error.get('errorName')}: {error.get('message')}")
+    if columns is not None:
+        body["columns"] = columns
+    if data:
+        body["data"] = data
     return body
 
 

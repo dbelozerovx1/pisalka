@@ -1,13 +1,20 @@
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use arrow_flight::{FlightClient, FlightDescriptor, FlightInfo};
+use arrow_array::RecordBatch;
+use arrow_cast::pretty::pretty_format_batches;
+use arrow_flight::{FlightClient, FlightDescriptor, FlightEndpoint, FlightInfo, Ticket};
+use bytes::Bytes;
 use clap::Parser;
+use futures::TryStreamExt;
 use serde_json::{Map, Value};
 use tokio::time::sleep;
 use tonic::transport::Channel;
 
-use arrow_flight_s3_mvp::config::BenchConfig;
+use arrow_flight_s3_mvp::{
+    config::BenchConfig,
+    util::{batch_memory_size, pretty_bytes, throughput},
+};
 
 #[derive(Debug, Parser)]
 struct Args {
@@ -31,6 +38,15 @@ struct Args {
 
     #[arg(long, env = "COORDINATOR_MAX_POLLS", default_value_t = 120)]
     max_polls: usize,
+
+    #[arg(long, env = "COORDINATOR_READ_RESULTS", default_value_t = false)]
+    read_results: bool,
+
+    #[arg(long, env = "COORDINATOR_READ_MAX_ENDPOINTS")]
+    read_max_endpoints: Option<usize>,
+
+    #[arg(long, env = "COORDINATOR_PREVIEW_ROWS", default_value_t = 20)]
+    preview_rows: usize,
 }
 
 #[tokio::main(flavor = "multi_thread")]
@@ -49,10 +65,10 @@ async fn main() -> Result<()> {
 
     let mut body = Map::new();
     body.insert("type".to_owned(), Value::String("ctas".to_owned()));
-    body.insert("sql".to_owned(), Value::String(args.sql));
-    body.insert("user".to_owned(), Value::String(args.user));
-    insert_string(&mut body, "targetTable", args.target_table);
-    insert_string(&mut body, "authorization", args.authorization);
+    body.insert("sql".to_owned(), Value::String(args.sql.clone()));
+    body.insert("user".to_owned(), Value::String(args.user.clone()));
+    insert_string(&mut body, "targetTable", args.target_table.clone());
+    insert_string(&mut body, "authorization", args.authorization.clone());
 
     let flight_info = client
         .get_flight_info(FlightDescriptor::new_cmd(json_bytes(Value::Object(body))))
@@ -103,6 +119,9 @@ async fn main() -> Result<()> {
             status == "SUCCEEDED",
             "query {query_id} completed with unexpected status {status}"
         );
+        if args.read_results {
+            read_results(info, &args, &bench_config).await?;
+        }
         return Ok(());
     }
 
@@ -110,6 +129,156 @@ async fn main() -> Result<()> {
         "query {query_id} did not complete after {} polls",
         args.max_polls
     );
+}
+
+async fn read_results(info: &FlightInfo, args: &Args, config: &BenchConfig) -> Result<()> {
+    let endpoint_limit = args
+        .read_max_endpoints
+        .unwrap_or(info.endpoint.len())
+        .min(info.endpoint.len());
+    println!("read_results=true");
+    println!("read_endpoint_count={}", info.endpoint.len());
+    println!("read_endpoint_limit={endpoint_limit}");
+    if endpoint_limit == 0 {
+        return Ok(());
+    }
+
+    let started = std::time::Instant::now();
+    let mut total_rows = 0usize;
+    let mut total_batches = 0usize;
+    let mut total_arrow_bytes = 0u64;
+    let mut preview_remaining = args.preview_rows;
+    let mut preview_batches = Vec::new();
+
+    for (index, endpoint) in info.endpoint.iter().take(endpoint_limit).enumerate() {
+        let result = read_endpoint(endpoint, index, config, preview_remaining).await?;
+        preview_remaining = preview_remaining.saturating_sub(result.preview_rows);
+        total_rows += result.rows;
+        total_batches += result.batches;
+        total_arrow_bytes += result.arrow_bytes;
+        preview_batches.extend(result.preview_batches);
+        println!(
+            "read_endpoint={} uri={} path={} rows={} batches={} arrow_bytes={} elapsed_ms={}",
+            index,
+            result.flight_uri,
+            result.path,
+            result.rows,
+            result.batches,
+            result.arrow_bytes,
+            result.elapsed_ms
+        );
+    }
+
+    let elapsed = started.elapsed();
+    println!("read_rows={total_rows}");
+    println!("read_batches={total_batches}");
+    println!("read_arrow_memory_bytes_estimate={total_arrow_bytes}");
+    println!(
+        "read_arrow_memory_size_estimate={}",
+        pretty_bytes(total_arrow_bytes)
+    );
+    println!("read_elapsed_ms={}", elapsed.as_millis());
+    println!(
+        "read_aggregate_throughput={}",
+        throughput(total_arrow_bytes, elapsed)
+    );
+    if !preview_batches.is_empty() {
+        println!("preview_rows={}", args.preview_rows - preview_remaining);
+        println!("{}", pretty_format_batches(&preview_batches)?);
+    }
+    Ok(())
+}
+
+async fn read_endpoint(
+    endpoint: &FlightEndpoint,
+    index: usize,
+    config: &BenchConfig,
+    preview_limit: usize,
+) -> Result<EndpointReadResult> {
+    let ticket = endpoint
+        .ticket
+        .as_ref()
+        .with_context(|| format!("endpoint {index} did not include a ticket"))?;
+    let flight_uri = endpoint
+        .location
+        .first()
+        .map(|location| location.uri.clone())
+        .with_context(|| format!("endpoint {index} did not include a worker location"))?;
+    let metadata = endpoint_metadata(endpoint)?;
+    let path = metadata
+        .get("path")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown")
+        .to_owned();
+
+    let channel = Channel::from_shared(flight_uri.clone())?
+        .connect()
+        .await
+        .with_context(|| format!("failed to connect to worker {flight_uri}"))?;
+    let mut client = FlightClient::new_from_inner(
+        arrow_flight::flight_service_client::FlightServiceClient::new(channel)
+            .max_decoding_message_size(config.max_message_size)
+            .max_encoding_message_size(config.max_message_size),
+    );
+
+    let started = std::time::Instant::now();
+    let mut stream = client
+        .do_get(Ticket {
+            ticket: Bytes::copy_from_slice(&ticket.ticket),
+        })
+        .await
+        .with_context(|| format!("DoGet failed to start for {path}"))?;
+
+    let mut rows = 0usize;
+    let mut batches = 0usize;
+    let mut arrow_bytes = 0u64;
+    let mut preview_rows = 0usize;
+    let mut preview_batches = Vec::new();
+    while let Some(batch) = stream
+        .try_next()
+        .await
+        .with_context(|| format!("DoGet stream failed for {path}"))?
+    {
+        rows += batch.num_rows();
+        batches += 1;
+        arrow_bytes += batch_memory_size(&batch);
+        if preview_rows < preview_limit {
+            let take = (preview_limit - preview_rows).min(batch.num_rows());
+            preview_batches.push(batch.slice(0, take));
+            preview_rows += take;
+        }
+    }
+
+    Ok(EndpointReadResult {
+        flight_uri,
+        path,
+        rows,
+        batches,
+        arrow_bytes,
+        preview_rows,
+        preview_batches,
+        elapsed_ms: started.elapsed().as_millis(),
+    })
+}
+
+fn endpoint_metadata(endpoint: &FlightEndpoint) -> Result<Value> {
+    if endpoint.app_metadata.is_empty() {
+        Ok(Value::Object(Map::new()))
+    } else {
+        serde_json::from_slice(&endpoint.app_metadata)
+            .context("FlightEndpoint app_metadata was not JSON")
+    }
+}
+
+struct EndpointReadResult {
+    flight_uri: String,
+    path: String,
+    rows: usize,
+    batches: usize,
+    arrow_bytes: u64,
+    preview_rows: usize,
+    preview_batches: Vec<RecordBatch>,
+    elapsed_ms: u128,
 }
 
 fn print_flight_info(prefix: &str, info: &FlightInfo) -> Result<()> {

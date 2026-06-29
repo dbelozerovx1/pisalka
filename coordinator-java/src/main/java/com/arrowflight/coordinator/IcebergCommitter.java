@@ -19,12 +19,15 @@ import org.apache.iceberg.MetricsConfig;
 import org.apache.iceberg.OverwriteFiles;
 import org.apache.iceberg.Snapshot;
 import org.apache.iceberg.Table;
+import org.apache.iceberg.TableProperties;
 import org.apache.iceberg.catalog.Namespace;
 import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.iceberg.expressions.Expressions;
 import org.apache.iceberg.hadoop.HadoopInputFile;
 import org.apache.iceberg.hive.HiveCatalog;
 import org.apache.iceberg.io.InputFile;
+import org.apache.iceberg.mapping.MappingUtil;
+import org.apache.iceberg.mapping.NameMappingParser;
 import org.apache.iceberg.parquet.ParquetUtil;
 
 final class IcebergCommitter {
@@ -51,6 +54,7 @@ final class IcebergCommitter {
         }
 
         Table table = catalog.loadTable(tableIdentifier(tableName));
+        ensureNameMapping(table);
         ArrayList<DataFile> dataFiles = new ArrayList<>(files.size());
         ArrayList<String> metricWarnings = new ArrayList<>();
         long recordCount = 0;
@@ -132,6 +136,19 @@ final class IcebergCommitter {
             String warning = file.filePath() + ": " + error.getMessage();
             return new BuiltDataFile(builder.withMetrics(fallbackMetrics).build(), false, Optional.of(warning));
         }
+    }
+
+    private static void ensureNameMapping(Table table) {
+        if (table.properties().containsKey(TableProperties.DEFAULT_NAME_MAPPING)) {
+            return;
+        }
+        table.updateProperties()
+                .set(
+                        TableProperties.DEFAULT_NAME_MAPPING,
+                        NameMappingParser.toJson(MappingUtil.create(table.schema()))
+                )
+                .commit();
+        table.refresh();
     }
 
     private static void setSnapshotProperties(org.apache.iceberg.SnapshotUpdate<?> update, String uploadId, CommitMode mode) {

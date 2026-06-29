@@ -35,6 +35,7 @@ path = "benchmarks/tools/coordinator_query.rs"
 [dependencies]
 anyhow = "1"
 arrow-array = "=58.3.0"
+arrow-cast = { version = "=58.3.0", features = ["prettyprint"] }
 arrow-flight = "=58.3.0"
 arrow-ipc = "=58.3.0"
 arrow-schema = "=58.3.0"
