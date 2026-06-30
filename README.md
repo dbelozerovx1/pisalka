@@ -117,7 +117,7 @@ E2E_READ_LIMIT=100 E2E_PREVIEW_ROWS=20 ./dev/e2e-read-table.sh arrow.example_eve
 E2E_READ_SQL='SELECT id, bucket, value FROM iceberg.arrow.example_events WHERE bucket < 3 LIMIT 20' ./dev/e2e-read-table.sh arrow.example_events
 ```
 
-Run the coordinator-first smoke path. This generates Arrow IPC data inside Docker and then runs the Rust `bench-coordinator` example client. That client asks the coordinator to create an upload session, writes with every issued signed `DoPut` ticket, finishes the upload so the coordinator validates worker metadata, commits the worker-written Parquet files into Iceberg through the Java API, asks the coordinator for signed exact-file `DoGet` ticket(s), reads the data back, and verifies `SELECT count(*)` plus `SELECT * LIMIT 1` through Trino:
+Run the coordinator-first smoke path. This generates Arrow IPC data inside Docker and then runs the Rust `bench-coordinator` example client. That client asks the coordinator to create an upload session, writes with every issued signed `DoPut` ticket, commits the worker-written Parquet files into Iceberg through the Java API, asks the coordinator for signed exact-file `DoGet` ticket(s), reads the data back, and verifies `SELECT count(*)` plus `SELECT * LIMIT 1` through Trino:
 
 ```bash
 ./dev/coordinator-smoke.sh
@@ -178,10 +178,11 @@ Useful environment variables:
 - `PARQUET_FLUSH_THRESHOLD_BYTES=268435456`
 - `PUT_PARALLELISM=4`
 - `PUT_QUEUE_DEPTH=2`
-- `PUT_MAX_ACTIVE_STREAMS=16`
-- `PUT_MAX_STREAMS_PER_UPLOAD=8`
-- `PUT_SCHEDULER_RESERVED_SLOTS=0`
+- `WORKER_CPU_MILLICORES=` detected from cgroup when possible, otherwise available CPU fallback
 - `WORKER_MEMORY_BYTES=` detected from cgroup when possible, otherwise 16 GiB fallback
+- `PUT_MAX_ACTIVE_STREAMS=auto` defaults to roughly `ceil(cpu_cores * 2)`, capped at 16
+- `PUT_MAX_STREAMS_PER_UPLOAD=auto` defaults to `min(put_slots, 4)`
+- `PUT_SCHEDULER_RESERVED_SLOTS=auto` defaults to 1 only when the auto slot count is at least 4
 - `WORKER_RESERVED_MEMORY_BYTES=` reserved process/system headroom, otherwise max(512 MiB, 20%)
 - `PUT_MEMORY_PERCENT=55`
 - `PUT_MEMORY_BUDGET_BYTES=` explicit write memory pool override
@@ -192,9 +193,9 @@ Useful environment variables:
 - `READ_MAX_STREAM_MEMORY_BYTES=` per admitted DoGet memory charge
 - `READ_MAX_RECORD_BATCH_BYTES=` max decoded DoGet batch memory estimate
 - `READ_MAX_BATCH_ROWS=1048576`
-- `READ_MAX_ACTIVE_STREAMS=16`
-- `READ_MAX_STREAMS_PER_OPERATION=8`
-- `READ_SCHEDULER_RESERVED_SLOTS=0`
+- `READ_MAX_ACTIVE_STREAMS=auto` defaults to roughly `ceil(cpu_cores * 4)`, capped at 32
+- `READ_MAX_STREAMS_PER_OPERATION=auto` defaults to `min(read_slots, 8)`
+- `READ_SCHEDULER_RESERVED_SLOTS=auto` defaults to 1 only when the auto slot count is at least 4
 - `READ_SLOT_WAIT_MS=30000`
 - `WORKER_ZONE=` optional coordinator locality hint
 - `WORKER_FLIGHT_URI=http://127.0.0.1:50051` worker-published URI stored in `worker_registry`; in Docker Compose this defaults to `http://flight-server:50051`
@@ -253,10 +254,8 @@ Standard Flight methods:
 
 Flight actions:
 
-- `coordinator.create-upload`: creates a durable upload session, selects workers from `worker_registry`, persists planned stream attempts, and returns one signed `DoPut` ticket per granted stream. When the planned mode is `overwrite` / `replace`, the coordinator first drops the target table through Trino and best-effort cleans the target table location, then issues tickets under the clean table `data/` directory.
-- `coordinator.upload-status`: returns the planned session, stream status joined with worker stream metadata, and written file rows.
-- `coordinator.finish-upload`: explicit finalization gate. It succeeds only when all planned streams are `SUCCEEDED`, reads DB-backed worker file/schema metadata, marks the upload `READY_TO_COMMIT`, and returns the file list plus a Trino `CREATE TABLE` DDL preview.
-- `coordinator.commit-upload`: explicit commit gate. It reruns the same upload validation, loads or creates the Iceberg table metadata, collects Parquet footer metrics, and commits the DB-backed file list. `append` requires an existing table. `overwrite` is recreate-style when planned at `create-upload`: old table/location are removed before data moves, then the new table metadata is created from the recorded Arrow schema and committed with the uploaded files.
+- `coordinator.create-upload`: creates a durable upload session, selects workers from `worker_registry`, persists planned stream attempts, and returns one signed `DoPut` ticket per granted stream. Repeating the action with the same `uploadId` and same parameters can land on any coordinator replica and returns the persisted plan. When the planned mode is `overwrite` / `replace`, the coordinator first drops the target table through Trino and best-effort cleans the target table location, then issues tickets under the clean table `data/` directory.
+- `coordinator.commit-upload`: explicit commit gate. The client calls it after it considers all `DoPut` streams complete. The coordinator reads currently recorded worker file rows, loads or creates the Iceberg table metadata through the Hive catalog, collects Parquet footer metrics, and commits that DB-backed file list. `append` requires an existing table and checks the uploaded Arrow-derived Iceberg schema against the existing table schema before committing. `overwrite` is recreate-style when planned at `create-upload`: old table/location are removed before data moves, then the new table metadata is created from the recorded Arrow schema and committed with the uploaded files.
 - `coordinator.do-commit`: compatibility alias for `coordinator.commit-upload`.
 - `coordinator.abort-upload`: marks an upload `ABORTED` and best-effort deletes the upload staging prefix.
 - `coordinator.drop-temp`: drops a coordinator-created CTAS temp table by `queryId`, best-effort deletes its CTAS staging prefix, and marks the query row `DROPPED`. `coordinator.drop_temp` is accepted as an alias.
@@ -271,16 +270,19 @@ Read planning intentionally uses Iceberg `$files` metadata instead of direct S3 
 
 The coordinator does not store bearer tokens in the registry. If Trino requires per-user auth on cursor polling, pass the user's `authorization` value on every `PollFlightInfo` call or use a future service-token model.
 
+For multi-coordinator and multi-worker Kubernetes deployment shape, see [docs/k8s-launch.md](/Users/dbelozerov/Repos/arrow-flight-s3-mvp/docs/k8s-launch.md).
+
 Commit/readiness flow:
 
 1. Workers publish `worker_registry` heartbeats with their Flight URI, live read/write capacity, memory-derived recommended streams, utilization, EWMA wait/throughput, and selection score.
 2. `create-upload` selects active, non-draining, heartbeat-fresh workers from `worker_registry`; coordinator has no configured worker id/url.
 3. `create-upload` persists `coordinator_upload_sessions` and `coordinator_upload_streams` rows before data moves.
 4. Each worker `DoPut` persists its stream status, Arrow schema JSON from the first decoded batch, and written Parquet file rows in `worker_put_streams` / `worker_put_files`.
-5. `finish-upload` compares planned streams to actual worker outcomes. Missing or running streams block finalization. Rejected or failed streams mark the upload `FAILED` and trigger best-effort cleanup of the upload's exact planned/recorded objects.
-6. `commit-upload` can be called after `finish-upload`, or directly after all worker streams finish. It appends or overwrites Iceberg with the exact files stored in `worker_put_files`. For `overwrite`, the destructive table drop/location cleanup happens during `create-upload`, before new data files are written.
+5. The client decides when upload streams are complete and calls `commit-upload`.
+6. `commit-upload` appends or overwrites Iceberg with the exact files currently stored in `worker_put_files`. If the client commits too early, only files recorded at that moment are part of the table. For `overwrite`, the destructive table drop/location cleanup happens during `create-upload`, before new data files are written.
 7. A successful commit stores mode, table name, snapshot id, and commit summary on the upload session. Repeating `commit-upload` for an already committed upload returns the stored result instead of appending the same files again.
-8. If commit fails before entering the Iceberg snapshot commit boundary, the coordinator marks the upload `FAILED`, best-effort deletes the upload's exact planned/recorded objects, and drops the table only when it did not exist before this commit attempt. After the Iceberg commit boundary, raw object deletion is skipped because the files may already be table data.
+8. If a coordinator dies or fails around the Iceberg commit boundary, a later `commit-upload` on any coordinator first checks Iceberg snapshots for `coordinator.upload-id` and repairs the DB row when the snapshot already landed.
+9. If commit fails before a committed Iceberg snapshot is visible, the coordinator marks the upload `FAILED`, best-effort deletes the upload's exact planned/recorded objects, and drops the table only for overwrite when the table did not exist before this commit attempt. Append failures never drop or clean the existing table location; only files recorded for this upload are cleaned. After a committed snapshot is visible, raw object deletion is skipped because the files are table data.
 
 Coordinator-created uploads place Parquet files under the Iceberg table data directory: `<warehouse>/<schema>/<table>/data/`. Each planned stream receives a `flight-<uuid>.parquet` descriptor path. Without `--file-size` / `TARGET_FILE_SIZE`, `DoPut` writes that single Parquet object. With a target file size, `DoPut` writes ordered sibling part files such as `flight-<uuid>-part-00000.parquet` under the same `data/` directory and returns the file list in the `DoPut` result and metadata DB. `PUT_PARALLELISM` controls the maximum number of active part writers. `DoGet` accepts a direct physical Parquet path ticket and streams that file back.
 
@@ -388,7 +390,7 @@ Coordinator-facing worker status shape:
 }
 ```
 
-The same scheduler fields are persisted into `worker_registry` as columns for simple SQL filtering and ordering, while the full payload is kept in `status_json`.
+Only the worker fields needed for coordinator scheduling are persisted into `worker_registry`: direct Flight URI, state/draining, read/write recommended streams, scores, utilization, admission wait EWMA, throughput EWMA, TTL, and heartbeat time. The full worker payload remains available through worker status actions and Prometheus metrics instead of being duplicated in Postgres.
 
 Worker metrics are exposed as Prometheus text at `http://127.0.0.1:9090/metrics`; coordinator metrics are exposed at `http://127.0.0.1:9091/metrics`. Both listeners also expose cheap `/healthz` endpoints. Metrics are intentionally low-cardinality and request-level only: no per-batch metrics, no object-path labels, no upload-id labels, no query-id labels, and no `errorId` labels. This keeps the hot path to a few atomic increments while logs retain the exact request ids for investigation.
 

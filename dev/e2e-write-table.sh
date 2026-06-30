@@ -179,7 +179,6 @@ docker compose run --rm \
   --entrypoint env bench \
   -u COORDINATOR_OPERATION_ID \
   -u COORDINATOR_UPLOAD_ID \
-  -u COORDINATOR_STAGING_PREFIX \
   -u COORDINATOR_TABLE_NAME \
   -u COORDINATOR_COMMIT_MODE \
   -u PUT_MAX_STREAM_BYTES \

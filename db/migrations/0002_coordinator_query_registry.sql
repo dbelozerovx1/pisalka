@@ -2,7 +2,6 @@ CREATE TABLE IF NOT EXISTS coordinator_query_registry (
     query_id TEXT PRIMARY KEY,
     query_type TEXT NOT NULL,
     status TEXT NOT NULL,
-    descriptor_json JSONB NOT NULL,
     target_table TEXT,
     submitted_sql TEXT,
     trino_user TEXT,

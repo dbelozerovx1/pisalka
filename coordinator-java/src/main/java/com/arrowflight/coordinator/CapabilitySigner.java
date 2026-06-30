@@ -39,9 +39,7 @@ final class CapabilitySigner {
         String attemptId = stringOrDefault(request, "attemptId", java.util.UUID.randomUUID().toString());
         String uploadId = stringOrDefault(request, "uploadId", operationId);
         String streamId = stringOrDefault(request, "streamId", "stream-0");
-        String stagingPrefix = request.containsKey("stagingPrefix")
-                ? Config.normalizePrefix(String.valueOf(request.get("stagingPrefix")))
-                : config.stagingPrefixForOperation(operationId);
+        String stagingPrefix = Config.normalizePrefix(Json.requiredString(request, "stagingPrefix"));
         String path = request.containsKey("path")
                 ? Config.normalizePath(String.valueOf(request.get("path")))
                 : Config.normalizePath(stagingPrefix + "/flight-" + java.util.UUID.randomUUID() + ".parquet");

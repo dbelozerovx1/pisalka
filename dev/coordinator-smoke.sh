@@ -10,7 +10,6 @@ streams="${SMOKE_STREAMS:-1}"
 read_back="${SMOKE_READ_BACK:-first}"
 input="${SMOKE_INPUT:-/bench-data/coordinator-smoke-${size}.arrow}"
 operation_id="${SMOKE_OPERATION_ID:-smoke-$(date +%Y%m%d-%H%M%S)}"
-staging_prefix="${SMOKE_STAGING_PREFIX:-coordinator/smoke/${operation_id}}"
 commit_mode="${SMOKE_COMMIT_MODE:-append}"
 table_suffix="$(printf '%s' "$operation_id" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9_' '_')"
 table_name="${SMOKE_TABLE_NAME:-iceberg.arrow.smoke_${table_suffix}}"
@@ -49,7 +48,6 @@ args=(
   --input "$input"
   --coordinator-uri "http://coordinator:8088"
   --operation-id "$operation_id"
-  --staging-prefix "$staging_prefix"
   --streams "$streams"
   --file-size "$target_file_size"
   --read-back "$read_back"
@@ -75,7 +73,6 @@ docker compose run --rm \
   --entrypoint env bench \
   -u COORDINATOR_OPERATION_ID \
   -u COORDINATOR_UPLOAD_ID \
-  -u COORDINATOR_STAGING_PREFIX \
   -u COORDINATOR_TABLE_NAME \
   -u COORDINATOR_COMMIT_MODE \
   -u PUT_MAX_STREAM_BYTES \

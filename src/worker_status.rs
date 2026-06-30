@@ -48,6 +48,7 @@ pub struct WorkerCapacity {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct WorkerResourceStatus {
+    pub worker_cpu_millicores: u64,
     pub worker_memory_bytes: u64,
     pub reserved_memory_bytes: u64,
     pub put: WorkerResourcePool,

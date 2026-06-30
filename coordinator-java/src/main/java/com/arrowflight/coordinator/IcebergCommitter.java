@@ -32,6 +32,8 @@ import org.apache.iceberg.io.InputFile;
 import org.apache.iceberg.mapping.MappingUtil;
 import org.apache.iceberg.mapping.NameMappingParser;
 import org.apache.iceberg.parquet.ParquetUtil;
+import org.apache.iceberg.types.CheckCompatibility;
+import org.apache.iceberg.types.Types;
 
 final class IcebergCommitter {
     private final Config config;
@@ -127,6 +129,82 @@ final class IcebergCommitter {
         return catalog.tableExists(tableIdentifier(tableName));
     }
 
+    Optional<CommitOutcome> committedUpload(String tableName, String uploadId, List<UploadFile> files) {
+        TableIdentifier identifier = tableIdentifier(tableName);
+        if (!catalog.tableExists(identifier)) {
+            return Optional.empty();
+        }
+        Table table = catalog.loadTable(identifier);
+        table.refresh();
+
+        Snapshot matchedSnapshot = null;
+        for (Snapshot snapshot : table.snapshots()) {
+            Map<String, String> snapshotSummary = snapshot.summary();
+            if (snapshotSummary != null && uploadId.equals(snapshotSummary.get("coordinator.upload-id"))) {
+                matchedSnapshot = snapshot;
+            }
+        }
+        if (matchedSnapshot == null) {
+            return Optional.empty();
+        }
+
+        long recordCount = 0;
+        long parquetBytes = 0;
+        for (UploadFile file : files) {
+            recordCount += file.rows();
+            parquetBytes += file.parquetObjectBytes();
+        }
+
+        Map<String, String> snapshotSummary = matchedSnapshot.summary();
+        String mode = Optional.ofNullable(snapshotSummary)
+                .map(summary -> summary.get("coordinator.commit-mode"))
+                .filter(value -> !value.isBlank())
+                .orElse("unknown");
+        LinkedHashMap<String, Object> summary = new LinkedHashMap<>();
+        summary.put("mode", mode);
+        summary.put("fileCount", files.size());
+        summary.put("recordCount", recordCount);
+        summary.put("parquetObjectBytes", parquetBytes);
+        summary.put("snapshotId", matchedSnapshot.snapshotId());
+        summary.put("recoveredFromIcebergSnapshot", true);
+        if (matchedSnapshot.operation() != null) {
+            summary.put("snapshotOperation", matchedSnapshot.operation());
+        }
+        if (snapshotSummary != null) {
+            summary.put("snapshotSummary", new LinkedHashMap<>(snapshotSummary));
+        }
+        return Optional.of(new CommitOutcome(mode, matchedSnapshot.snapshotId(), recordCount, parquetBytes, summary));
+    }
+
+    Map<String, Object> validateAppendSchema(String tableName, Map<String, Object> arrowSchema) {
+        TableIdentifier identifier = tableIdentifier(tableName);
+        if (!catalog.tableExists(identifier)) {
+            throw new CoordinatorException(
+                    409,
+                    "append commit requires an existing Iceberg table when worker files are written directly "
+                            + "under table data location; use overwrite to recreate the table"
+            );
+        }
+
+        Table table = catalog.loadTable(identifier);
+        Schema uploadSchema = IcebergSchemaPlanner.schema(arrowSchema);
+        List<String> compatibilityErrors = checkCompatibilityErrors(table.schema(), uploadSchema);
+        if (!compatibilityErrors.isEmpty()) {
+            throw new CoordinatorException(
+                    409,
+                    "uploaded schema is not compatible with existing Iceberg table " + tableName
+                            + ": " + String.join("; ", compatibilityErrors.stream().limit(8).toList())
+            );
+        }
+
+        LinkedHashMap<String, Object> body = new LinkedHashMap<>();
+        body.put("tableName", tableName);
+        body.put("tableSchemaId", table.schema().schemaId());
+        body.put("tableLocation", table.location());
+        body.put("compatible", true);
+        return body;
+    }
+
     boolean createTableIfMissing(String tableName, Map<String, Object> arrowSchema, String location) {
         TableIdentifier identifier = tableIdentifier(tableName);
         if (catalog.tableExists(identifier)) {
@@ -181,6 +259,45 @@ final class IcebergCommitter {
     private static void setSnapshotProperties(org.apache.iceberg.SnapshotUpdate<?> update, String uploadId, CommitMode mode) {
         update.set("coordinator.upload-id", uploadId);
         update.set("coordinator.commit-mode", mode.value);
+    }
+
+    private static List<String> checkCompatibilityErrors(Schema tableSchema, Schema uploadSchema) {
+        ArrayList<String> errors = new ArrayList<>(CheckCompatibility.writeCompatibilityErrors(
+                tableSchema,
+                uploadSchema,
+                true
+        ));
+        errors.addAll(topLevelSchemaContractErrors(tableSchema, uploadSchema));
+        return errors;
+    }
+
+    private static List<String> topLevelSchemaContractErrors(Schema tableSchema, Schema uploadSchema) {
+        List<Types.NestedField> tableColumns = tableSchema.columns();
+        List<Types.NestedField> uploadColumns = uploadSchema.columns();
+        ArrayList<String> errors = new ArrayList<>();
+        if (tableColumns.size() != uploadColumns.size()) {
+            errors.add("table has " + tableColumns.size() + " columns but upload has " + uploadColumns.size());
+        }
+
+        int shared = Math.min(tableColumns.size(), uploadColumns.size());
+        for (int index = 0; index < shared; index++) {
+            Types.NestedField tableField = tableColumns.get(index);
+            Types.NestedField uploadField = uploadColumns.get(index);
+            if (!tableField.name().equals(uploadField.name())) {
+                errors.add(
+                        "column " + (index + 1) + " is " + uploadField.name()
+                                + " but existing table column is " + tableField.name()
+                );
+            }
+            if (tableField.isOptional() != uploadField.isOptional()) {
+                errors.add(
+                        "column " + uploadField.name() + " nullability differs; table is "
+                                + (tableField.isOptional() ? "nullable" : "required")
+                                + " but upload is " + (uploadField.isOptional() ? "nullable" : "required")
+                );
+            }
+        }
+        return errors;
     }
 
     private TableIdentifier tableIdentifier(String tableName) {

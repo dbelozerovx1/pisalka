@@ -80,14 +80,12 @@ case "$mode" in
     ;;
   coordinator|coord)
     streams="${UPLOAD_STREAMS:-${PUT_STREAMS:-1}}"
-    staging_prefix="${BENCH_STAGING_PREFIX:-coordinator/bench/${timestamp}}"
     read_back="${READ_BACK:-first}"
     operation_id="${COORDINATOR_OPERATION_ID:-bench-docker-${timestamp}}"
 
     args=(
       --input "$input"
       --operation-id "$operation_id"
-      --staging-prefix "$staging_prefix"
       --streams "$streams"
       --read-back "$read_back"
     )

@@ -25,12 +25,10 @@ import java.util.Map;
 final class CoordinatorFlightProducer implements FlightProducer {
     private static final Schema EMPTY_SCHEMA = new Schema(List.of());
 
-    private final Config config;
     private final CoordinatorService coordinator;
     private final CoordinatorMetrics metrics;
 
-    CoordinatorFlightProducer(Config config, CoordinatorService coordinator, CoordinatorMetrics metrics) {
-        this.config = config;
+    CoordinatorFlightProducer(CoordinatorService coordinator, CoordinatorMetrics metrics) {
         this.coordinator = coordinator;
         this.metrics = metrics;
     }
@@ -105,8 +103,6 @@ final class CoordinatorFlightProducer implements FlightProducer {
             Map<String, Object> response = switch (action.getType()) {
                 case "coordinator.config" -> coordinator.configJson();
                 case "coordinator.create-upload" -> coordinator.createUpload(request);
-                case "coordinator.upload-status" -> coordinator.uploadStatus(request);
-                case "coordinator.finish-upload" -> coordinator.finishUpload(request);
                 case "coordinator.commit-upload", "coordinator.do-commit" -> coordinator.commitUpload(request);
                 case "coordinator.abort-upload" -> coordinator.abortUpload(request);
                 case "coordinator.drop-temp", "coordinator.drop_temp" -> coordinator.dropTemp(request);
@@ -130,8 +126,6 @@ final class CoordinatorFlightProducer implements FlightProducer {
     public void listActions(CallContext context, StreamListener<ActionType> listener) {
         listener.onNext(new ActionType("coordinator.config", "Return non-secret coordinator configuration"));
         listener.onNext(new ActionType("coordinator.create-upload", "Create a durable upload session and signed DoPut tickets"));
-        listener.onNext(new ActionType("coordinator.upload-status", "Return upload session and worker stream status"));
-        listener.onNext(new ActionType("coordinator.finish-upload", "Validate completed upload streams and return files/DDL"));
         listener.onNext(new ActionType("coordinator.commit-upload", "Commit uploaded files to Iceberg with append or overwrite"));
         listener.onNext(new ActionType("coordinator.do-commit", "Alias for coordinator.commit-upload"));
         listener.onNext(new ActionType("coordinator.abort-upload", "Mark an upload session aborted"));

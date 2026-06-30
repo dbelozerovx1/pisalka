@@ -13,7 +13,7 @@ public final class CoordinatorApplication {
         Config config = Config.fromEnv();
         CoordinatorMetrics metrics = new CoordinatorMetrics();
         CoordinatorService coordinator = new CoordinatorService(config);
-        CoordinatorFlightProducer producer = new CoordinatorFlightProducer(config, coordinator, metrics);
+        CoordinatorFlightProducer producer = new CoordinatorFlightProducer(coordinator, metrics);
         Location location = Location.forGrpcInsecure(
                 config.listenAddress.getHostString(),
                 config.listenAddress.getPort()

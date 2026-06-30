@@ -82,6 +82,7 @@ pub struct SecurityConfig {
 
 #[derive(Debug, Clone)]
 pub struct ResourceConfig {
+    pub worker_cpu_millicores: u64,
     pub worker_memory_bytes: u64,
     pub reserved_memory_bytes: u64,
     pub put_memory_bytes: u64,
@@ -110,9 +111,10 @@ impl AppConfig {
         let flight_addr = env_string("FLIGHT_ADDR", "0.0.0.0:50051")
             .parse::<SocketAddr>()
             .context("FLIGHT_ADDR must be a socket address such as 0.0.0.0:50051")?;
-        let worker = WorkerConfig::from_env()?;
+        let flavor = WorkerFlavor::from_env()?;
+        let worker = WorkerConfig::from_env(&flavor)?;
         let read_batch_size = env_usize("READ_BATCH_SIZE", 65_536)?;
-        let resources = ResourceConfig::from_env(&worker, read_batch_size)?;
+        let resources = ResourceConfig::from_env(&worker, read_batch_size, &flavor)?;
         let security = SecurityConfig::from_env()?;
 
         Ok(Self {
@@ -127,6 +129,33 @@ impl AppConfig {
             flight_max_message_size: env_usize("FLIGHT_MAX_MESSAGE_SIZE", 256 * 1024 * 1024)?,
             flight_data_chunk_size: env_usize("FLIGHT_DATA_CHUNK_SIZE", 16 * 1024 * 1024)?,
             read_batch_size,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct WorkerFlavor {
+    cpu_millicores: u64,
+    memory_bytes: u64,
+}
+
+impl WorkerFlavor {
+    fn from_env() -> Result<Self> {
+        const MIB: u64 = 1024 * 1024;
+        const GIB: u64 = 1024 * MIB;
+
+        let cpu_millicores = env_optional_cpu_millicores("WORKER_CPU_MILLICORES")?
+            .or_else(detect_worker_cpu_millicores)
+            .unwrap_or_else(default_cpu_millicores)
+            .max(100);
+        let memory_bytes = env_optional_u64("WORKER_MEMORY_BYTES")?
+            .or_else(detect_worker_memory_bytes)
+            .unwrap_or(16 * GIB)
+            .max(512 * MIB);
+
+        Ok(Self {
+            cpu_millicores,
+            memory_bytes,
         })
     }
 }
@@ -176,22 +205,40 @@ impl ParquetTuning {
 }
 
 impl WorkerConfig {
-    pub fn from_env() -> Result<Self> {
+    fn from_env(flavor: &WorkerFlavor) -> Result<Self> {
+        let auto_put_streams = auto_put_streams(flavor.cpu_millicores);
+        let auto_read_streams = auto_read_streams(flavor.cpu_millicores);
         Ok(Self {
             worker_id: env_string("WORKER_ID", "local-worker"),
             flight_uri: env_string("WORKER_FLIGHT_URI", "http://127.0.0.1:50051"),
             zone: env_optional_string("WORKER_ZONE"),
             draining: env_bool("WORKER_DRAINING", false),
-            max_active_put_streams: env_usize("PUT_MAX_ACTIVE_STREAMS", 16)?.max(1),
-            max_put_streams_per_upload: env_usize("PUT_MAX_STREAMS_PER_UPLOAD", 8)?.max(1),
-            put_scheduler_reserved_slots: env_usize("PUT_SCHEDULER_RESERVED_SLOTS", 0)?,
+            max_active_put_streams: env_usize_auto("PUT_MAX_ACTIVE_STREAMS", auto_put_streams)?
+                .max(1),
+            max_put_streams_per_upload: env_usize_auto(
+                "PUT_MAX_STREAMS_PER_UPLOAD",
+                auto_put_streams.min(4),
+            )?
+            .max(1),
+            put_scheduler_reserved_slots: env_usize_auto(
+                "PUT_SCHEDULER_RESERVED_SLOTS",
+                auto_reserved_slots(auto_put_streams),
+            )?,
             put_slot_wait_ms: env_usize("PUT_SLOT_WAIT_MS", 30_000)? as u64,
             put_first_batch_timeout_ms: env_usize("PUT_FIRST_BATCH_TIMEOUT_MS", 10_000)? as u64,
             max_put_stream_bytes: env_optional_u64("PUT_MAX_STREAM_BYTES")?,
             require_staging_prefix: env_bool("PUT_REQUIRE_STAGING_PREFIX", false),
-            max_active_read_streams: env_usize("READ_MAX_ACTIVE_STREAMS", 16)?.max(1),
-            max_read_streams_per_operation: env_usize("READ_MAX_STREAMS_PER_OPERATION", 8)?.max(1),
-            read_scheduler_reserved_slots: env_usize("READ_SCHEDULER_RESERVED_SLOTS", 0)?,
+            max_active_read_streams: env_usize_auto("READ_MAX_ACTIVE_STREAMS", auto_read_streams)?
+                .max(1),
+            max_read_streams_per_operation: env_usize_auto(
+                "READ_MAX_STREAMS_PER_OPERATION",
+                auto_read_streams.min(8),
+            )?
+            .max(1),
+            read_scheduler_reserved_slots: env_usize_auto(
+                "READ_SCHEDULER_RESERVED_SLOTS",
+                auto_reserved_slots(auto_read_streams),
+            )?,
             read_slot_wait_ms: env_usize("READ_SLOT_WAIT_MS", 30_000)? as u64,
             require_structured_tickets: env_bool("WORKER_REQUIRE_STRUCTURED_TICKETS", false),
             registry_heartbeat_interval_ms: env_usize("WORKER_HEARTBEAT_INTERVAL_MS", 5_000)?
@@ -234,14 +281,15 @@ impl SecurityConfig {
 }
 
 impl ResourceConfig {
-    pub fn from_env(worker: &WorkerConfig, read_batch_size: usize) -> Result<Self> {
+    fn from_env(
+        worker: &WorkerConfig,
+        read_batch_size: usize,
+        flavor: &WorkerFlavor,
+    ) -> Result<Self> {
         const MIB: u64 = 1024 * 1024;
         const GIB: u64 = 1024 * MIB;
 
-        let worker_memory_bytes = env_optional_u64("WORKER_MEMORY_BYTES")?
-            .or_else(detect_worker_memory_bytes)
-            .unwrap_or(16 * GIB)
-            .max(512 * MIB);
+        let worker_memory_bytes = flavor.memory_bytes;
         let default_reserved = (worker_memory_bytes / 5)
             .max(512 * MIB)
             .min(worker_memory_bytes / 2);
@@ -270,11 +318,11 @@ impl ResourceConfig {
             worker.max_active_put_streams,
             worker.max_put_streams_per_upload,
             256 * MIB,
-            GIB,
+            2 * GIB,
         );
         let put_max_stream_memory_bytes =
             env_optional_u64("PUT_MAX_STREAM_MEMORY_BYTES")?.unwrap_or(put_default_stream);
-        let put_default_batch = default_batch_memory(put_max_stream_memory_bytes, 256 * MIB);
+        let put_default_batch = default_batch_memory(put_max_stream_memory_bytes, 512 * MIB);
         let put_max_record_batch_bytes =
             env_optional_u64("PUT_MAX_RECORD_BATCH_BYTES")?.unwrap_or(put_default_batch);
 
@@ -283,17 +331,18 @@ impl ResourceConfig {
             worker.max_active_read_streams,
             worker.max_read_streams_per_operation,
             128 * MIB,
-            512 * MIB,
+            GIB,
         );
         let read_max_stream_memory_bytes =
             env_optional_u64("READ_MAX_STREAM_MEMORY_BYTES")?.unwrap_or(read_default_stream);
-        let read_default_batch = default_batch_memory(read_max_stream_memory_bytes, 128 * MIB);
+        let read_default_batch = default_batch_memory(read_max_stream_memory_bytes, 256 * MIB);
         let read_max_record_batch_bytes =
             env_optional_u64("READ_MAX_RECORD_BATCH_BYTES")?.unwrap_or(read_default_batch);
         let read_max_batch_rows =
             env_usize("READ_MAX_BATCH_ROWS", read_batch_size.max(1_048_576))?.max(1);
 
         Ok(Self {
+            worker_cpu_millicores: flavor.cpu_millicores,
             worker_memory_bytes,
             reserved_memory_bytes,
             put_memory_bytes,
@@ -365,6 +414,17 @@ fn env_usize(key: &str, default: usize) -> Result<usize> {
     }
 }
 
+fn env_usize_auto(key: &str, default: usize) -> Result<usize> {
+    match env::var(key) {
+        Ok(value) if value.trim().is_empty() || value.trim().eq_ignore_ascii_case("auto") => {
+            Ok(default)
+        }
+        Ok(value) => crate::util::parse_size(&value)
+            .with_context(|| format!("{key} must be auto, a number, or a size-like integer")),
+        Err(_) => Ok(default),
+    }
+}
+
 fn env_percent(key: &str, default: u64) -> Result<u64> {
     match env::var(key) {
         Ok(value) => value
@@ -373,6 +433,18 @@ fn env_percent(key: &str, default: u64) -> Result<u64> {
             .with_context(|| format!("{key} must be an integer percent"))
             .map(|value| value.min(100)),
         Err(_) => Ok(default.min(100)),
+    }
+}
+
+fn env_optional_cpu_millicores(key: &str) -> Result<Option<u64>> {
+    match env::var(key) {
+        Ok(value) if value.trim().is_empty() || value.trim().eq_ignore_ascii_case("auto") => {
+            Ok(None)
+        }
+        Ok(value) => parse_cpu_millicores(&value)
+            .with_context(|| format!("{key} must be auto, 1000m, or a CPU count like 1 or 0.5"))
+            .map(Some),
+        Err(_) => Ok(None),
     }
 }
 
@@ -388,9 +460,39 @@ fn env_optional_u64(key: &str) -> Result<Option<u64>> {
     }
 }
 
+fn parse_cpu_millicores(value: &str) -> Result<u64> {
+    let value = value.trim();
+    if let Some(millis) = value.strip_suffix('m') {
+        let parsed = millis
+            .trim()
+            .parse::<u64>()
+            .context("millicore value must be an integer")?;
+        return Ok(parsed.max(1));
+    }
+
+    let cores = value
+        .parse::<f64>()
+        .context("CPU value must be a number of cores")?;
+    if !cores.is_finite() || cores <= 0.0 {
+        anyhow::bail!("CPU value must be positive");
+    }
+    Ok((cores * 1000.0).ceil().max(1.0) as u64)
+}
+
 fn detect_worker_memory_bytes() -> Option<u64> {
     read_cgroup_memory_limit("/sys/fs/cgroup/memory.max")
         .or_else(|| read_cgroup_memory_limit("/sys/fs/cgroup/memory/memory.limit_in_bytes"))
+}
+
+fn detect_worker_cpu_millicores() -> Option<u64> {
+    read_cgroup_cpu_max("/sys/fs/cgroup/cpu.max")
+        .or_else(|| {
+            read_cgroup_cpu_quota_period(
+                "/sys/fs/cgroup/cpu/cpu.cfs_quota_us",
+                "/sys/fs/cgroup/cpu/cpu.cfs_period_us",
+            )
+        })
+        .or_else(default_cpu_millicores_opt)
 }
 
 fn read_cgroup_memory_limit(path: &str) -> Option<u64> {
@@ -402,6 +504,67 @@ fn read_cgroup_memory_limit(path: &str) -> Option<u64> {
 
     let bytes = value.parse::<u64>().ok()?;
     (bytes > 0 && bytes < i64::MAX as u64).then_some(bytes)
+}
+
+fn read_cgroup_cpu_max(path: &str) -> Option<u64> {
+    let raw = fs::read_to_string(path).ok()?;
+    let mut parts = raw.split_whitespace();
+    let quota = parts.next()?;
+    let period = parts.next()?.parse::<u64>().ok()?;
+    if quota == "max" || period == 0 {
+        return None;
+    }
+    let quota = quota.parse::<u64>().ok()?;
+    cpu_quota_to_millicores(quota, period)
+}
+
+fn read_cgroup_cpu_quota_period(quota_path: &str, period_path: &str) -> Option<u64> {
+    let quota = fs::read_to_string(quota_path)
+        .ok()?
+        .trim()
+        .parse::<i64>()
+        .ok()?;
+    if quota <= 0 {
+        return None;
+    }
+    let period = fs::read_to_string(period_path)
+        .ok()?
+        .trim()
+        .parse::<u64>()
+        .ok()?;
+    cpu_quota_to_millicores(quota as u64, period)
+}
+
+fn cpu_quota_to_millicores(quota: u64, period: u64) -> Option<u64> {
+    if quota == 0 || period == 0 {
+        return None;
+    }
+    Some(
+        (((quota as u128).saturating_mul(1000) + period as u128 - 1) / period as u128)
+            .min(u64::MAX as u128) as u64,
+    )
+}
+
+fn default_cpu_millicores_opt() -> Option<u64> {
+    std::thread::available_parallelism()
+        .ok()
+        .map(|parallelism| parallelism.get() as u64 * 1000)
+}
+
+fn default_cpu_millicores() -> u64 {
+    default_cpu_millicores_opt().unwrap_or(1000)
+}
+
+fn auto_put_streams(cpu_millicores: u64) -> usize {
+    (((cpu_millicores as u128).saturating_mul(2) + 999) / 1000).clamp(1, 16) as usize
+}
+
+fn auto_read_streams(cpu_millicores: u64) -> usize {
+    (((cpu_millicores as u128).saturating_mul(4) + 999) / 1000).clamp(1, 32) as usize
+}
+
+fn auto_reserved_slots(streams: usize) -> usize {
+    usize::from(streams >= 4)
 }
 
 fn percent_of(value: u64, percent: u64) -> u64 {
@@ -427,4 +590,37 @@ fn default_batch_memory(stream_memory_bytes: u64, cap_bytes: u64) -> u64 {
         .max(16 * 1024 * 1024)
         .min(cap_bytes)
         .min(stream_memory_bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_kubernetes_cpu_values() {
+        assert_eq!(parse_cpu_millicores("1000m").unwrap(), 1000);
+        assert_eq!(parse_cpu_millicores("500m").unwrap(), 500);
+        assert_eq!(parse_cpu_millicores("1").unwrap(), 1000);
+        assert_eq!(parse_cpu_millicores("0.5").unwrap(), 500);
+    }
+
+    #[test]
+    fn detects_cpu_quota_as_millicores() {
+        assert_eq!(cpu_quota_to_millicores(100_000, 100_000), Some(1000));
+        assert_eq!(cpu_quota_to_millicores(150_000, 100_000), Some(1500));
+        assert_eq!(cpu_quota_to_millicores(50_000, 100_000), Some(500));
+    }
+
+    #[test]
+    fn auto_slots_follow_cpu_budget() {
+        assert_eq!(auto_put_streams(500), 1);
+        assert_eq!(auto_put_streams(1000), 2);
+        assert_eq!(auto_put_streams(4000), 8);
+        assert_eq!(auto_put_streams(16_000), 16);
+
+        assert_eq!(auto_read_streams(500), 2);
+        assert_eq!(auto_read_streams(1000), 4);
+        assert_eq!(auto_read_streams(4000), 16);
+        assert_eq!(auto_read_streams(16_000), 32);
+    }
 }

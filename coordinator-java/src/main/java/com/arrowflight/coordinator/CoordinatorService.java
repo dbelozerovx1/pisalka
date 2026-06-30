@@ -5,6 +5,7 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicLong;
@@ -69,12 +70,6 @@ final class CoordinatorService {
         String mode = requestedCommitMode(request).orElse("append");
         String trinoUser = stringOrDefault(request, "user", "anonymous");
         Optional<String> authorization = authorizationFrom(request);
-        int requestedStreams = Math.max(1, Math.min(
-                Json.intValue(request, "streams", config.defaultUploadStreams),
-                config.defaultMaxUploadStreams
-        ));
-        List<WorkerAssignment> workerAssignments = metadataStore.selectPutWorkers(requestedStreams);
-        int streams = workerAssignments.size();
         long targetFileSize = Json.longValue(request, "targetFileSizeBytes", config.defaultTargetFileSizeBytes);
         Optional<Long> maxStreamBytes = optionalLong(request, "maxStreamBytes", config.defaultMaxStreamBytes);
         Optional<Long> maxRecordBatchBytes = optionalLong(
@@ -82,6 +77,27 @@ final class CoordinatorService {
                 "maxRecordBatchBytes",
                 config.defaultPutMaxRecordBatchBytes
         );
+        Optional<UploadSnapshot> existing = metadataStore.loadUploadIfExists(uploadId);
+        if (existing.isPresent()) {
+            return createUploadResponse(
+                    existing.get(),
+                    request,
+                    tableName,
+                    mode,
+                    targetFileSize,
+                    maxStreamBytes,
+                    maxRecordBatchBytes,
+                    Optional.empty(),
+                    true
+            );
+        }
+
+        int requestedStreams = Math.max(1, Math.min(
+                Json.intValue(request, "streams", config.defaultUploadStreams),
+                config.defaultMaxUploadStreams
+        ));
+        List<WorkerAssignment> workerAssignments = metadataStore.selectPutWorkers(requestedStreams);
+        int streams = workerAssignments.size();
         Instant expiresAt = Instant.now().plusMillis(Json.longValue(
                 request,
                 "ttlMs",
@@ -89,43 +105,26 @@ final class CoordinatorService {
         ));
 
         ArrayList<PlannedUploadStream> plannedStreams = new ArrayList<>();
-        ArrayList<Map<String, Object>> ticketBodies = new ArrayList<>();
         for (int index = 0; index < streams; index++) {
             WorkerAssignment worker = workerAssignments.get(index);
             String streamId = "stream-%05d".formatted(index);
             String attemptId = UUID.randomUUID().toString();
             String descriptorPath = outputPrefix + "/flight-" + UUID.randomUUID() + ".parquet";
-            LinkedHashMap<String, Object> ticketRequest = new LinkedHashMap<>();
-            ticketRequest.put("operationId", operationId);
-            ticketRequest.put("attemptId", attemptId);
-            ticketRequest.put("uploadId", uploadId);
-            ticketRequest.put("streamId", streamId);
-            ticketRequest.put("workerId", worker.workerId());
-            ticketRequest.put("flightUri", worker.flightUri());
-            ticketRequest.put("stagingPrefix", outputPrefix);
-            ticketRequest.put("path", descriptorPath);
-            ticketRequest.put("targetFileSizeBytes", targetFileSize);
-            maxStreamBytes.ifPresent(value -> ticketRequest.put("maxStreamBytes", value));
-            maxRecordBatchBytes.ifPresent(value -> ticketRequest.put("maxRecordBatchBytes", value));
-            ticketRequest.put("maxUploadStreams", streams);
-            ticketRequest.put("ttlMs", Math.max(1, expiresAt.toEpochMilli() - Instant.now().toEpochMilli()));
-
-            Map<String, Object> ticket = capabilitySigner.putPayload(ticketRequest);
             plannedStreams.add(new PlannedUploadStream(
                     streamId,
                     attemptId,
                     worker.workerId(),
                     worker.flightUri(),
                     descriptorPath,
-                    ticket
+                    Map.of()
             ));
-            ticketBodies.add(ticket);
         }
 
         PlannedUploadSession session = new PlannedUploadSession(
                 uploadId,
                 operationId,
                 Optional.of(tableName),
+                mode.equals("overwrite") ? "PREPARING" : "PLANNED",
                 streams,
                 outputPrefix,
                 targetFileSize,
@@ -134,60 +133,209 @@ final class CoordinatorService {
                 mode,
                 expiresAt
         );
-        metadataStore.createUpload(session, plannedStreams);
+        if (!metadataStore.tryCreateUpload(session, plannedStreams)) {
+            return createUploadResponse(
+                    metadataStore.loadUpload(uploadId),
+                    request,
+                    tableName,
+                    mode,
+                    targetFileSize,
+                    maxStreamBytes,
+                    maxRecordBatchBytes,
+                    Optional.empty(),
+                    true
+            );
+        }
+
         Optional<Map<String, Object>> overwritePreparation = Optional.empty();
         try {
             if (mode.equals("overwrite")) {
                 overwritePreparation = Optional.of(prepareOverwriteUpload(tableName, trinoUser, authorization));
+                metadataStore.markPlanned(uploadId);
             }
         } catch (RuntimeException error) {
             metadataStore.markFailed(uploadId, "failed to prepare overwrite upload: " + error.getMessage());
             throw error;
         }
 
-        LinkedHashMap<String, Object> body = new LinkedHashMap<>();
-        body.put("uploadId", uploadId);
-        body.put("operationId", operationId);
-        body.put("tableName", tableName);
-        body.put("status", "PLANNED");
-        body.put("mode", mode);
-        body.put("requestedStreams", requestedStreams);
-        body.put("grantedStreams", streams);
-        body.put("expectedStreams", streams);
-        body.put("stagingPrefix", outputPrefix + "/");
-        body.put("outputPrefix", outputPrefix + "/");
-        body.put("targetFileSizeBytes", targetFileSize);
-        body.put("expiresAtMs", expiresAt.toEpochMilli());
-        body.put("selectedWorkers", workerAssignments.stream().map(WorkerAssignment::toJson).toList());
+        return createUploadResponse(
+                metadataStore.loadUpload(uploadId),
+                request,
+                tableName,
+                mode,
+                targetFileSize,
+                maxStreamBytes,
+                maxRecordBatchBytes,
+                overwritePreparation,
+                false
+        );
+    }
+
+    private LinkedHashMap<String, Object> createUploadResponse(
+            UploadSnapshot snapshot,
+            Map<String, Object> request,
+            String requestedTableName,
+            String requestedMode,
+            long requestedTargetFileSize,
+            Optional<Long> requestedMaxStreamBytes,
+            Optional<Long> requestedMaxRecordBatchBytes,
+            Optional<Map<String, Object>> overwritePreparation,
+            boolean alreadyCreated
+    ) {
+        UploadSessionRecord session = snapshot.session();
+        validateCreateUploadRetry(
+                session,
+                requestedTableName,
+                requestedMode,
+                requestedTargetFileSize,
+                requestedMaxStreamBytes,
+                requestedMaxRecordBatchBytes
+        );
+        if (session.status().equals("PREPARING")) {
+            LinkedHashMap<String, Object> body = baseCreateUploadResponse(session, snapshot, request, alreadyCreated);
+            body.put("status", "PREPARING");
+            body.put("retryAfterMs", 500);
+            body.put("tickets", List.of());
+            return body;
+        }
+        if (session.status().equals("FAILED")) {
+            return failedUploadResponse(snapshot);
+        }
+        if (session.status().equals("COMMITTING")) {
+            throw new CoordinatorException(
+                    409,
+                    "upload session " + session.uploadId()
+                            + " is already committing; wait for commit-upload to finish or retry commit-upload with the same uploadId"
+            );
+        }
+        if (session.status().equals("COMMITTED")) {
+            throw new CoordinatorException(
+                    409,
+                    "upload session " + session.uploadId() + " is already committed; create a new uploadId"
+            );
+        }
+        if (session.status().equals("ABORTED")) {
+            throw new CoordinatorException(
+                    409,
+                    "upload session " + session.uploadId() + " was aborted and cannot issue upload tickets"
+            );
+        }
+
+        List<Map<String, Object>> ticketBodies = snapshot.streams().stream()
+                .map(stream -> uploadTicket(session, stream))
+                .toList();
+        LinkedHashMap<String, Object> body = baseCreateUploadResponse(session, snapshot, request, alreadyCreated);
+        body.put("status", session.status());
         overwritePreparation.ifPresent(value -> body.put("overwritePreparation", value));
         body.put("tickets", ticketBodies);
         return body;
     }
 
-    Map<String, Object> uploadStatus(Map<String, Object> request) {
-        requireAdminIfConfigured(request);
-        return metadataStore.loadUpload(Json.requiredString(request, "uploadId")).toJson();
+    private LinkedHashMap<String, Object> baseCreateUploadResponse(
+            UploadSessionRecord session,
+            UploadSnapshot snapshot,
+            Map<String, Object> request,
+            boolean alreadyCreated
+    ) {
+        LinkedHashMap<String, Object> body = new LinkedHashMap<>();
+        body.put("uploadId", session.uploadId());
+        body.put("operationId", session.operationId());
+        session.tableName().ifPresent(value -> body.put("tableName", value));
+        session.commitMode().ifPresent(value -> body.put("mode", value));
+        body.put("requestedStreams", Json.intValue(request, "streams", session.expectedStreams()));
+        body.put("grantedStreams", session.expectedStreams());
+        body.put("expectedStreams", session.expectedStreams());
+        body.put("stagingPrefix", session.stagingPrefix() + "/");
+        body.put("outputPrefix", session.stagingPrefix() + "/");
+        body.put("targetFileSizeBytes", session.targetFileSize());
+        body.put("expiresAtMs", session.expiresAt().toEpochMilli());
+        body.put("selectedWorkers", snapshot.streams().stream().map(this::selectedWorkerJson).toList());
+        body.put("alreadyCreated", alreadyCreated);
+        return body;
     }
 
-    Map<String, Object> finishUpload(Map<String, Object> request) {
-        requireAdminIfConfigured(request);
-        String uploadId = Json.requiredString(request, "uploadId");
-        UploadSnapshot snapshot = metadataStore.loadUpload(uploadId);
-        if (snapshot.session().status().equals("COMMITTED")) {
-            return committedUploadResponse(snapshot);
-        }
-        if (snapshot.session().status().equals("FAILED")) {
-            return failedUploadResponse(snapshot);
-        }
-        if (snapshot.session().status().equals("COMMITTING") || snapshot.session().status().equals("ABORTED")) {
+    private void validateCreateUploadRetry(
+            UploadSessionRecord session,
+            String requestedTableName,
+            String requestedMode,
+            long requestedTargetFileSize,
+            Optional<Long> requestedMaxStreamBytes,
+            Optional<Long> requestedMaxRecordBatchBytes
+    ) {
+        if (session.tableName().isPresent() && !session.tableName().get().equals(requestedTableName)) {
             throw new CoordinatorException(
                     409,
-                    "upload session " + uploadId + " cannot be finalized; status=" + snapshot.session().status()
+                    "create-upload retry conflicts with existing uploadId " + session.uploadId()
+                            + ": tableName was " + session.tableName().get()
+                            + " but request asked for " + requestedTableName
             );
         }
-        UploadReadyPlan plan = uploadReadyPlan(snapshot, request);
-        metadataStore.markReadyToCommit(uploadId, plan.tableName(), plan.createTableSql());
-        return readyUploadResponse(plan);
+        if (session.commitMode().isPresent() && !session.commitMode().get().equals(requestedMode)) {
+            throw new CoordinatorException(
+                    409,
+                    "create-upload retry conflicts with existing uploadId " + session.uploadId()
+                            + ": mode was " + session.commitMode().get()
+                            + " but request asked for " + requestedMode
+            );
+        }
+        if (session.targetFileSize() != requestedTargetFileSize) {
+            throw new CoordinatorException(
+                    409,
+                    "create-upload retry conflicts with existing uploadId " + session.uploadId()
+                            + ": targetFileSizeBytes was " + session.targetFileSize()
+                            + " but request asked for " + requestedTargetFileSize
+            );
+        }
+        if (!Objects.equals(session.maxStreamBytes(), requestedMaxStreamBytes)) {
+            throw new CoordinatorException(
+                    409,
+                    "create-upload retry conflicts with existing uploadId " + session.uploadId()
+                            + ": maxStreamBytes was " + optionalLongForMessage(session.maxStreamBytes())
+                            + " but request asked for " + optionalLongForMessage(requestedMaxStreamBytes)
+            );
+        }
+        if (!Objects.equals(session.maxRecordBatchBytes(), requestedMaxRecordBatchBytes)) {
+            throw new CoordinatorException(
+                    409,
+                    "create-upload retry conflicts with existing uploadId " + session.uploadId()
+                            + ": maxRecordBatchBytes was " + optionalLongForMessage(session.maxRecordBatchBytes())
+                            + " but request asked for " + optionalLongForMessage(requestedMaxRecordBatchBytes)
+            );
+        }
+    }
+
+    private Map<String, Object> uploadTicket(UploadSessionRecord session, UploadStreamState stream) {
+        long ttlMs = session.expiresAt().toEpochMilli() - Instant.now().toEpochMilli();
+        if (ttlMs <= 0) {
+            throw new CoordinatorException(
+                    409,
+                    "upload session " + session.uploadId() + " is expired; create a new upload"
+            );
+        }
+
+        LinkedHashMap<String, Object> ticketRequest = new LinkedHashMap<>();
+        ticketRequest.put("operationId", session.operationId());
+        ticketRequest.put("attemptId", stream.attemptId());
+        ticketRequest.put("uploadId", session.uploadId());
+        ticketRequest.put("streamId", stream.streamId());
+        ticketRequest.put("workerId", stream.workerId());
+        ticketRequest.put("flightUri", stream.flightUri());
+        ticketRequest.put("stagingPrefix", session.stagingPrefix());
+        ticketRequest.put("path", stream.descriptorPath());
+        ticketRequest.put("targetFileSizeBytes", session.targetFileSize());
+        session.maxStreamBytes().ifPresent(value -> ticketRequest.put("maxStreamBytes", value));
+        session.maxRecordBatchBytes().ifPresent(value -> ticketRequest.put("maxRecordBatchBytes", value));
+        ticketRequest.put("maxUploadStreams", session.expectedStreams());
+        ticketRequest.put("ttlMs", ttlMs);
+        return capabilitySigner.putPayload(ticketRequest);
+    }
+
+    private Map<String, Object> selectedWorkerJson(UploadStreamState stream) {
+        LinkedHashMap<String, Object> body = new LinkedHashMap<>();
+        body.put("streamId", stream.streamId());
+        body.put("workerId", stream.workerId());
+        body.put("flightUri", stream.flightUri());
+        return body;
     }
 
     Map<String, Object> commitUpload(Map<String, Object> request) {
@@ -200,7 +348,17 @@ final class CoordinatorService {
         if (snapshot.session().status().equals("FAILED")) {
             return failedUploadResponse(snapshot);
         }
-        if (snapshot.session().status().equals("COMMITTING") || snapshot.session().status().equals("ABORTED")) {
+        if (snapshot.session().status().equals("COMMITTING")) {
+            Optional<Map<String, Object>> recovered = recoverCommittedUpload(snapshot, request);
+            if (recovered.isPresent()) {
+                return recovered.get();
+            }
+            throw new CoordinatorException(
+                    409,
+                    "upload session " + uploadId + " is already committing; retry commit-upload with the same uploadId"
+            );
+        }
+        if (snapshot.session().status().equals("ABORTED")) {
             throw new CoordinatorException(
                     409,
                     "upload session " + uploadId + " is not available for commit; status=" + snapshot.session().status()
@@ -208,7 +366,6 @@ final class CoordinatorService {
         }
 
         UploadReadyPlan plan = uploadReadyPlan(snapshot, request);
-        metadataStore.markReadyToCommit(uploadId, plan.tableName(), plan.createTableSql());
         if (!metadataStore.tryMarkCommitting(uploadId, plan.tableName(), plan.createTableSql())) {
             UploadSnapshot current = metadataStore.loadUpload(uploadId);
             if (current.session().status().equals("COMMITTED")) {
@@ -224,12 +381,12 @@ final class CoordinatorService {
         String trinoUser = stringOrDefault(request, "user", "anonymous");
         Optional<String> authorization = authorizationFrom(request);
         boolean tableExistedBeforeCommit = true;
+        boolean tableCreatedByCoordinator = false;
         boolean icebergCommitStarted = false;
         boolean icebergCommitCompleted = false;
         try {
             tableExistedBeforeCommit = icebergCommitter.tableExists(plan.tableName());
-            Optional<TrinoClient.QueryHandle> ddl = Optional.empty();
-            boolean tableCreatedByCoordinator = false;
+            Optional<Map<String, Object>> appendCompatibility = Optional.empty();
             if (mode.equals("append")) {
                 if (!tableExistedBeforeCommit) {
                     throw new CoordinatorException(
@@ -238,7 +395,10 @@ final class CoordinatorService {
                                     + "under table data location; use overwrite to recreate the table"
                     );
                 }
-                ddl = Optional.of(trinoClient.runStatement(plan.createTableSql(), trinoUser, authorization));
+                appendCompatibility = Optional.of(icebergCommitter.validateAppendSchema(
+                        plan.tableName(),
+                        plan.arrowSchema()
+                ));
             } else if (!tableExistedBeforeCommit) {
                 tableCreatedByCoordinator = icebergCommitter.createTableIfMissing(
                         plan.tableName(),
@@ -250,7 +410,7 @@ final class CoordinatorService {
             CommitOutcome outcome = icebergCommitter.commit(uploadId, plan.tableName(), mode, snapshot.files());
             icebergCommitCompleted = true;
             LinkedHashMap<String, Object> summary = new LinkedHashMap<>(outcome.summary());
-            ddl.flatMap(TrinoClient.QueryHandle::queryId).ifPresent(value -> summary.put("trinoDdlQueryId", value));
+            appendCompatibility.ifPresent(value -> summary.put("appendSchemaCompatibility", value));
             summary.put("tableExistedBeforeCommit", tableExistedBeforeCommit);
             summary.put("tableCreatedByCoordinator", tableCreatedByCoordinator);
             metadataStore.markCommitted(uploadId, new CommitMetadata(
@@ -261,7 +421,7 @@ final class CoordinatorService {
                     summary
             ));
 
-            LinkedHashMap<String, Object> body = readyUploadResponse(plan);
+            LinkedHashMap<String, Object> body = uploadPlanResponse(plan);
             body.put("status", "COMMITTED");
             body.put("mode", outcome.mode());
             body.put("snapshotId", outcome.snapshotId());
@@ -271,10 +431,27 @@ final class CoordinatorService {
             return body;
         } catch (Exception error) {
             if (icebergCommitStarted) {
-                String commitState = icebergCommitCompleted ? "completed" : "started";
+                try {
+                    Optional<Map<String, Object>> recovered = recoverCommittedUpload(snapshot, request);
+                    if (recovered.isPresent()) {
+                        return recovered.get();
+                    }
+                } catch (RuntimeException recoveryError) {
+                    String commitState = icebergCommitCompleted ? "completed" : "started";
+                    throw new CoordinatorException(
+                            500,
+                            "Iceberg commit for upload " + uploadId + " " + commitState
+                                    + ", but coordinator failed while reconciling the committed snapshot: "
+                                    + recoveryError.getMessage()
+                                    + "; no staged files were deleted because they may now be table data",
+                            recoveryError
+                    );
+                }
+            }
+            if (icebergCommitCompleted) {
                 throw new CoordinatorException(
                         500,
-                        "Iceberg commit for upload " + uploadId + " " + commitState
+                        "Iceberg commit for upload " + uploadId + " completed"
                                 + ", but coordinator failed at or after the snapshot commit boundary: "
                                 + error.getMessage()
                                 + "; no staged files were deleted because they may now be table data",
@@ -282,38 +459,60 @@ final class CoordinatorService {
                 );
             }
             CleanupResult stagedCleanup = objectStoreCleaner.deleteUploadObjects(snapshot);
-            Optional<Map<String, Object>> tableCleanup = tableExistedBeforeCommit
-                    ? Optional.empty()
-                    : Optional.of(dropTableBestEffort(plan.tableName(), trinoUser, authorization));
-            String message = "failed to commit upload " + uploadId + ": " + error.getMessage();
+            Optional<Map<String, Object>> tableCleanup = mode.equals("overwrite") && !tableExistedBeforeCommit
+                    ? Optional.of(dropTableBestEffort(plan.tableName(), trinoUser, authorization))
+                    : Optional.empty();
+            int status = error instanceof CoordinatorException coordinatorError ? coordinatorError.status : 500;
+            String message = icebergCommitStarted
+                    ? "failed to commit upload " + uploadId
+                            + " before a committed Iceberg snapshot became visible: " + error.getMessage()
+                    : "failed to commit upload " + uploadId + ": " + error.getMessage();
             metadataStore.markFailed(uploadId, message);
             LinkedHashMap<String, Object> cleanup = new LinkedHashMap<>();
             cleanup.put("staging", stagedCleanup.toJson());
             tableCleanup.ifPresent(value -> cleanup.put("table", value));
-            throw new CoordinatorException(500, message + "; cleanup=" + cleanup, error);
+            throw new CoordinatorException(status, message + "; cleanup=" + cleanup, error);
         }
+    }
+
+    private Optional<Map<String, Object>> recoverCommittedUpload(UploadSnapshot snapshot, Map<String, Object> request) {
+        UploadSessionRecord session = snapshot.session();
+        Optional<String> tableName = session.commitTableName()
+                .or(session::tableName)
+                .or(() -> Optional.ofNullable(Json.string(request, "tableName")).filter(value -> !value.isBlank()));
+        if (tableName.isEmpty()) {
+            return Optional.empty();
+        }
+
+        Optional<CommitOutcome> recovered = icebergCommitter.committedUpload(
+                tableName.get(),
+                session.uploadId(),
+                snapshot.files()
+        );
+        if (recovered.isEmpty()) {
+            return Optional.empty();
+        }
+
+        CommitOutcome outcome = recovered.get();
+        metadataStore.markCommitted(session.uploadId(), new CommitMetadata(
+                tableName.get(),
+                outcome.mode(),
+                outcome.snapshotId(),
+                session.createTableSql(),
+                outcome.summary()
+        ));
+        LinkedHashMap<String, Object> body = committedUploadResponse(metadataStore.loadUpload(session.uploadId()));
+        body.put("recoveredFromIcebergSnapshot", true);
+        return Optional.of(body);
     }
 
     private UploadReadyPlan uploadReadyPlan(UploadSnapshot snapshot, Map<String, Object> request) {
         String uploadId = snapshot.session().uploadId();
-        Optional<UploadStreamState> failed = snapshot.firstFailedStream();
-        if (failed.isPresent()) {
-            String message = "upload stream " + failed.get().streamId() + " failed with status " + failed.get().status()
-                    + failed.get().errorMessage().map(error -> ": " + error).orElse("");
-            objectStoreCleaner.deleteUploadObjects(snapshot);
-            metadataStore.markFailed(uploadId, message);
-            throw new CoordinatorException(409, message);
-        }
-        if (!snapshot.allStreamsSucceeded()) {
-            metadataStore.markRunning(uploadId);
-            Optional<UploadStreamState> incomplete = snapshot.firstIncompleteStream();
-            String message = incomplete
-                    .map(stream -> "upload stream " + stream.streamId() + " is not complete yet; status=" + stream.status())
-                    .orElse("upload has fewer worker stream rows than expected");
-            throw new CoordinatorException(409, message);
-        }
         if (snapshot.files().isEmpty()) {
-            throw new CoordinatorException(409, "upload streams succeeded but no parquet files were recorded");
+            throw new CoordinatorException(
+                    409,
+                    "upload " + uploadId + " has no recorded parquet files yet; finish DoPut before commit-upload"
+            );
         }
 
         String tableName = Optional.ofNullable(Json.string(request, "tableName"))
@@ -321,7 +520,7 @@ final class CoordinatorService {
                 .or(() -> snapshot.session().tableName())
                 .or(() -> snapshot.session().commitTableName())
                 .orElseGet(() -> config.generatedUploadTable(uploadId));
-        Map<String, Object> arrowSchema = Json.parseObject(snapshot.canonicalSchemaJson());
+        Map<String, Object> arrowSchema = Json.parseObject(snapshot.canonicalSchemaJsonForFiles());
         String createTableSql;
         try {
             createTableSql = TrinoDdlPlanner.createTableSql(
@@ -366,10 +565,9 @@ final class CoordinatorService {
         return objectPrefixFromUri(tableLocation(tableName));
     }
 
-    private LinkedHashMap<String, Object> readyUploadResponse(UploadReadyPlan plan) {
+    private LinkedHashMap<String, Object> uploadPlanResponse(UploadReadyPlan plan) {
         LinkedHashMap<String, Object> body = new LinkedHashMap<>();
         body.put("uploadId", plan.snapshot().session().uploadId());
-        body.put("status", "READY_TO_COMMIT");
         body.put("tableName", plan.tableName());
         body.put("createTableSql", plan.createTableSql());
         body.put("files", plan.snapshot().files().stream().map(UploadFile::toJson).toList());
@@ -528,7 +726,6 @@ final class CoordinatorService {
                 queryId,
                 "read",
                 "SUCCEEDED",
-                descriptorForRegistry(request, queryId),
                 Optional.empty(),
                 Optional.empty(),
                 Optional.empty(),
@@ -571,7 +768,6 @@ final class CoordinatorService {
                 queryId,
                 "ctas",
                 "RUNNING",
-                descriptorForRegistry(request, queryId),
                 Optional.of(targetTable),
                 Optional.of(ctasSql),
                 Optional.of(trinoUser),
@@ -944,13 +1140,6 @@ final class CoordinatorService {
                 .orElse("read");
     }
 
-    private LinkedHashMap<String, Object> descriptorForRegistry(Map<String, Object> request, String queryId) {
-        LinkedHashMap<String, Object> descriptor = new LinkedHashMap<>(request);
-        descriptor.remove("authorization");
-        descriptor.put("queryId", queryId);
-        return descriptor;
-    }
-
     private LinkedHashMap<String, Object> baseFlightMetadata(
             String queryId,
             String queryType,
@@ -1109,6 +1298,10 @@ final class CoordinatorService {
         }
         long value = Json.longValue(request, key, defaultValue);
         return value <= 0 ? Optional.empty() : Optional.of(value);
+    }
+
+    private static String optionalLongForMessage(Optional<Long> value) {
+        return value.map(String::valueOf).orElse("<none>");
     }
 
     private static String effectiveCommitMode(Map<String, Object> request, Optional<String> persistedMode) {

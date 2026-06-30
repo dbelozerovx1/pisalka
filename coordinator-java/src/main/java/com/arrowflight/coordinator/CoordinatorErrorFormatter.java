@@ -92,11 +92,18 @@ final class CoordinatorErrorFormatter {
         if (message.contains("no live data-plane worker")) {
             return "NO_WORKER_CAPACITY";
         }
+        if (message.contains("has no recorded parquet files yet")) {
+            return "UPLOAD_HAS_NO_FILES";
+        }
         if (message.contains("not complete yet") || message.contains("fewer worker stream rows")) {
             return "UPLOAD_NOT_COMPLETE";
         }
-        if (message.contains("produced different arrow schemas")) {
+        if (message.contains("produced different arrow schemas")
+                || message.contains("produced from different arrow schemas")) {
             return "UPLOAD_SCHEMA_MISMATCH";
+        }
+        if (message.contains("uploaded schema is not compatible with existing iceberg table")) {
+            return "APPEND_SCHEMA_INCOMPATIBLE";
         }
         if (message.contains("no persisted arrow schema")) {
             return "UPLOAD_SCHEMA_NOT_READY";
@@ -150,10 +157,14 @@ final class CoordinatorErrorFormatter {
                     "Use Arrow Timestamp(Microsecond); Timestamp(Second/Millisecond/Nanosecond) and Date64 are not accepted.";
             case "NO_WORKER_CAPACITY" ->
                     "Retry later. If it keeps happening, ask the platform team to check worker heartbeats and capacity.";
+            case "UPLOAD_HAS_NO_FILES" ->
+                    "Finish at least one DoPut stream for this upload, then retry commit-upload with the same uploadId.";
             case "UPLOAD_NOT_COMPLETE", "UPLOAD_SCHEMA_NOT_READY" ->
-                    "Wait until every DoPut stream for this upload finishes, then retry finish-upload or commit-upload with the same uploadId.";
+                    "Wait until DoPut streams for this upload finish, then retry commit-upload with the same uploadId.";
             case "UPLOAD_SCHEMA_MISMATCH" ->
                     "All streams in one upload must use exactly the same Arrow schema.";
+            case "APPEND_SCHEMA_INCOMPATIBLE" ->
+                    "Use the same table schema for append, or use overwrite to recreate the table with the uploaded schema.";
             case "APPEND_REQUIRES_EXISTING_TABLE" ->
                     "Use overwrite to recreate the table, or create the Iceberg table before append.";
             case "COMMIT_MODE_CONFLICT" ->

@@ -37,11 +37,12 @@ final class CoordinatorMetadataStore {
         }
     }
 
-    void createUpload(PlannedUploadSession session, List<PlannedUploadStream> streams) {
+    boolean tryCreateUpload(PlannedUploadSession session, List<PlannedUploadStream> streams) {
         requireEnabled();
         try (Connection connection = connect()) {
             connection.setAutoCommit(false);
             try {
+                int inserted;
                 try (PreparedStatement statement = connection.prepareStatement("""
                         INSERT INTO coordinator_upload_sessions (
                             upload_id,
@@ -56,19 +57,26 @@ final class CoordinatorMetadataStore {
                             commit_mode,
                             expires_at,
                             updated_at
-                        ) VALUES (?, ?, ?, 'PLANNED', ?, ?, ?, ?, ?, ?, ?, now())
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, now())
+                        ON CONFLICT (upload_id) DO NOTHING
                         """)) {
                     statement.setString(1, session.uploadId());
                     statement.setString(2, session.operationId());
                     statement.setString(3, session.tableName().orElse(null));
-                    statement.setInt(4, session.expectedStreams());
-                    statement.setString(5, session.stagingPrefix());
-                    statement.setLong(6, session.targetFileSize());
-                    setNullableLong(statement, 7, session.maxStreamBytes());
-                    setNullableLong(statement, 8, session.maxRecordBatchBytes());
-                    statement.setString(9, session.commitMode());
-                    statement.setTimestamp(10, Timestamp.from(session.expiresAt()));
-                    statement.executeUpdate();
+                    statement.setString(4, session.status());
+                    statement.setInt(5, session.expectedStreams());
+                    statement.setString(6, session.stagingPrefix());
+                    statement.setLong(7, session.targetFileSize());
+                    setNullableLong(statement, 8, session.maxStreamBytes());
+                    setNullableLong(statement, 9, session.maxRecordBatchBytes());
+                    statement.setString(10, session.commitMode());
+                    statement.setTimestamp(11, Timestamp.from(session.expiresAt()));
+                    inserted = statement.executeUpdate();
+                }
+
+                if (inserted == 0) {
+                    connection.rollback();
+                    return false;
                 }
 
                 try (PreparedStatement statement = connection.prepareStatement("""
@@ -78,10 +86,8 @@ final class CoordinatorMetadataStore {
                             attempt_id,
                             worker_id,
                             flight_uri,
-                            descriptor_path,
-                            status,
-                            updated_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, 'PLANNED', now())
+                            descriptor_path
+                        ) VALUES (?, ?, ?, ?, ?, ?)
                         """)) {
                     for (PlannedUploadStream stream : streams) {
                         statement.setString(1, session.uploadId());
@@ -96,12 +102,25 @@ final class CoordinatorMetadataStore {
                 }
 
                 connection.commit();
+                return true;
             } catch (SQLException error) {
                 connection.rollback();
                 throw error;
             }
         } catch (SQLException error) {
             throw new IllegalStateException("failed to create upload session metadata", error);
+        }
+    }
+
+    Optional<UploadSnapshot> loadUploadIfExists(String uploadId) {
+        requireEnabled();
+        try {
+            return Optional.of(loadUpload(uploadId));
+        } catch (CoordinatorException error) {
+            if (error.status == 404) {
+                return Optional.empty();
+            }
+            throw error;
         }
     }
 
@@ -201,7 +220,6 @@ final class CoordinatorMetadataStore {
                          query_id,
                          query_type,
                          status,
-                         descriptor_json,
                          target_table,
                          submitted_sql,
                          trino_user,
@@ -217,26 +235,25 @@ final class CoordinatorMetadataStore {
                          expires_at,
                          completed_at,
                          updated_at
-                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, now())
+                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, now())
                      """)) {
             statement.setString(1, record.queryId());
             statement.setString(2, record.queryType());
             statement.setString(3, record.status());
-            statement.setObject(4, jsonb(record.descriptorJson()), Types.OTHER);
-            statement.setString(5, record.targetTable().orElse(null));
-            statement.setString(6, record.submittedSql().orElse(null));
-            statement.setString(7, record.trinoUser().orElse(null));
-            statement.setString(8, record.trinoQueryId().orElse(null));
-            statement.setString(9, record.trinoInfoUri().orElse(null));
-            statement.setString(10, record.trinoNextUri().orElse(null));
-            statement.setObject(11, jsonb(record.trinoStatsJson()), Types.OTHER);
-            setNullableDouble(statement, 12, record.progress());
-            statement.setString(13, record.errorMessage().orElse(null));
-            statement.setObject(14, jsonb(record.resultFlightInfoJson()), Types.OTHER);
-            statement.setObject(15, jsonb(record.resultTicketsJson()), Types.OTHER);
-            statement.setObject(16, jsonb(record.resultFilesJson()), Types.OTHER);
-            statement.setTimestamp(17, Timestamp.from(record.expiresAt()));
-            statement.setTimestamp(18, record.completedAt().map(Timestamp::from).orElse(null));
+            statement.setString(4, record.targetTable().orElse(null));
+            statement.setString(5, record.submittedSql().orElse(null));
+            statement.setString(6, record.trinoUser().orElse(null));
+            statement.setString(7, record.trinoQueryId().orElse(null));
+            statement.setString(8, record.trinoInfoUri().orElse(null));
+            statement.setString(9, record.trinoNextUri().orElse(null));
+            statement.setObject(10, jsonb(record.trinoStatsJson()), Types.OTHER);
+            setNullableDouble(statement, 11, record.progress());
+            statement.setString(12, record.errorMessage().orElse(null));
+            statement.setObject(13, jsonb(record.resultFlightInfoJson()), Types.OTHER);
+            statement.setObject(14, jsonb(record.resultTicketsJson()), Types.OTHER);
+            statement.setObject(15, jsonb(record.resultFilesJson()), Types.OTHER);
+            statement.setTimestamp(16, Timestamp.from(record.expiresAt()));
+            statement.setTimestamp(17, record.completedAt().map(Timestamp::from).orElse(null));
             statement.executeUpdate();
         } catch (SQLException error) {
             throw new IllegalStateException("failed to create query registry row", error);
@@ -250,7 +267,6 @@ final class CoordinatorMetadataStore {
                      SELECT query_id,
                             query_type,
                             status,
-                            descriptor_json::text AS descriptor_json,
                             target_table,
                             submitted_sql,
                             trino_user,
@@ -446,31 +462,8 @@ final class CoordinatorMetadataStore {
         }
     }
 
-    void markRunning(String uploadId) {
-        updateStatus(uploadId, "RUNNING", Optional.empty(), Optional.empty(), Optional.empty(), false);
-    }
-
-    void markReadyToCommit(String uploadId, String tableName, String createTableSql) {
-        requireEnabled();
-        try (Connection connection = connect();
-             PreparedStatement statement = connection.prepareStatement("""
-                     UPDATE coordinator_upload_sessions
-                     SET status = 'READY_TO_COMMIT',
-                         table_name = COALESCE(?, table_name),
-                         create_table_sql = COALESCE(?, create_table_sql),
-                         error_message = NULL,
-                         updated_at = now(),
-                         completed_at = COALESCE(completed_at, now())
-                     WHERE upload_id = ?
-                       AND status NOT IN ('COMMITTED', 'COMMITTING', 'ABORTED')
-                     """)) {
-            statement.setString(1, tableName);
-            statement.setString(2, createTableSql);
-            statement.setString(3, uploadId);
-            statement.executeUpdate();
-        } catch (SQLException error) {
-            throw new IllegalStateException("failed to mark upload session ready to commit", error);
-        }
+    void markPlanned(String uploadId) {
+        updateStatus(uploadId, "PLANNED", Optional.empty(), Optional.empty(), Optional.empty(), false);
     }
 
     boolean tryMarkCommitting(String uploadId, String tableName, String createTableSql) {
@@ -714,9 +707,8 @@ final class CoordinatorMetadataStore {
 
     private List<UploadFile> loadFiles(Connection connection, String uploadId) throws SQLException {
         try (PreparedStatement statement = connection.prepareStatement("""
-                SELECT files.stream_id,
-                       files.worker_id,
-                       files.logical_key,
+                SELECT planned.stream_id,
+                       planned.worker_id,
                        files.part_index,
                        files.file_path,
                        files.rows,
@@ -727,7 +719,7 @@ final class CoordinatorMetadataStore {
                 JOIN coordinator_upload_streams planned
                   ON planned.attempt_id = files.attempt_id
                 WHERE planned.upload_id = ?
-                ORDER BY files.stream_id, files.part_index
+                ORDER BY planned.stream_id, files.part_index
                 """)) {
             statement.setString(1, uploadId);
             try (ResultSet rows = statement.executeQuery()) {
@@ -736,7 +728,6 @@ final class CoordinatorMetadataStore {
                     files.add(new UploadFile(
                             rows.getString("stream_id"),
                             rows.getString("worker_id"),
-                            rows.getString("logical_key"),
                             rows.getInt("part_index"),
                             rows.getString("file_path"),
                             rows.getLong("rows"),
@@ -843,7 +834,6 @@ final class CoordinatorMetadataStore {
                 rows.getString("query_id"),
                 rows.getString("query_type"),
                 rows.getString("status"),
-                Json.parseObject(rows.getString("descriptor_json")),
                 Optional.ofNullable(rows.getString("target_table")),
                 Optional.ofNullable(rows.getString("submitted_sql")),
                 Optional.ofNullable(rows.getString("trino_user")),
@@ -868,7 +858,6 @@ record QueryRegistryRecord(
         String queryId,
         String queryType,
         String status,
-        Map<String, Object> descriptorJson,
         Optional<String> targetTable,
         Optional<String> submittedSql,
         Optional<String> trinoUser,
@@ -913,6 +902,7 @@ record PlannedUploadSession(
         String uploadId,
         String operationId,
         Optional<String> tableName,
+        String status,
         int expectedStreams,
         String stagingPrefix,
         long targetFileSize,
@@ -1006,14 +996,6 @@ record UploadStreamState(
         Optional<Long> elapsedMs,
         Optional<String> arrowSchemaJson
 ) {
-    boolean succeeded() {
-        return status.equals("SUCCEEDED");
-    }
-
-    boolean failed() {
-        return status.equals("FAILED") || status.equals("REJECTED");
-    }
-
     Map<String, Object> toJson() {
         LinkedHashMap<String, Object> body = new LinkedHashMap<>();
         body.put("streamId", streamId);
@@ -1036,7 +1018,6 @@ record UploadStreamState(
 record UploadFile(
         String streamId,
         String workerId,
-        String logicalKey,
         int partIndex,
         String filePath,
         long rows,
@@ -1048,7 +1029,6 @@ record UploadFile(
         LinkedHashMap<String, Object> body = new LinkedHashMap<>();
         body.put("streamId", streamId);
         body.put("workerId", workerId);
-        body.put("logicalKey", logicalKey);
         body.put("partIndex", partIndex);
         body.put("filePath", filePath);
         body.put("rows", rows);
@@ -1064,39 +1044,23 @@ record UploadSnapshot(
         List<UploadStreamState> streams,
         List<UploadFile> files
 ) {
-    boolean allStreamsSucceeded() {
-        return streams.size() == session.expectedStreams() && streams.stream().allMatch(UploadStreamState::succeeded);
-    }
-
-    Optional<UploadStreamState> firstFailedStream() {
-        return streams.stream().filter(UploadStreamState::failed).findFirst();
-    }
-
-    Optional<UploadStreamState> firstIncompleteStream() {
-        return streams.stream().filter(stream -> !stream.succeeded()).findFirst();
-    }
-
-    String canonicalSchemaJson() {
+    String canonicalSchemaJsonForFiles() {
+        List<String> fileStreamIds = files.stream()
+                .map(UploadFile::streamId)
+                .distinct()
+                .toList();
         List<String> schemas = streams.stream()
+                .filter(stream -> fileStreamIds.contains(stream.streamId()))
                 .flatMap(stream -> stream.arrowSchemaJson().stream())
                 .distinct()
                 .toList();
         if (schemas.isEmpty()) {
-            throw new CoordinatorException(409, "upload has no persisted Arrow schema yet");
+            throw new CoordinatorException(409, "upload files have no persisted Arrow schema yet");
         }
         if (schemas.size() > 1) {
-            throw new CoordinatorException(409, "upload streams produced different Arrow schemas");
+            throw new CoordinatorException(409, "uploaded files were produced from different Arrow schemas");
         }
         return schemas.getFirst();
-    }
-
-    Map<String, Object> toJson() {
-        LinkedHashMap<String, Object> body = new LinkedHashMap<>();
-        body.put("session", session.toJson());
-        body.put("streams", streams.stream().map(UploadStreamState::toJson).toList());
-        body.put("files", files.stream().map(UploadFile::toJson).toList());
-        body.put("allStreamsSucceeded", allStreamsSucceeded());
-        return body;
     }
 }
 

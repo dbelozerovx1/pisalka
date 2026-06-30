@@ -49,9 +49,6 @@ struct Args {
     #[arg(long, env = "COORDINATOR_UPLOAD_ID")]
     upload_id: Option<String>,
 
-    #[arg(long, env = "COORDINATOR_STAGING_PREFIX")]
-    staging_prefix: Option<String>,
-
     #[arg(long, alias = "table", env = "COORDINATOR_TABLE_NAME")]
     table_name: Option<String>,
 
@@ -129,6 +126,8 @@ struct CoordinatorClient {
 struct CreateUploadResponse {
     upload_id: String,
     operation_id: String,
+    #[serde(default)]
+    table_name: Option<String>,
     status: String,
     requested_streams: usize,
     granted_streams: usize,
@@ -154,20 +153,6 @@ struct UploadTicket {
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct FinishUploadResponse {
-    upload_id: String,
-    status: String,
-    table_name: String,
-    create_table_sql: String,
-    files: Vec<FinishedFile>,
-    #[serde(default)]
-    streams: Vec<Value>,
-    #[serde(default)]
-    arrow_schema: Value,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
 struct CommitUploadResponse {
     upload_id: String,
     status: String,
@@ -181,15 +166,16 @@ struct CommitUploadResponse {
     #[serde(default)]
     commit_summary: Value,
     #[serde(default)]
+    files: Vec<WrittenFile>,
+    #[serde(default)]
     already_committed: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct FinishedFile {
+struct WrittenFile {
     stream_id: String,
     worker_id: String,
-    logical_key: String,
     part_index: i32,
     file_path: String,
     rows: u64,
@@ -271,7 +257,6 @@ async fn main() -> Result<()> {
         .create_upload(CreateUploadRequest {
             operation_id: operation_id.clone(),
             upload_id: args.upload_id.clone(),
-            staging_prefix: args.staging_prefix.clone(),
             table_name: args.table_name.clone(),
             commit_mode: if args.commit_mode == CommitMode::None {
                 None
@@ -368,34 +353,12 @@ async fn main() -> Result<()> {
         }
     }
 
-    let finish = coordinator.finish_upload(&create_upload.upload_id).await?;
-    println!("finish_upload_id={}", finish.upload_id);
-    println!("finish_status={}", finish.status);
-    println!("finish_table_name={}", finish.table_name);
-    println!("finish_files={}", finish.files.len());
-    println!("finish_streams={}", finish.streams.len());
-    println!(
-        "create_table_sql={}",
-        finish.create_table_sql.replace('\n', " ")
-    );
-    for file in &finish.files {
-        println!(
-            "written_file={} stream={} part={} rows={} batches={} parquet_bytes={}",
-            file.file_path,
-            file.stream_id,
-            file.part_index,
-            file.rows,
-            file.batches,
-            file.parquet_object_bytes
-        );
-    }
-
-    if args.commit_mode != CommitMode::None {
+    let written_files = if args.commit_mode != CommitMode::None {
         let commit = coordinator
             .commit_upload(
                 &create_upload.upload_id,
                 &args.commit_mode,
-                Some(finish.table_name.clone()),
+                create_upload.table_name.clone().or(args.table_name.clone()),
                 args.trino_user.clone(),
                 args.trino_authorization.clone(),
             )
@@ -415,9 +378,25 @@ async fn main() -> Result<()> {
             "commit_summary={}",
             serde_json::to_string(&commit.commit_summary)?
         );
+        commit.files
+    } else {
+        files_from_put_results(&upload_summary)?
+    };
+
+    println!("written_files={}", written_files.len());
+    for file in &written_files {
+        println!(
+            "written_file={} stream={} part={} rows={} batches={} parquet_bytes={}",
+            file.file_path,
+            file.stream_id,
+            file.part_index,
+            file.rows,
+            file.batches,
+            file.parquet_object_bytes
+        );
     }
 
-    let read_files = files_to_read(&finish.files, &args.read_back, args.read_max_files);
+    let read_files = files_to_read(&written_files, &args.read_back, args.read_max_files);
     if read_files.is_empty() {
         println!("read_back=none");
         return Ok(());
@@ -517,7 +496,6 @@ impl CoordinatorClient {
             Value::Number(serde_json::Number::from(request.streams)),
         );
         insert_string(&mut body, "uploadId", request.upload_id);
-        insert_string(&mut body, "stagingPrefix", request.staging_prefix);
         insert_string(&mut body, "tableName", request.table_name);
         if let Some(mode) = request.commit_mode {
             body.insert(
@@ -544,12 +522,6 @@ impl CoordinatorClient {
         insert_u64(&mut body, "ttlMs", request.ttl_ms);
 
         self.action_json("coordinator.create-upload", body).await
-    }
-
-    async fn finish_upload(&mut self, upload_id: &str) -> Result<FinishUploadResponse> {
-        let mut body = Map::new();
-        body.insert("uploadId".to_owned(), Value::String(upload_id.to_owned()));
-        self.action_json("coordinator.finish-upload", body).await
     }
 
     async fn commit_upload(
@@ -694,7 +666,6 @@ impl CoordinatorClient {
 struct CreateUploadRequest {
     operation_id: String,
     upload_id: Option<String>,
-    staging_prefix: Option<String>,
     table_name: Option<String>,
     commit_mode: Option<CommitMode>,
     trino_user: Option<String>,
@@ -904,11 +875,71 @@ async fn run_get(ticket: GetTicketResponse, config: &BenchConfig) -> Result<GetR
     })
 }
 
+fn files_from_put_results(summary: &UploadRunSummary) -> Result<Vec<WrittenFile>> {
+    let mut files = Vec::new();
+    for stream in &summary.stream_results {
+        for raw in &stream.put_results {
+            if raw.trim().is_empty() {
+                continue;
+            }
+            let value: Value = serde_json::from_str(raw).with_context(|| {
+                format!("failed to parse DoPut result for {}", stream.stream_id)
+            })?;
+            if let Some(raw_files) = value.get("files").and_then(Value::as_array) {
+                for (index, raw_file) in raw_files.iter().enumerate() {
+                    files.push(written_file_from_put_result(stream, raw_file, index as i32));
+                }
+            } else if value.get("key").is_some()
+                || value.get("path").is_some()
+                || value.get("filePath").is_some()
+            {
+                files.push(written_file_from_put_result(stream, &value, 0));
+            }
+        }
+    }
+    files.sort_by(|left, right| {
+        left.stream_id
+            .cmp(&right.stream_id)
+            .then(left.part_index.cmp(&right.part_index))
+            .then(left.file_path.cmp(&right.file_path))
+    });
+    Ok(files)
+}
+
+fn written_file_from_put_result(
+    stream: &StreamResult,
+    value: &Value,
+    default_part_index: i32,
+) -> WrittenFile {
+    let file_path = json_string(value, "filePath")
+        .or_else(|| json_string(value, "file_path"))
+        .or_else(|| json_string(value, "key"))
+        .or_else(|| json_string(value, "path"))
+        .unwrap_or_else(|| stream.key.clone());
+    WrittenFile {
+        stream_id: json_string(value, "streamId").unwrap_or_else(|| stream.stream_id.clone()),
+        worker_id: json_string(value, "workerId").unwrap_or_else(|| stream.worker_id.clone()),
+        part_index: json_i32(value, "partIndex")
+            .or_else(|| json_i32(value, "part_index"))
+            .unwrap_or(default_part_index),
+        file_path,
+        rows: json_u64(value, "rows").unwrap_or(0),
+        batches: json_u64(value, "batches").unwrap_or(0),
+        flight_stream_bytes: json_u64(value, "flightStreamBytes")
+            .or_else(|| json_u64(value, "flight_stream_bytes"))
+            .unwrap_or(0),
+        parquet_object_bytes: json_u64(value, "parquetObjectBytes")
+            .or_else(|| json_u64(value, "parquet_object_bytes"))
+            .or_else(|| json_u64(value, "bytes"))
+            .unwrap_or(0),
+    }
+}
+
 fn files_to_read(
-    files: &[FinishedFile],
+    files: &[WrittenFile],
     read_back: &ReadBackMode,
     read_max_files: Option<usize>,
-) -> Vec<FinishedFile> {
+) -> Vec<WrittenFile> {
     let limit = match read_back {
         ReadBackMode::None => 0,
         ReadBackMode::First => 1,
@@ -916,6 +947,28 @@ fn files_to_read(
     };
 
     files.iter().take(limit).cloned().collect()
+}
+
+fn json_string(value: &Value, key: &str) -> Option<String> {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn json_u64(value: &Value, key: &str) -> Option<u64> {
+    value.get(key).and_then(|value| {
+        value
+            .as_u64()
+            .or_else(|| value.as_i64().map(|v| v.max(0) as u64))
+    })
+}
+
+fn json_i32(value: &Value, key: &str) -> Option<i32> {
+    value
+        .get(key)
+        .and_then(|value| value.as_i64().map(|value| value as i32))
 }
 
 fn parse_optional_size(name: &str, value: Option<&str>) -> Result<Option<u64>> {

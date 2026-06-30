@@ -36,7 +36,6 @@ final class Config {
     final long uploadSessionTtlMs;
     final long queryRegistryTtlMs;
     final long queryRegistryCleanupIntervalMs;
-    final String stagingPrefixRoot;
     final String objectStoreUriPrefix;
     final int defaultUploadStreams;
     final long defaultTargetFileSizeBytes;
@@ -77,7 +76,6 @@ final class Config {
             long uploadSessionTtlMs,
             long queryRegistryTtlMs,
             long queryRegistryCleanupIntervalMs,
-            String stagingPrefixRoot,
             String objectStoreUriPrefix,
             int defaultUploadStreams,
             long defaultTargetFileSizeBytes,
@@ -117,7 +115,6 @@ final class Config {
         this.uploadSessionTtlMs = uploadSessionTtlMs;
         this.queryRegistryTtlMs = queryRegistryTtlMs;
         this.queryRegistryCleanupIntervalMs = queryRegistryCleanupIntervalMs;
-        this.stagingPrefixRoot = normalizePrefix(stagingPrefixRoot);
         this.objectStoreUriPrefix = normalizeObjectStoreUriPrefix(objectStoreUriPrefix);
         this.defaultUploadStreams = defaultUploadStreams;
         this.defaultTargetFileSizeBytes = defaultTargetFileSizeBytes;
@@ -161,7 +158,6 @@ final class Config {
                 envLong("COORDINATOR_UPLOAD_SESSION_TTL_MS", 60 * 60 * 1000L),
                 envLong("COORDINATOR_QUERY_REGISTRY_TTL_MS", 60 * 60 * 1000L),
                 envLong("COORDINATOR_QUERY_REGISTRY_CLEANUP_INTERVAL_MS", 5 * 60 * 1000L),
-                env("COORDINATOR_STAGING_PREFIX_ROOT", "coordinator/staging"),
                 env("COORDINATOR_OBJECT_STORE_URI_PREFIX", "s3://arrow-flight"),
                 envInt("COORDINATOR_DEFAULT_UPLOAD_STREAMS", 1),
                 envLong("COORDINATOR_DEFAULT_TARGET_FILE_SIZE_BYTES", 512L * 1024 * 1024),
@@ -178,10 +174,6 @@ final class Config {
     String generatedCtasTable(String queryId) {
         String suffix = queryId.replace("-", "_").replace(".", "_").replace(":", "_").toLowerCase(Locale.ROOT);
         return ctasCatalog + "." + ctasSchema + "." + ctasTablePrefix + "_" + suffix;
-    }
-
-    String stagingPrefixForOperation(String operationId) {
-        return stagingPrefixRoot + "/" + operationId;
     }
 
     String generatedUploadTable(String uploadId) {

@@ -32,7 +32,7 @@ use tokio::{
     time::{Instant as TokioInstant, sleep, timeout},
 };
 use tonic::{Request, Response, Status, Streaming};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::{
     admission::{GuardedResponseStream, PutAdmission, ReadAdmission},
@@ -126,6 +126,7 @@ impl WorkerFlightService {
         };
         let runtime = self.metrics.runtime_status();
         let resources = WorkerResourceStatus {
+            worker_cpu_millicores: self.config.resources.worker_cpu_millicores,
             worker_memory_bytes: self.config.resources.worker_memory_bytes,
             reserved_memory_bytes: self.config.resources.reserved_memory_bytes,
             put: WorkerResourcePool {
@@ -546,34 +547,9 @@ impl WorkerFlightService {
         })
     }
 
-    fn put_start_record(
-        &self,
-        key: &str,
-        context: &PutContext,
-        worker_summary: Option<&WorkerPutSummary>,
-        options: &PutOptions,
-    ) -> PutStreamStartRecord {
+    fn put_start_record(&self, context: &PutContext) -> PutStreamStartRecord {
         PutStreamStartRecord {
             attempt_id: context.attempt_id.clone(),
-            upload_id: context.upload_id.clone(),
-            stream_id: context.stream_id.clone(),
-            worker_id: self.config.worker.worker_id.clone(),
-            key: key.to_owned(),
-            mode: Some(put_mode(context).to_owned()),
-            staging_prefix: context.staging_prefix.clone(),
-            target_file_size: context.target_file_size.map(usize_to_i64),
-            client_input_file_bytes: options.input_file_bytes.map(u64_to_i64),
-            stream_budget_bytes: context.stream_budget_bytes.map(u64_to_i64),
-            global_put_stream_limit: usize_to_i32(self.config.worker.max_active_put_streams),
-            upload_put_stream_limit: context.upload_stream_limit.map(usize_to_i32),
-            active_put_streams_at_admit: worker_summary
-                .map(|summary| usize_to_i32(summary.active_put_streams_at_admit)),
-            upload_active_streams_at_admit: worker_summary
-                .and_then(|summary| summary.upload_active_streams_at_admit)
-                .map(usize_to_i32),
-            compression: self.config.parquet.compression_name.clone(),
-            multipart_part_size: usize_to_i64(self.config.parquet.multipart_part_size),
-            multipart_max_concurrency: usize_to_i32(self.config.parquet.multipart_max_concurrency),
         }
     }
 
@@ -659,14 +635,12 @@ impl WorkerFlightService {
         };
         let record = PutStreamCompleteRecord {
             attempt_id: summary.worker.attempt_id.clone(),
-            mode: summary.mode.clone(),
             rows: usize_to_i64(summary.rows),
             batches: usize_to_i64(summary.batches),
             parts: usize_to_i32(summary.parts),
             flight_stream_bytes: u64_to_i64(summary.flight_stream_bytes),
             parquet_object_bytes: summary.parquet_object_bytes.map(u64_to_i64),
             elapsed_ms: u128_to_i64(summary.elapsed_ms),
-            put_result_json: serde_json::to_value(summary).map_err(status_from_anyhow)?,
             files: put_file_records(summary),
         };
         metadata_store
@@ -715,13 +689,12 @@ impl WorkerFlightService {
             Ok(admission) => admission,
             Err(status) => {
                 let status = status_with_put_context(status, &put_context);
-                let record = self.put_start_record(&key, &put_context, None, &put_options);
+                let record = self.put_start_record(&put_context);
                 self.record_put_rejected(&record, &status).await?;
                 return Err(status);
             }
         };
-        let start_record =
-            self.put_start_record(&key, &put_context, Some(&worker_summary), &put_options);
+        let start_record = self.put_start_record(&put_context);
         self.record_put_admitted(&start_record).await?;
 
         let attempt_id = worker_summary.attempt_id.clone();
@@ -841,7 +814,7 @@ impl WorkerFlightService {
     async fn cleanup_failed_put_objects(&self, key: &str, target_file_size: Option<usize>) {
         let path = path_from_key(key);
         match self.store.delete(&path).await {
-            Ok(()) => info!(key = %key, "deleted failed DoPut object"),
+            Ok(()) => debug!(key = %key, "deleted failed DoPut object"),
             Err(error) => warn!(
                 key = %key,
                 error = %error,
@@ -877,7 +850,7 @@ impl WorkerFlightService {
             }
         }
         if deleted > 0 {
-            info!(
+            debug!(
                 key = %key,
                 prefix = %prefix,
                 deleted,
@@ -1024,7 +997,7 @@ impl WorkerFlightService {
             part_profiles,
         };
 
-        info!(
+        debug!(
             key = %summary.key,
             worker_id = %summary.worker.worker_id,
             attempt_id = %summary.worker.attempt_id,
@@ -1228,7 +1201,7 @@ impl WorkerFlightService {
             part_profiles,
         };
 
-        info!(
+        debug!(
             key = %summary.key,
             worker_id = %summary.worker.worker_id,
             attempt_id = %summary.worker.attempt_id,
@@ -1365,7 +1338,7 @@ impl FlightService for WorkerFlightService {
             let measured_stream =
                 MeasuredReadStream::new(flight_stream, self.metrics.clone(), started, meta.size);
 
-            info!(
+            debug!(
                 key = %key,
                 operation_id = ?ticket.operation_id,
                 bytes = meta.size,
@@ -1480,14 +1453,6 @@ fn parse_put_options(app_metadata: &Bytes) -> Result<PutOptions, Status> {
     serde_json::from_slice(app_metadata).map_err(|err| {
         Status::invalid_argument(format!("invalid DoPut app_metadata options: {err}"))
     })
-}
-
-fn put_mode(context: &PutContext) -> &'static str {
-    if context.target_file_size.is_some() {
-        "sized_dataset"
-    } else {
-        "single"
-    }
 }
 
 fn usize_to_i32(value: usize) -> i32 {
@@ -1805,10 +1770,6 @@ fn put_file_records(summary: &PutSummary) -> Vec<PutFileRecord> {
         .iter()
         .map(|file| PutFileRecord {
             attempt_id: summary.worker.attempt_id.clone(),
-            upload_id: summary.worker.upload_id.clone(),
-            stream_id: summary.worker.stream_id.clone(),
-            worker_id: summary.worker.worker_id.clone(),
-            logical_key: summary.key.clone(),
             part_index: usize_to_i32(file.part_index),
             file_path: file.key.clone(),
             rows: usize_to_i64(file.rows),
