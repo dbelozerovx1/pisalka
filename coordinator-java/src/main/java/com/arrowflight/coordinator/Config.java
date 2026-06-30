@@ -9,6 +9,8 @@ import java.util.UUID;
 
 final class Config {
     final InetSocketAddress listenAddress;
+    final boolean coordinatorMetricsEnabled;
+    final InetSocketAddress coordinatorMetricsAddress;
     final URI trinoUri;
     final String trinoCatalog;
     final String trinoSchema;
@@ -48,6 +50,8 @@ final class Config {
 
     private Config(
             InetSocketAddress listenAddress,
+            boolean coordinatorMetricsEnabled,
+            InetSocketAddress coordinatorMetricsAddress,
             URI trinoUri,
             String trinoCatalog,
             String trinoSchema,
@@ -86,6 +90,8 @@ final class Config {
             Duration trinoRequestTimeout
     ) {
         this.listenAddress = listenAddress;
+        this.coordinatorMetricsEnabled = coordinatorMetricsEnabled;
+        this.coordinatorMetricsAddress = coordinatorMetricsAddress;
         this.trinoUri = trinoUri;
         this.trinoCatalog = trinoCatalog;
         this.trinoSchema = trinoSchema;
@@ -127,7 +133,9 @@ final class Config {
     static Config fromEnv() {
         long capabilityTtlMs = envLong("COORDINATOR_CAPABILITY_TTL_MS", 15 * 60 * 1000L);
         return new Config(
-                parseListenAddress(env("COORDINATOR_ADDR", "0.0.0.0:8088")),
+                parseListenAddress(env("COORDINATOR_ADDR", "0.0.0.0:8088"), "COORDINATOR_ADDR"),
+                envBool("COORDINATOR_METRICS_ENABLED", true),
+                parseListenAddress(env("COORDINATOR_METRICS_ADDR", "0.0.0.0:9091"), "COORDINATOR_METRICS_ADDR"),
                 URI.create(env("TRINO_URI", "http://host.docker.internal:8080")),
                 env("TRINO_CATALOG", "iceberg"),
                 env("TRINO_SCHEMA", "arrow"),
@@ -167,8 +175,8 @@ final class Config {
         );
     }
 
-    String generatedCtasTable() {
-        String suffix = UUID.randomUUID().toString().replace("-", "").toLowerCase(Locale.ROOT);
+    String generatedCtasTable(String queryId) {
+        String suffix = queryId.replace("-", "_").replace(".", "_").replace(":", "_").toLowerCase(Locale.ROOT);
         return ctasCatalog + "." + ctasSchema + "." + ctasTablePrefix + "_" + suffix;
     }
 
@@ -185,10 +193,10 @@ final class Config {
         return objectStoreUriPrefix + "/" + normalizePrefix(prefix);
     }
 
-    private static InetSocketAddress parseListenAddress(String raw) {
+    private static InetSocketAddress parseListenAddress(String raw, String envName) {
         int split = raw.lastIndexOf(':');
         if (split <= 0 || split == raw.length() - 1) {
-            throw new IllegalArgumentException("COORDINATOR_ADDR must look like 0.0.0.0:8088");
+            throw new IllegalArgumentException(envName + " must look like 0.0.0.0:8088");
         }
         return new InetSocketAddress(raw.substring(0, split), Integer.parseInt(raw.substring(split + 1)));
     }

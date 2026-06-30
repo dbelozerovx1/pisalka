@@ -17,6 +17,7 @@ final class CoordinatorService {
     private final Config config;
     private final TrinoClient trinoClient;
     private final IcebergCommitter icebergCommitter;
+    private final ObjectStoreCleaner objectStoreCleaner;
     private final CapabilitySigner capabilitySigner;
     private final CoordinatorMetadataStore metadataStore;
     private final AtomicLong lastQueryCleanupMs = new AtomicLong(0);
@@ -25,6 +26,7 @@ final class CoordinatorService {
         this.config = config;
         this.trinoClient = new TrinoClient(config);
         this.icebergCommitter = new IcebergCommitter(config);
+        this.objectStoreCleaner = new ObjectStoreCleaner(config);
         this.capabilitySigner = new CapabilitySigner(config);
         this.metadataStore = new CoordinatorMetadataStore(config);
     }
@@ -47,7 +49,10 @@ final class CoordinatorService {
         body.put("capabilitySigningConfigured", config.capabilitySecret.isPresent());
         body.put("adminTokenConfigured", config.adminToken.isPresent());
         body.put("metadataDatabaseConfigured", metadataStore.enabled());
+        body.put("metricsEnabled", config.coordinatorMetricsEnabled);
+        body.put("metricsAddress", config.coordinatorMetricsAddress.toString());
         body.put("queryRegistryTtlMs", config.queryRegistryTtlMs);
+        body.put("tempCleanupAction", "coordinator.drop-temp");
         return body;
     }
 
@@ -57,11 +62,13 @@ final class CoordinatorService {
 
         String operationId = stringOrDefault(request, "operationId", UUID.randomUUID().toString());
         String uploadId = stringOrDefault(request, "uploadId", operationId);
-        String stagingPrefix = request.containsKey("stagingPrefix")
-                ? Config.normalizePrefix(String.valueOf(request.get("stagingPrefix")))
-                : config.stagingPrefixForOperation(operationId);
-        Optional<String> tableName = Optional.ofNullable(Json.string(request, "tableName"))
-                .filter(value -> !value.isBlank());
+        String tableName = Optional.ofNullable(Json.string(request, "tableName"))
+                .filter(value -> !value.isBlank())
+                .orElseGet(() -> config.generatedUploadTable(uploadId));
+        String outputPrefix = tableDataPrefix(tableName);
+        String mode = requestedCommitMode(request).orElse("append");
+        String trinoUser = stringOrDefault(request, "user", "anonymous");
+        Optional<String> authorization = authorizationFrom(request);
         int requestedStreams = Math.max(1, Math.min(
                 Json.intValue(request, "streams", config.defaultUploadStreams),
                 config.defaultMaxUploadStreams
@@ -87,7 +94,7 @@ final class CoordinatorService {
             WorkerAssignment worker = workerAssignments.get(index);
             String streamId = "stream-%05d".formatted(index);
             String attemptId = UUID.randomUUID().toString();
-            String descriptorPath = stagingPrefix + "/" + streamId + ".parquet";
+            String descriptorPath = outputPrefix + "/flight-" + UUID.randomUUID() + ".parquet";
             LinkedHashMap<String, Object> ticketRequest = new LinkedHashMap<>();
             ticketRequest.put("operationId", operationId);
             ticketRequest.put("attemptId", attemptId);
@@ -95,7 +102,7 @@ final class CoordinatorService {
             ticketRequest.put("streamId", streamId);
             ticketRequest.put("workerId", worker.workerId());
             ticketRequest.put("flightUri", worker.flightUri());
-            ticketRequest.put("stagingPrefix", stagingPrefix);
+            ticketRequest.put("stagingPrefix", outputPrefix);
             ticketRequest.put("path", descriptorPath);
             ticketRequest.put("targetFileSizeBytes", targetFileSize);
             maxStreamBytes.ifPresent(value -> ticketRequest.put("maxStreamBytes", value));
@@ -118,28 +125,41 @@ final class CoordinatorService {
         PlannedUploadSession session = new PlannedUploadSession(
                 uploadId,
                 operationId,
-                tableName,
+                Optional.of(tableName),
                 streams,
-                stagingPrefix,
+                outputPrefix,
                 targetFileSize,
                 maxStreamBytes,
                 maxRecordBatchBytes,
+                mode,
                 expiresAt
         );
         metadataStore.createUpload(session, plannedStreams);
+        Optional<Map<String, Object>> overwritePreparation = Optional.empty();
+        try {
+            if (mode.equals("overwrite")) {
+                overwritePreparation = Optional.of(prepareOverwriteUpload(tableName, trinoUser, authorization));
+            }
+        } catch (RuntimeException error) {
+            metadataStore.markFailed(uploadId, "failed to prepare overwrite upload: " + error.getMessage());
+            throw error;
+        }
 
         LinkedHashMap<String, Object> body = new LinkedHashMap<>();
         body.put("uploadId", uploadId);
         body.put("operationId", operationId);
-        tableName.ifPresent(value -> body.put("tableName", value));
+        body.put("tableName", tableName);
         body.put("status", "PLANNED");
+        body.put("mode", mode);
         body.put("requestedStreams", requestedStreams);
         body.put("grantedStreams", streams);
         body.put("expectedStreams", streams);
-        body.put("stagingPrefix", stagingPrefix + "/");
+        body.put("stagingPrefix", outputPrefix + "/");
+        body.put("outputPrefix", outputPrefix + "/");
         body.put("targetFileSizeBytes", targetFileSize);
         body.put("expiresAtMs", expiresAt.toEpochMilli());
         body.put("selectedWorkers", workerAssignments.stream().map(WorkerAssignment::toJson).toList());
+        overwritePreparation.ifPresent(value -> body.put("overwritePreparation", value));
         body.put("tickets", ticketBodies);
         return body;
     }
@@ -155,6 +175,9 @@ final class CoordinatorService {
         UploadSnapshot snapshot = metadataStore.loadUpload(uploadId);
         if (snapshot.session().status().equals("COMMITTED")) {
             return committedUploadResponse(snapshot);
+        }
+        if (snapshot.session().status().equals("FAILED")) {
+            return failedUploadResponse(snapshot);
         }
         if (snapshot.session().status().equals("COMMITTING") || snapshot.session().status().equals("ABORTED")) {
             throw new CoordinatorException(
@@ -173,6 +196,9 @@ final class CoordinatorService {
         UploadSnapshot snapshot = metadataStore.loadUpload(uploadId);
         if (snapshot.session().status().equals("COMMITTED")) {
             return committedUploadResponse(snapshot);
+        }
+        if (snapshot.session().status().equals("FAILED")) {
+            return failedUploadResponse(snapshot);
         }
         if (snapshot.session().status().equals("COMMITTING") || snapshot.session().status().equals("ABORTED")) {
             throw new CoordinatorException(
@@ -194,17 +220,39 @@ final class CoordinatorService {
             );
         }
 
-        String mode = Optional.ofNullable(Json.string(request, "mode"))
-                .or(() -> Optional.ofNullable(Json.string(request, "commitMode")))
-                .filter(value -> !value.isBlank())
-                .orElse("append");
+        String mode = effectiveCommitMode(request, snapshot.session().commitMode());
         String trinoUser = stringOrDefault(request, "user", "anonymous");
         Optional<String> authorization = authorizationFrom(request);
+        boolean tableExistedBeforeCommit = true;
+        boolean icebergCommitStarted = false;
+        boolean icebergCommitCompleted = false;
         try {
-            TrinoClient.QueryHandle ddl = trinoClient.runStatement(plan.createTableSql(), trinoUser, authorization);
+            tableExistedBeforeCommit = icebergCommitter.tableExists(plan.tableName());
+            Optional<TrinoClient.QueryHandle> ddl = Optional.empty();
+            boolean tableCreatedByCoordinator = false;
+            if (mode.equals("append")) {
+                if (!tableExistedBeforeCommit) {
+                    throw new CoordinatorException(
+                            409,
+                            "append commit requires an existing Iceberg table when worker files are written directly "
+                                    + "under table data location; use overwrite to recreate the table"
+                    );
+                }
+                ddl = Optional.of(trinoClient.runStatement(plan.createTableSql(), trinoUser, authorization));
+            } else if (!tableExistedBeforeCommit) {
+                tableCreatedByCoordinator = icebergCommitter.createTableIfMissing(
+                        plan.tableName(),
+                        plan.arrowSchema(),
+                        tableLocation(plan.tableName())
+                );
+            }
+            icebergCommitStarted = true;
             CommitOutcome outcome = icebergCommitter.commit(uploadId, plan.tableName(), mode, snapshot.files());
+            icebergCommitCompleted = true;
             LinkedHashMap<String, Object> summary = new LinkedHashMap<>(outcome.summary());
-            ddl.queryId().ifPresent(value -> summary.put("trinoDdlQueryId", value));
+            ddl.flatMap(TrinoClient.QueryHandle::queryId).ifPresent(value -> summary.put("trinoDdlQueryId", value));
+            summary.put("tableExistedBeforeCommit", tableExistedBeforeCommit);
+            summary.put("tableCreatedByCoordinator", tableCreatedByCoordinator);
             metadataStore.markCommitted(uploadId, new CommitMetadata(
                     plan.tableName(),
                     outcome.mode(),
@@ -222,8 +270,27 @@ final class CoordinatorService {
             body.put("commitSummary", summary);
             return body;
         } catch (Exception error) {
-            metadataStore.markFailed(uploadId, error.getMessage());
-            throw new CoordinatorException(500, "failed to commit upload " + uploadId + ": " + error.getMessage(), error);
+            if (icebergCommitStarted) {
+                String commitState = icebergCommitCompleted ? "completed" : "started";
+                throw new CoordinatorException(
+                        500,
+                        "Iceberg commit for upload " + uploadId + " " + commitState
+                                + ", but coordinator failed at or after the snapshot commit boundary: "
+                                + error.getMessage()
+                                + "; no staged files were deleted because they may now be table data",
+                        error
+                );
+            }
+            CleanupResult stagedCleanup = objectStoreCleaner.deleteUploadObjects(snapshot);
+            Optional<Map<String, Object>> tableCleanup = tableExistedBeforeCommit
+                    ? Optional.empty()
+                    : Optional.of(dropTableBestEffort(plan.tableName(), trinoUser, authorization));
+            String message = "failed to commit upload " + uploadId + ": " + error.getMessage();
+            metadataStore.markFailed(uploadId, message);
+            LinkedHashMap<String, Object> cleanup = new LinkedHashMap<>();
+            cleanup.put("staging", stagedCleanup.toJson());
+            tableCleanup.ifPresent(value -> cleanup.put("table", value));
+            throw new CoordinatorException(500, message + "; cleanup=" + cleanup, error);
         }
     }
 
@@ -233,6 +300,7 @@ final class CoordinatorService {
         if (failed.isPresent()) {
             String message = "upload stream " + failed.get().streamId() + " failed with status " + failed.get().status()
                     + failed.get().errorMessage().map(error -> ": " + error).orElse("");
+            objectStoreCleaner.deleteUploadObjects(snapshot);
             metadataStore.markFailed(uploadId, message);
             throw new CoordinatorException(409, message);
         }
@@ -254,12 +322,20 @@ final class CoordinatorService {
                 .or(() -> snapshot.session().commitTableName())
                 .orElseGet(() -> config.generatedUploadTable(uploadId));
         Map<String, Object> arrowSchema = Json.parseObject(snapshot.canonicalSchemaJson());
-        String createTableSql = TrinoDdlPlanner.createTableSql(
-                tableName,
-                arrowSchema,
-                tableLocation(tableName),
-                true
-        );
+        String createTableSql;
+        try {
+            createTableSql = TrinoDdlPlanner.createTableSql(
+                    tableName,
+                    arrowSchema,
+                    tableLocation(tableName),
+                    true
+            );
+        } catch (RuntimeException error) {
+            objectStoreCleaner.deleteUploadObjects(snapshot);
+            String message = "upload schema is not supported for Iceberg table planning: " + error.getMessage();
+            metadataStore.markFailed(uploadId, message);
+            throw new CoordinatorException(400, message, error);
+        }
         return new UploadReadyPlan(snapshot, tableName, createTableSql, arrowSchema);
     }
 
@@ -280,6 +356,14 @@ final class CoordinatorService {
             throw new CoordinatorException(400, "tableName must be table, schema.table, or catalog.schema.table");
         }
         return config.icebergWarehouse + "/" + schema + "/" + table;
+    }
+
+    private String tableDataPrefix(String tableName) {
+        return objectPrefixFromUri(tableLocation(tableName) + "/data");
+    }
+
+    private String tablePrefix(String tableName) {
+        return objectPrefixFromUri(tableLocation(tableName));
     }
 
     private LinkedHashMap<String, Object> readyUploadResponse(UploadReadyPlan plan) {
@@ -310,14 +394,65 @@ final class CoordinatorService {
         return body;
     }
 
+    private LinkedHashMap<String, Object> failedUploadResponse(UploadSnapshot snapshot) {
+        UploadSessionRecord session = snapshot.session();
+        LinkedHashMap<String, Object> body = new LinkedHashMap<>();
+        body.put("uploadId", session.uploadId());
+        body.put("status", session.status());
+        session.errorMessage().ifPresent(value -> body.put("errorMessage", value));
+        session.tableName().ifPresent(value -> body.put("tableName", value));
+        body.put("files", snapshot.files().stream().map(UploadFile::toJson).toList());
+        body.put("streams", snapshot.streams().stream().map(UploadStreamState::toJson).toList());
+        return body;
+    }
+
     Map<String, Object> abortUpload(Map<String, Object> request) {
         requireAdminIfConfigured(request);
         String uploadId = Json.requiredString(request, "uploadId");
         String reason = Optional.ofNullable(Json.string(request, "reason"))
                 .filter(value -> !value.isBlank())
                 .orElse("aborted by coordinator request");
+        UploadSnapshot snapshot = metadataStore.loadUpload(uploadId);
+        if (snapshot.session().status().equals("COMMITTED")) {
+            throw new CoordinatorException(409, "committed upload " + uploadId + " cannot be aborted");
+        }
+        CleanupResult cleanup = objectStoreCleaner.deleteUploadObjects(snapshot);
         metadataStore.markAborted(uploadId, reason);
-        return Map.of("uploadId", uploadId, "status", "ABORTED");
+        return Map.of(
+                "uploadId", uploadId,
+                "status", "ABORTED",
+                "cleanup", Map.of("staging", cleanup.toJson())
+        );
+    }
+
+    Map<String, Object> dropTemp(Map<String, Object> request) {
+        cleanupQueriesIfDue();
+        String queryId = Json.requiredString(request, "queryId");
+        QueryRegistryRecord record = metadataStore.loadQuery(queryId);
+        if (!record.queryType().equals("ctas")) {
+            throw new CoordinatorException(400, "drop-temp only applies to CTAS query ids");
+        }
+        String trinoUser = stringOrDefault(request, "user", record.trinoUser().orElse("anonymous"));
+        Optional<String> authorization = authorizationFrom(request);
+        Optional<String> targetTable = record.targetTable();
+        Optional<Map<String, Object>> tableDrop = targetTable.map(table -> dropTable(table, trinoUser, authorization));
+        CleanupResult stagingCleanup = objectStoreCleaner.deleteCtasStaging(queryId);
+
+        LinkedHashMap<String, Object> metadata = baseFlightMetadata(queryId, "ctas", "DROPPED", Optional.of(1.0));
+        metadata.put("phase", "dropped");
+        targetTable.ifPresent(value -> metadata.put("targetTable", value));
+        tableDrop.ifPresent(value -> metadata.put("tableDrop", value));
+        metadata.put("stagingCleanup", stagingCleanup.toJson());
+        metadataStore.markQueryDropped(queryId, metadata);
+
+        LinkedHashMap<String, Object> body = new LinkedHashMap<>(metadata);
+        body.put("queryId", queryId);
+        body.put("status", "DROPPED");
+        body.put("cleanup", Map.of(
+                "table", tableDrop.orElse(Map.of("skipped", true, "reason", "query has no target table")),
+                "staging", stagingCleanup.toJson()
+        ));
+        return body;
     }
 
     Map<String, Object> putTicket(Map<String, Object> request) {
@@ -418,7 +553,7 @@ final class CoordinatorService {
         String queryId = newQueryId("ctas");
         String targetTable = qualifiedTargetTable(Optional.ofNullable(Json.string(request, "targetTable"))
                 .filter(value -> !value.isBlank())
-                .orElseGet(config::generatedCtasTable));
+                .orElseGet(() -> config.generatedCtasTable(queryId)));
         String ctasLocation = config.objectUriForPrefix("coordinator/ctas/" + queryId);
         String ctasSql = SqlPlanner.buildCtas(targetTable, Json.requiredString(request, "sql"), ctasLocation);
         String trinoUser = stringOrDefault(request, "user", "anonymous");
@@ -877,6 +1012,16 @@ final class CoordinatorService {
         return Config.normalizePath(raw);
     }
 
+    private String objectPrefixFromUri(String raw) {
+        for (String prefix : objectStoreUriPrefixes()) {
+            String normalizedPrefix = prefix + "/";
+            if (raw.startsWith(normalizedPrefix)) {
+                return Config.normalizePrefix(raw.substring(normalizedPrefix.length()));
+            }
+        }
+        return Config.normalizePrefix(raw);
+    }
+
     private List<String> objectStoreUriPrefixes() {
         ArrayList<String> prefixes = new ArrayList<>();
         prefixes.add(config.objectStoreUriPrefix);
@@ -896,7 +1041,61 @@ final class CoordinatorService {
     }
 
     private String newQueryId(String prefix) {
-        return prefix + "-" + UUID.randomUUID();
+        return prefix + "_" + UUID.randomUUID().toString().replace("-", "");
+    }
+
+    private Map<String, Object> dropTable(String tableName, String trinoUser, Optional<String> authorization) {
+        try {
+            TrinoClient.QueryHandle handle = trinoClient.runStatement(
+                    SqlPlanner.buildDropTable(tableName),
+                    trinoUser,
+                    authorization
+            );
+            LinkedHashMap<String, Object> body = new LinkedHashMap<>();
+            body.put("tableName", tableName);
+            body.put("dropped", true);
+            handle.queryId().ifPresent(value -> body.put("trinoQueryId", value));
+            return body;
+        } catch (Exception error) {
+            throw new CoordinatorException(500, "failed to drop table " + tableName + ": " + error.getMessage(), error);
+        }
+    }
+
+    private Map<String, Object> prepareOverwriteUpload(
+            String tableName,
+            String trinoUser,
+            Optional<String> authorization
+    ) {
+        Map<String, Object> tableDrop = dropTable(tableName, trinoUser, authorization);
+        CleanupResult locationCleanup = objectStoreCleaner.deletePrefix(tablePrefix(tableName));
+        if (!locationCleanup.succeeded()) {
+            throw new CoordinatorException(
+                    500,
+                    "failed to clean table location before overwrite upload " + tableName
+                            + ": " + locationCleanup.errorMessage().orElse("unknown cleanup error")
+            );
+        }
+
+        LinkedHashMap<String, Object> body = new LinkedHashMap<>();
+        body.put("table", tableDrop);
+        body.put("location", locationCleanup.toJson());
+        return body;
+    }
+
+    private Map<String, Object> dropTableBestEffort(
+            String tableName,
+            String trinoUser,
+            Optional<String> authorization
+    ) {
+        try {
+            return dropTable(tableName, trinoUser, authorization);
+        } catch (RuntimeException error) {
+            return Map.of(
+                    "tableName", tableName,
+                    "dropped", false,
+                    "errorMessage", error.getMessage()
+            );
+        }
     }
 
     private static String stringOrDefault(Map<String, Object> request, String key, String defaultValue) {
@@ -910,6 +1109,39 @@ final class CoordinatorService {
         }
         long value = Json.longValue(request, key, defaultValue);
         return value <= 0 ? Optional.empty() : Optional.of(value);
+    }
+
+    private static String effectiveCommitMode(Map<String, Object> request, Optional<String> persistedMode) {
+        Optional<String> requestedMode = requestedCommitMode(request);
+        Optional<String> normalizedPersisted = persistedMode
+                .filter(value -> !value.isBlank())
+                .map(CoordinatorService::normalizeCommitMode);
+        if (requestedMode.isPresent()
+                && normalizedPersisted.isPresent()
+                && !requestedMode.get().equals(normalizedPersisted.get())) {
+            throw new CoordinatorException(
+                    409,
+                    "commit mode " + requestedMode.get()
+                            + " conflicts with upload planned mode " + normalizedPersisted.get()
+            );
+        }
+        return requestedMode.or(() -> normalizedPersisted).orElse("append");
+    }
+
+    private static Optional<String> requestedCommitMode(Map<String, Object> request) {
+        return Optional.ofNullable(Json.string(request, "mode"))
+                .or(() -> Optional.ofNullable(Json.string(request, "commitMode")))
+                .filter(value -> !value.isBlank())
+                .map(CoordinatorService::normalizeCommitMode);
+    }
+
+    private static String normalizeCommitMode(String raw) {
+        String value = raw.trim().toLowerCase(java.util.Locale.ROOT);
+        return switch (value) {
+            case "append" -> "append";
+            case "overwrite", "replace" -> "overwrite";
+            default -> throw new CoordinatorException(400, "commit mode must be append or overwrite");
+        };
     }
 }
 

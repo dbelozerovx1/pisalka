@@ -198,6 +198,8 @@ services:
         condition: service_completed_successfully
     environment:
       COORDINATOR_ADDR: 0.0.0.0:8088
+      COORDINATOR_METRICS_ENABLED: "${COORDINATOR_METRICS_ENABLED:-true}"
+      COORDINATOR_METRICS_ADDR: "${COORDINATOR_METRICS_ADDR:-0.0.0.0:9091}"
       COORDINATOR_ADMIN_TOKEN: "${COORDINATOR_ADMIN_TOKEN:-}"
       COORDINATOR_CAPABILITY_SECRET: "${COORDINATOR_CAPABILITY_SECRET:-local-dev-secret}"
       COORDINATOR_METADATA_DATABASE_URL: "${COORDINATOR_METADATA_DATABASE_URL:-postgres://flight:flight@metadata-db:5432/flight_metadata}"
@@ -232,6 +234,7 @@ services:
       CTAS_TABLE_PREFIX: "${CTAS_TABLE_PREFIX:-ctas_tmp}"
     ports:
       - "8088:8088"
+      - "9091:9091"
 
   bench:
     profiles:

@@ -28,6 +28,18 @@ final class SqlPlanner {
                 + quoteIdentifier(parts[2] + "$files");
     }
 
+    static String buildDropTable(String targetTable) {
+        String[] parts = validateTableName(targetTable).split("\\.");
+        StringBuilder out = new StringBuilder("DROP TABLE IF EXISTS ");
+        for (int index = 0; index < parts.length; index++) {
+            if (index > 0) {
+                out.append(".");
+            }
+            out.append(quoteIdentifier(parts[index]));
+        }
+        return out.toString();
+    }
+
     static String normalizeSourceSql(String sql) {
         if (sql == null || sql.isBlank()) {
             throw new IllegalArgumentException("sql is required");

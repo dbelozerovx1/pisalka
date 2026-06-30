@@ -27,10 +27,12 @@ final class CoordinatorFlightProducer implements FlightProducer {
 
     private final Config config;
     private final CoordinatorService coordinator;
+    private final CoordinatorMetrics metrics;
 
-    CoordinatorFlightProducer(Config config, CoordinatorService coordinator) {
+    CoordinatorFlightProducer(Config config, CoordinatorService coordinator, CoordinatorMetrics metrics) {
         this.config = config;
         this.coordinator = coordinator;
+        this.metrics = metrics;
     }
 
     @Override
@@ -47,28 +49,44 @@ final class CoordinatorFlightProducer implements FlightProducer {
 
     @Override
     public FlightInfo getFlightInfo(CallContext context, FlightDescriptor descriptor) {
+        Map<String, Object> request = Map.of();
         try {
-            return flightInfo(coordinator.startFlight(descriptorRequest(descriptor)), false);
+            request = descriptorRequest(descriptor);
+            FlightInfo response = flightInfo(coordinator.startFlight(request), false);
+            metrics.recordSuccess("GetFlightInfo", null);
+            return response;
         } catch (RuntimeException error) {
-            throw toFlight(error);
+            throw CoordinatorErrorFormatter.toFlight(
+                    error,
+                    CoordinatorErrorFormatter.ErrorContext.method("GetFlightInfo", request),
+                    metrics
+            );
         }
     }
 
     @Override
     public PollInfo pollFlightInfo(CallContext context, FlightDescriptor descriptor) {
+        Map<String, Object> request = Map.of();
         try {
-            PollResult result = coordinator.pollFlight(descriptorRequest(descriptor));
+            request = descriptorRequest(descriptor);
+            PollResult result = coordinator.pollFlight(request);
             FlightDescriptor nextDescriptor = result.complete()
                     ? null
                     : FlightDescriptor.command(jsonBytes(Map.of("type", "poll", "queryId", result.plan().queryId())));
-            return new PollInfo(
+            PollInfo response = new PollInfo(
                     flightInfo(result.plan(), result.complete()),
                     nextDescriptor,
                     result.progress().orElse(null),
                     result.complete() ? null : result.expiresAt()
             );
+            metrics.recordSuccess("PollFlightInfo", null);
+            return response;
         } catch (RuntimeException error) {
-            throw toFlight(error);
+            throw CoordinatorErrorFormatter.toFlight(
+                    error,
+                    CoordinatorErrorFormatter.ErrorContext.method("PollFlightInfo", request),
+                    metrics
+            );
         }
     }
 
@@ -81,8 +99,9 @@ final class CoordinatorFlightProducer implements FlightProducer {
 
     @Override
     public void doAction(CallContext context, Action action, StreamListener<Result> listener) {
+        Map<String, Object> request = Map.of();
         try {
-            Map<String, Object> request = actionBody(action);
+            request = actionBody(action);
             Map<String, Object> response = switch (action.getType()) {
                 case "coordinator.config" -> coordinator.configJson();
                 case "coordinator.create-upload" -> coordinator.createUpload(request);
@@ -90,14 +109,20 @@ final class CoordinatorFlightProducer implements FlightProducer {
                 case "coordinator.finish-upload" -> coordinator.finishUpload(request);
                 case "coordinator.commit-upload", "coordinator.do-commit" -> coordinator.commitUpload(request);
                 case "coordinator.abort-upload" -> coordinator.abortUpload(request);
+                case "coordinator.drop-temp", "coordinator.drop_temp" -> coordinator.dropTemp(request);
                 case "coordinator.put-ticket" -> coordinator.putTicket(request);
                 case "coordinator.get-ticket" -> coordinator.getTicket(request);
                 default -> throw new CoordinatorException(400, "unknown coordinator action: " + action.getType());
             };
             listener.onNext(new Result(jsonBytes(response)));
             listener.onCompleted();
+            metrics.recordSuccess("DoAction", action.getType());
         } catch (RuntimeException error) {
-            listener.onError(toFlight(error));
+            listener.onError(CoordinatorErrorFormatter.toFlight(
+                    error,
+                    CoordinatorErrorFormatter.ErrorContext.action(action.getType(), request),
+                    metrics
+            ));
         }
     }
 
@@ -107,9 +132,10 @@ final class CoordinatorFlightProducer implements FlightProducer {
         listener.onNext(new ActionType("coordinator.create-upload", "Create a durable upload session and signed DoPut tickets"));
         listener.onNext(new ActionType("coordinator.upload-status", "Return upload session and worker stream status"));
         listener.onNext(new ActionType("coordinator.finish-upload", "Validate completed upload streams and return files/DDL"));
-        listener.onNext(new ActionType("coordinator.commit-upload", "Execute Trino DDL gate and Iceberg append/overwrite commit"));
+        listener.onNext(new ActionType("coordinator.commit-upload", "Commit uploaded files to Iceberg with append or overwrite"));
         listener.onNext(new ActionType("coordinator.do-commit", "Alias for coordinator.commit-upload"));
         listener.onNext(new ActionType("coordinator.abort-upload", "Mark an upload session aborted"));
+        listener.onNext(new ActionType("coordinator.drop-temp", "Drop a coordinator-created CTAS temp table by query id"));
         listener.onNext(new ActionType("coordinator.put-ticket", "Low-level signed DoPut ticket for internal/dev use"));
         listener.onNext(new ActionType("coordinator.get-ticket", "Low-level signed DoGet ticket for internal/dev use"));
         listener.onCompleted();
@@ -170,21 +196,5 @@ final class CoordinatorFlightProducer implements FlightProducer {
 
     private byte[] jsonBytes(Object value) {
         return Json.stringify(value).getBytes(StandardCharsets.UTF_8);
-    }
-
-    private RuntimeException toFlight(RuntimeException error) {
-        if (error instanceof CoordinatorException coordinatorError) {
-            return switch (coordinatorError.status) {
-                case 400, 409 -> CallStatus.INVALID_ARGUMENT.withDescription(error.getMessage()).toRuntimeException();
-                case 403 -> CallStatus.UNAUTHORIZED.withDescription(error.getMessage()).toRuntimeException();
-                case 404 -> CallStatus.NOT_FOUND.withDescription(error.getMessage()).toRuntimeException();
-                case 503 -> CallStatus.UNAVAILABLE.withDescription(error.getMessage()).toRuntimeException();
-                default -> CallStatus.INTERNAL.withDescription(error.getMessage()).withCause(error).toRuntimeException();
-            };
-        }
-        if (error instanceof IllegalArgumentException) {
-            return CallStatus.INVALID_ARGUMENT.withDescription(error.getMessage()).withCause(error).toRuntimeException();
-        }
-        return CallStatus.INTERNAL.withDescription(error.getMessage()).withCause(error).toRuntimeException();
     }
 }

@@ -3,7 +3,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use arrow_array::RecordBatch;
 use arrow_cast::pretty::pretty_format_batches;
-use arrow_flight::{FlightClient, FlightDescriptor, FlightEndpoint, FlightInfo, Ticket};
+use arrow_flight::{Action, FlightClient, FlightDescriptor, FlightEndpoint, FlightInfo, Ticket};
 use bytes::Bytes;
 use clap::Parser;
 use futures::TryStreamExt;
@@ -47,6 +47,9 @@ struct Args {
 
     #[arg(long, env = "COORDINATOR_PREVIEW_ROWS", default_value_t = 20)]
     preview_rows: usize,
+
+    #[arg(long, env = "COORDINATOR_DROP_TEMP", default_value_t = false)]
+    drop_temp: bool,
 }
 
 #[tokio::main(flavor = "multi_thread")]
@@ -119,9 +122,15 @@ async fn main() -> Result<()> {
             status == "SUCCEEDED",
             "query {query_id} completed with unexpected status {status}"
         );
-        if args.read_results {
-            read_results(info, &args, &bench_config).await?;
+        let read_result = if args.read_results {
+            read_results(info, &args, &bench_config).await
+        } else {
+            Ok(())
+        };
+        if args.drop_temp {
+            drop_temp(&mut client, &query_id, &args).await?;
         }
+        read_result?;
         return Ok(());
     }
 
@@ -129,6 +138,29 @@ async fn main() -> Result<()> {
         "query {query_id} did not complete after {} polls",
         args.max_polls
     );
+}
+
+async fn drop_temp(client: &mut FlightClient, query_id: &str, args: &Args) -> Result<()> {
+    let mut body = Map::new();
+    body.insert("queryId".to_owned(), Value::String(query_id.to_owned()));
+    body.insert("user".to_owned(), Value::String(args.user.clone()));
+    insert_string(&mut body, "authorization", args.authorization.clone());
+    let action = Action {
+        r#type: "coordinator.drop-temp".to_owned(),
+        body: Bytes::from(json_bytes(Value::Object(body))),
+    };
+    let mut stream = client
+        .do_action(action)
+        .await
+        .context("coordinator drop-temp action failed")?;
+    let response = stream
+        .try_next()
+        .await?
+        .context("coordinator drop-temp action returned no result")?;
+    let value: Value =
+        serde_json::from_slice(&response).context("invalid drop-temp JSON response")?;
+    println!("drop_temp_result={}", serde_json::to_string(&value)?);
+    Ok(())
 }
 
 async fn read_results(info: &FlightInfo, args: &Args, config: &BenchConfig) -> Result<()> {

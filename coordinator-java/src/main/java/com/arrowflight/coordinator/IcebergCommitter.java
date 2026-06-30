@@ -17,11 +17,14 @@ import org.apache.iceberg.FileFormat;
 import org.apache.iceberg.Metrics;
 import org.apache.iceberg.MetricsConfig;
 import org.apache.iceberg.OverwriteFiles;
+import org.apache.iceberg.PartitionSpec;
+import org.apache.iceberg.Schema;
 import org.apache.iceberg.Snapshot;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.TableProperties;
 import org.apache.iceberg.catalog.Namespace;
 import org.apache.iceberg.catalog.TableIdentifier;
+import org.apache.iceberg.exceptions.AlreadyExistsException;
 import org.apache.iceberg.expressions.Expressions;
 import org.apache.iceberg.hadoop.HadoopInputFile;
 import org.apache.iceberg.hive.HiveCatalog;
@@ -120,6 +123,30 @@ final class IcebergCommitter {
         return new CommitOutcome(commitMode.value, snapshot.snapshotId(), recordCount, parquetBytes, summary);
     }
 
+    boolean tableExists(String tableName) {
+        return catalog.tableExists(tableIdentifier(tableName));
+    }
+
+    boolean createTableIfMissing(String tableName, Map<String, Object> arrowSchema, String location) {
+        TableIdentifier identifier = tableIdentifier(tableName);
+        if (catalog.tableExists(identifier)) {
+            return false;
+        }
+        Schema schema = IcebergSchemaPlanner.schema(arrowSchema);
+        LinkedHashMap<String, String> properties = new LinkedHashMap<>();
+        properties.put(TableProperties.DEFAULT_FILE_FORMAT, "parquet");
+        properties.put(
+                TableProperties.DEFAULT_NAME_MAPPING,
+                NameMappingParser.toJson(MappingUtil.create(schema))
+        );
+        try {
+            catalog.createTable(identifier, schema, PartitionSpec.unpartitioned(), location, properties);
+            return true;
+        } catch (AlreadyExistsException ignored) {
+            return false;
+        }
+    }
+
     private BuiltDataFile dataFile(Table table, UploadFile file) {
         String location = config.objectUriForPrefix(file.filePath());
         InputFile inputFile = HadoopInputFile.fromPath(new Path(location), hadoopConf);
@@ -184,7 +211,7 @@ final class IcebergCommitter {
         return TableIdentifier.of(Namespace.of(namespace), table);
     }
 
-    private static Configuration hadoopConfiguration(Config config) {
+    static Configuration hadoopConfiguration(Config config) {
         Configuration configuration = new Configuration();
         configuration.set("hive.metastore.uris", config.icebergCatalogUri);
         configuration.set("fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem");

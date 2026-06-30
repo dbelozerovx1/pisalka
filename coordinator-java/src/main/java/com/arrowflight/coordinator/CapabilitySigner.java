@@ -44,7 +44,7 @@ final class CapabilitySigner {
                 : config.stagingPrefixForOperation(operationId);
         String path = request.containsKey("path")
                 ? Config.normalizePath(String.valueOf(request.get("path")))
-                : Config.normalizePath(stagingPrefix + "/part-00000.parquet");
+                : Config.normalizePath(stagingPrefix + "/flight-" + java.util.UUID.randomUUID() + ".parquet");
 
         if (!path.startsWith(stagingPrefix + "/")) {
             throw new IllegalArgumentException("path must be inside stagingPrefix");

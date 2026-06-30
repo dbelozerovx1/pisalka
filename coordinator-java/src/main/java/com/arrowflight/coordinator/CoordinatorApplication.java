@@ -11,14 +11,16 @@ public final class CoordinatorApplication {
 
     public static void main(String[] args) throws Exception {
         Config config = Config.fromEnv();
+        CoordinatorMetrics metrics = new CoordinatorMetrics();
         CoordinatorService coordinator = new CoordinatorService(config);
-        CoordinatorFlightProducer producer = new CoordinatorFlightProducer(config, coordinator);
+        CoordinatorFlightProducer producer = new CoordinatorFlightProducer(config, coordinator, metrics);
         Location location = Location.forGrpcInsecure(
                 config.listenAddress.getHostString(),
                 config.listenAddress.getPort()
         );
 
-        try (BufferAllocator allocator = new RootAllocator();
+        try (CoordinatorMetricsServer ignored = CoordinatorMetricsServer.start(config, metrics);
+             BufferAllocator allocator = new RootAllocator();
              FlightServer server = FlightServer.builder(allocator, location, producer)
                      .maxInboundMessageSize(config.flightMaxMessageSize)
                      .build()

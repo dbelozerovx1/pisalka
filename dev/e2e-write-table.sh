@@ -133,7 +133,6 @@ streams="${E2E_STREAMS:-1}"
 target_file_size="${E2E_TARGET_FILE_SIZE:-64mb}"
 commit_mode="${E2E_COMMIT_MODE:-overwrite}"
 operation_id="${E2E_OPERATION_ID:-e2e-write-${safe_table}-${timestamp}}"
-staging_prefix="${E2E_STAGING_PREFIX:-coordinator/e2e/write/${operation_id}}"
 verify_limit="${E2E_VERIFY_LIMIT:-1}"
 
 start_stack
@@ -148,7 +147,6 @@ args=(
   --input "$input"
   --coordinator-uri "${E2E_COORDINATOR_URI:-http://coordinator:8088}"
   --operation-id "$operation_id"
-  --staging-prefix "$staging_prefix"
   --streams "$streams"
   --table-name "$table_name"
   --commit-mode "$commit_mode"

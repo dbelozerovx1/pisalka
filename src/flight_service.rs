@@ -32,7 +32,7 @@ use tokio::{
     time::{Instant as TokioInstant, sleep, timeout},
 };
 use tonic::{Request, Response, Status, Streaming};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::{
     admission::{GuardedResponseStream, PutAdmission, ReadAdmission},
@@ -708,10 +708,13 @@ impl WorkerFlightService {
 
         let key = descriptor_to_object_key(first.flight_descriptor.as_ref());
         let put_options = parse_put_options(&first.app_metadata)?;
-        let put_context = self.build_put_context(&key, &put_options)?;
+        let put_context = self
+            .build_put_context(&key, &put_options)
+            .map_err(|status| status_with_put_options(status, &put_options))?;
         let (admission_guard, worker_summary) = match self.admit_put(&put_context).await {
             Ok(admission) => admission,
             Err(status) => {
+                let status = status_with_put_context(status, &put_context);
                 let record = self.put_start_record(&key, &put_context, None, &put_options);
                 self.record_put_rejected(&record, &status).await?;
                 return Err(status);
@@ -722,6 +725,11 @@ impl WorkerFlightService {
         self.record_put_admitted(&start_record).await?;
 
         let attempt_id = worker_summary.attempt_id.clone();
+        let error_operation_id = put_context.operation_id.clone();
+        let error_upload_id = put_context.upload_id.clone();
+        let error_stream_id = put_context.stream_id.clone();
+        let cleanup_key = key.clone();
+        let cleanup_target_file_size = put_context.target_file_size;
         let result = async {
             let profile_enabled = put_options.profile;
             let path = path_from_key(&key);
@@ -815,9 +823,66 @@ impl WorkerFlightService {
                 Ok(summary)
             }
             Err(status) => {
+                let status = status_with_worker_context(
+                    status,
+                    error_operation_id.as_deref(),
+                    error_upload_id.as_deref(),
+                    error_stream_id.as_deref(),
+                    Some(&attempt_id),
+                );
                 self.record_put_failed(&attempt_id, &status).await;
+                self.cleanup_failed_put_objects(&cleanup_key, cleanup_target_file_size)
+                    .await;
                 Err(status)
             }
+        }
+    }
+
+    async fn cleanup_failed_put_objects(&self, key: &str, target_file_size: Option<usize>) {
+        let path = path_from_key(key);
+        match self.store.delete(&path).await {
+            Ok(()) => info!(key = %key, "deleted failed DoPut object"),
+            Err(error) => warn!(
+                key = %key,
+                error = %error,
+                "failed DoPut exact-object cleanup skipped or failed"
+            ),
+        }
+
+        if target_file_size.is_none() {
+            return;
+        }
+
+        let prefix = Path::from(dataset_parts_prefix(key));
+        let mut deleted = 0usize;
+        let mut listed = self.store.list(Some(&prefix));
+        while let Some(item) = listed.next().await {
+            match item {
+                Ok(meta) => match self.store.delete(&meta.location).await {
+                    Ok(()) => deleted += 1,
+                    Err(error) => warn!(
+                        path = %meta.location,
+                        error = %error,
+                        "failed DoPut part cleanup skipped or failed"
+                    ),
+                },
+                Err(error) => {
+                    warn!(
+                        prefix = %prefix,
+                        error = %error,
+                        "failed DoPut part cleanup listing failed"
+                    );
+                    break;
+                }
+            }
+        }
+        if deleted > 0 {
+            info!(
+                key = %key,
+                prefix = %prefix,
+                deleted,
+                "deleted failed DoPut part objects"
+            );
         }
     }
 
@@ -1697,8 +1762,12 @@ fn flight_data_size(data: &FlightData) -> u64 {
 }
 
 fn dataset_part_key(key: &str, part_index: usize) -> String {
+    format!("{}-part-{part_index:05}.parquet", dataset_parts_prefix(key))
+}
+
+fn dataset_parts_prefix(key: &str) -> String {
     let stem = key.strip_suffix(".parquet").unwrap_or(key);
-    format!("{stem}.parts/part-{part_index:05}.parquet")
+    stem.to_owned()
 }
 
 fn part_profile_summaries(parts: &[DatasetPart]) -> Vec<PartProfileSummary> {
@@ -2069,6 +2138,64 @@ fn status_from_flight_error(error: FlightError) -> Status {
 
 fn status_from_anyhow(error: impl std::error::Error) -> Status {
     Status::internal(error.to_string())
+}
+
+fn status_with_put_options(status: Status, options: &PutOptions) -> Status {
+    status_with_worker_context(
+        status,
+        None,
+        options.upload_id.as_deref(),
+        options.stream_id.as_deref(),
+        options.attempt_id.as_deref(),
+    )
+}
+
+fn status_with_put_context(status: Status, context: &PutContext) -> Status {
+    status_with_worker_context(
+        status,
+        context.operation_id.as_deref(),
+        context.upload_id.as_deref(),
+        context.stream_id.as_deref(),
+        Some(&context.attempt_id),
+    )
+}
+
+fn status_with_worker_context(
+    status: Status,
+    operation_id: Option<&str>,
+    upload_id: Option<&str>,
+    stream_id: Option<&str>,
+    attempt_id: Option<&str>,
+) -> Status {
+    if status.message().starts_with("errorId=worker-err-") {
+        return status;
+    }
+
+    let code = status.code();
+    let message = status.message().to_owned();
+    let mut out = format!(
+        "errorId=worker-err-{}",
+        uuid::Uuid::new_v4().to_string().replace('-', "")
+    );
+    if let Some(operation_id) = operation_id.filter(|value| !value.is_empty()) {
+        out.push_str(" operationId=");
+        out.push_str(operation_id);
+    }
+    if let Some(upload_id) = upload_id.filter(|value| !value.is_empty()) {
+        out.push_str(" uploadId=");
+        out.push_str(upload_id);
+    }
+    if let Some(stream_id) = stream_id.filter(|value| !value.is_empty()) {
+        out.push_str(" streamId=");
+        out.push_str(stream_id);
+    }
+    if let Some(attempt_id) = attempt_id.filter(|value| !value.is_empty()) {
+        out.push_str(" attemptId=");
+        out.push_str(attempt_id);
+    }
+    out.push_str(": ");
+    out.push_str(&message);
+    Status::new(code, out)
 }
 
 pub fn status_from_context(error: anyhow::Error) -> Status {

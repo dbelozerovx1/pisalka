@@ -53,9 +53,10 @@ final class CoordinatorMetadataStore {
                             target_file_size,
                             max_stream_bytes,
                             max_record_batch_bytes,
+                            commit_mode,
                             expires_at,
                             updated_at
-                        ) VALUES (?, ?, ?, 'PLANNED', ?, ?, ?, ?, ?, ?, now())
+                        ) VALUES (?, ?, ?, 'PLANNED', ?, ?, ?, ?, ?, ?, ?, now())
                         """)) {
                     statement.setString(1, session.uploadId());
                     statement.setString(2, session.operationId());
@@ -65,7 +66,8 @@ final class CoordinatorMetadataStore {
                     statement.setLong(6, session.targetFileSize());
                     setNullableLong(statement, 7, session.maxStreamBytes());
                     setNullableLong(statement, 8, session.maxRecordBatchBytes());
-                    statement.setTimestamp(9, Timestamp.from(session.expiresAt()));
+                    statement.setString(9, session.commitMode());
+                    statement.setTimestamp(10, Timestamp.from(session.expiresAt()));
                     statement.executeUpdate();
                 }
 
@@ -401,6 +403,32 @@ final class CoordinatorMetadataStore {
             }
         } catch (SQLException error) {
             throw new IllegalStateException("failed to mark query failed", error);
+        }
+    }
+
+    void markQueryDropped(String queryId, Map<String, Object> resultFlightInfoJson) {
+        requireEnabled();
+        try (Connection connection = connect();
+             PreparedStatement statement = connection.prepareStatement("""
+                     UPDATE coordinator_query_registry
+                     SET status = 'DROPPED',
+                         trino_next_uri = NULL,
+                         progress = 1.0,
+                         error_message = NULL,
+                         result_flight_info_json = ?,
+                         result_tickets_json = ?,
+                         updated_at = now(),
+                         completed_at = COALESCE(completed_at, now())
+                     WHERE query_id = ?
+                     """)) {
+            statement.setObject(1, jsonb(resultFlightInfoJson), Types.OTHER);
+            statement.setObject(2, jsonb(Map.of("tickets", List.of())), Types.OTHER);
+            statement.setString(3, queryId);
+            if (statement.executeUpdate() == 0) {
+                throw new CoordinatorException(404, "query registry row was not found");
+            }
+        } catch (SQLException error) {
+            throw new IllegalStateException("failed to mark query dropped", error);
         }
     }
 
@@ -859,7 +887,7 @@ record QueryRegistryRecord(
         Optional<Instant> completedAt
 ) {
     boolean terminal() {
-        return status.equals("SUCCEEDED") || status.equals("FAILED") || status.equals("EXPIRED");
+        return status.equals("SUCCEEDED") || status.equals("FAILED") || status.equals("EXPIRED") || status.equals("DROPPED");
     }
 
     Map<String, Object> statusJson() {
@@ -890,6 +918,7 @@ record PlannedUploadSession(
         long targetFileSize,
         Optional<Long> maxStreamBytes,
         Optional<Long> maxRecordBatchBytes,
+        String commitMode,
         Instant expiresAt
 ) {
 }

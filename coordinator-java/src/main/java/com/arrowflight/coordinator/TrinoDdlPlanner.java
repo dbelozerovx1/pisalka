@@ -63,7 +63,10 @@ final class TrinoDdlPlanner {
             case "Utf8", "LargeUtf8", "Utf8View" -> "varchar";
             case "Binary", "LargeBinary", "BinaryView", "FixedSizeBinary" -> "varbinary";
             case "Date32" -> "date";
-            case "Date64" -> "timestamp(3)";
+            case "Date64" -> {
+                ArrowSchemaConstraints.rejectDate64AsTimestamp();
+                yield "timestamp(6)";
+            }
             case "Timestamp" -> timestampType(type);
             case "Time32", "Time64" -> timeType(type);
             case "Duration", "Interval" -> "varchar";
@@ -79,9 +82,9 @@ final class TrinoDdlPlanner {
     }
 
     private static String timestampType(Map<String, Object> type) {
-        String precision = precisionForUnit(Json.string(type, "unit"));
+        ArrowSchemaConstraints.requireMicrosecondTimestamp(type);
         Object timezone = type.get("timezone");
-        return timezone == null ? "timestamp(" + precision + ")" : "timestamp(" + precision + ") with time zone";
+        return timezone == null ? "timestamp(6)" : "timestamp(6) with time zone";
     }
 
     private static String timeType(Map<String, Object> type) {

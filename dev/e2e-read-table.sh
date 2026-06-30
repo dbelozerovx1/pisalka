@@ -22,10 +22,10 @@ and prints a small Arrow table preview to the console.
 Useful env:
   E2E_READ_LIMIT=20
   E2E_READ_SQL='SELECT ...'
-  E2E_TARGET_TABLE=iceberg.arrow.my_read_tmp
+  E2E_TARGET_TABLE=iceberg.arrow.my_read_tmp  # optional debug override
   E2E_PREVIEW_ROWS=20
   E2E_READ_MAX_ENDPOINTS=
-  E2E_DROP_CTAS_AFTER=false
+  E2E_DROP_TEMP_AFTER=true
   E2E_START_STACK=true
 USAGE
 }
@@ -103,11 +103,10 @@ fi
 source_table="$(qualify_table "$raw_table")"
 source_catalog="$(table_part "$source_table" catalog)"
 source_schema="$(table_part "$source_table" schema)"
-safe_table="$(printf '%s' "$source_table" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9_' '_')"
-timestamp="$(date +%Y%m%d_%H%M%S)"
-target_table="$(qualify_table "${E2E_TARGET_TABLE:-${source_schema}.e2e_read_${safe_table}_${timestamp}}")"
-target_catalog="$(table_part "$target_table" catalog)"
-target_schema="$(table_part "$target_table" schema)"
+target_table=""
+if [[ -n "${E2E_TARGET_TABLE:-}" ]]; then
+  target_table="$(qualify_table "$E2E_TARGET_TABLE")"
+fi
 read_limit="${E2E_READ_LIMIT:-20}"
 
 if [[ -n "${E2E_READ_SQL:-}" ]]; then
@@ -124,20 +123,31 @@ fi
 start_stack
 
 echo "source_table=$source_table"
-echo "ctas_table=$target_table"
+if [[ -n "$target_table" ]]; then
+  target_catalog="$(table_part "$target_table" catalog)"
+  target_schema="$(table_part "$target_table" schema)"
+  echo "ctas_table=$target_table"
+  echo "ensuring_schema=$target_catalog.$target_schema"
+  docker compose run --rm --entrypoint python trino-init \
+    /run_sql.py "CREATE SCHEMA IF NOT EXISTS $target_catalog.$target_schema"
+else
+  echo "ctas_table=<coordinator-generated-from-query-id>"
+fi
 echo "ctas_sql=$sql"
-echo "ensuring_schema=$target_catalog.$target_schema"
-docker compose run --rm --entrypoint python trino-init \
-  /run_sql.py "CREATE SCHEMA IF NOT EXISTS $target_catalog.$target_schema"
 
 args=(
   --coordinator-uri "${E2E_COORDINATOR_URI:-http://coordinator:8088}"
   --sql "$sql"
-  --target-table "$target_table"
   --read-results
   --preview-rows "${E2E_PREVIEW_ROWS:-20}"
 )
 
+if [[ -n "$target_table" ]]; then
+  args+=(--target-table "$target_table")
+fi
+if bool_enabled "${E2E_DROP_TEMP_AFTER:-${E2E_DROP_CTAS_AFTER:-true}}"; then
+  args+=(--drop-temp)
+fi
 if [[ -n "${E2E_READ_MAX_ENDPOINTS:-}" ]]; then
   args+=(--read-max-endpoints "$E2E_READ_MAX_ENDPOINTS")
 fi
@@ -163,13 +173,8 @@ docker compose run --rm \
   -u COORDINATOR_READ_RESULTS \
   -u COORDINATOR_READ_MAX_ENDPOINTS \
   -u COORDINATOR_PREVIEW_ROWS \
+  -u COORDINATOR_DROP_TEMP \
   -u TRINO_USER \
   -u TRINO_AUTHORIZATION \
   coordinator-query \
   "${args[@]}"
-
-if bool_enabled "${E2E_DROP_CTAS_AFTER:-false}"; then
-  echo "dropping_ctas_table=$target_table"
-  docker compose run --rm --entrypoint python trino-init \
-    /run_sql.py "DROP TABLE IF EXISTS $target_table"
-fi

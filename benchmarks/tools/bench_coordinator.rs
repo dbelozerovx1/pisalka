@@ -273,6 +273,13 @@ async fn main() -> Result<()> {
             upload_id: args.upload_id.clone(),
             staging_prefix: args.staging_prefix.clone(),
             table_name: args.table_name.clone(),
+            commit_mode: if args.commit_mode == CommitMode::None {
+                None
+            } else {
+                Some(args.commit_mode.clone())
+            },
+            trino_user: args.trino_user.clone(),
+            trino_authorization: args.trino_authorization.clone(),
             streams: args.streams.max(1),
             target_file_size,
             max_stream_bytes,
@@ -512,6 +519,21 @@ impl CoordinatorClient {
         insert_string(&mut body, "uploadId", request.upload_id);
         insert_string(&mut body, "stagingPrefix", request.staging_prefix);
         insert_string(&mut body, "tableName", request.table_name);
+        if let Some(mode) = request.commit_mode {
+            body.insert(
+                "mode".to_owned(),
+                Value::String(
+                    match mode {
+                        CommitMode::None => "append",
+                        CommitMode::Append => "append",
+                        CommitMode::Overwrite => "overwrite",
+                    }
+                    .to_owned(),
+                ),
+            );
+        }
+        insert_string(&mut body, "user", request.trino_user);
+        insert_string(&mut body, "authorization", request.trino_authorization);
         insert_u64(&mut body, "targetFileSizeBytes", request.target_file_size);
         insert_u64(&mut body, "maxStreamBytes", request.max_stream_bytes);
         insert_u64(
@@ -674,6 +696,9 @@ struct CreateUploadRequest {
     upload_id: Option<String>,
     staging_prefix: Option<String>,
     table_name: Option<String>,
+    commit_mode: Option<CommitMode>,
+    trino_user: Option<String>,
+    trino_authorization: Option<String>,
     streams: usize,
     target_file_size: Option<u64>,
     max_stream_bytes: Option<u64>,
@@ -801,15 +826,24 @@ async fn run_put_stream(
     );
 
     let started = Instant::now();
+    let put_context = format!(
+        "uploadId={} streamId={} attemptId={} worker={} uri={} path={}",
+        ticket.upload_id,
+        ticket.stream_id,
+        ticket.attempt_id,
+        ticket.worker_id,
+        ticket.flight_uri,
+        ticket.descriptor_path
+    );
     let mut response = client
         .do_put(flight_stream)
         .await
-        .with_context(|| format!("DoPut stream {stream_index} failed to start"))?;
+        .with_context(|| format!("DoPut stream {stream_index} failed to start; {put_context}"))?;
     let mut put_results = Vec::new();
     while let Some(result) = response
         .try_next()
         .await
-        .with_context(|| format!("DoPut stream {stream_index} failed"))?
+        .with_context(|| format!("DoPut stream {stream_index} failed; {put_context}"))?
     {
         put_results.push(String::from_utf8_lossy(&result.app_metadata).into_owned());
     }
@@ -835,12 +869,16 @@ async fn run_get(ticket: GetTicketResponse, config: &BenchConfig) -> Result<GetR
     );
 
     let started = Instant::now();
+    let get_context = format!(
+        "worker={} uri={} path={} operationId={}",
+        ticket.worker_id, ticket.flight_uri, ticket.path, ticket.operation_id
+    );
     let mut stream = client
         .do_get(Ticket {
             ticket: Bytes::from(ticket.ticket.clone()),
         })
         .await
-        .with_context(|| format!("DoGet failed to start for {}", ticket.path))?;
+        .with_context(|| format!("DoGet failed to start; {get_context}"))?;
 
     let mut rows = 0usize;
     let mut batches = 0usize;
@@ -848,7 +886,7 @@ async fn run_get(ticket: GetTicketResponse, config: &BenchConfig) -> Result<GetR
     while let Some(batch) = stream
         .try_next()
         .await
-        .with_context(|| format!("DoGet stream failed for {}", ticket.path))?
+        .with_context(|| format!("DoGet stream failed; {get_context}"))?
     {
         rows += batch.num_rows();
         batches += 1;
