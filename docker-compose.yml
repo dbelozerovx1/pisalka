@@ -115,7 +115,7 @@ services:
       done;
       "
 
-  flight-server:
+  flight-server: &flight-server-service
     build:
       context: .
       target: server
@@ -126,7 +126,7 @@ services:
         condition: service_healthy
       metadata-migrate:
         condition: service_completed_successfully
-    environment:
+    environment: &flight-server-environment
       RUST_LOG: info
       FLIGHT_ADDR: 0.0.0.0:50051
       METRICS_ENABLED: "${METRICS_ENABLED:-true}"
@@ -188,11 +188,25 @@ services:
       - "50051:50051"
       - "9090:9090"
 
+  flight-server-2:
+    <<: *flight-server-service
+    environment:
+      <<: *flight-server-environment
+      WORKER_ID: "${WORKER_2_ID:-local-worker-2}"
+      WORKER_FLIGHT_URI: "${WORKER_2_FLIGHT_URI:-http://flight-server-2:50051}"
+      WORKER_ZONE: "${WORKER_2_ZONE:-${WORKER_ZONE:-}}"
+      WORKER_DRAINING: "${WORKER_2_DRAINING:-false}"
+    ports:
+      - "50052:50051"
+      - "9092:9090"
+
   coordinator:
     build:
       context: ./coordinator-java
     depends_on:
       flight-server:
+        condition: service_started
+      flight-server-2:
         condition: service_started
       trino-init:
         condition: service_completed_successfully
@@ -243,6 +257,7 @@ services:
       target: bench
     depends_on:
       - flight-server
+      - flight-server-2
     environment:
       FLIGHT_URI: "${BENCH_FLIGHT_URI:-http://flight-server:50051}"
       COORDINATOR_URI: "${BENCH_COORDINATOR_URI:-http://coordinator:8088}"

@@ -14,7 +14,7 @@ if [[ "${BENCH_SKIP_UP:-false}" != "true" ]]; then
       export WORKER_REQUIRE_STRUCTURED_TICKETS="${WORKER_REQUIRE_STRUCTURED_TICKETS:-true}"
       export PUT_REQUIRE_STAGING_PREFIX="${PUT_REQUIRE_STAGING_PREFIX:-true}"
       export COORDINATOR_CAPABILITY_SECRET="${COORDINATOR_CAPABILITY_SECRET:-$WORKER_CAPABILITY_SECRET}"
-      docker compose --profile bench up -d --build flight-server coordinator trino-init
+      docker compose --profile bench up -d --build flight-server flight-server-2 coordinator trino-init
       ;;
     *)
       docker compose up -d --build flight-server

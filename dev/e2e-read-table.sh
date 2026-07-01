@@ -80,7 +80,7 @@ start_stack() {
     up_args+=(--force-recreate)
   fi
 
-  docker compose --profile bench build bench flight-server coordinator
+  docker compose --profile bench build bench flight-server flight-server-2 coordinator
   docker compose "${up_args[@]}" \
     minio \
     minio-create-bucket \
@@ -90,6 +90,7 @@ start_stack() {
     trino \
     trino-init \
     flight-server \
+    flight-server-2 \
     coordinator
   docker compose run --rm metadata-migrate
 }

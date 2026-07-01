@@ -24,7 +24,7 @@ export COORDINATOR_ADMIN_TOKEN="${COORDINATOR_ADMIN_TOKEN:-}"
 export TRINO_URI="${TRINO_URI:-http://trino:8080}"
 
 echo "starting_compose_stack=true"
-docker compose --profile bench build bench flight-server coordinator
+docker compose --profile bench build bench flight-server flight-server-2 coordinator
 docker compose --profile bench up -d --build --force-recreate \
   minio \
   minio-create-bucket \
@@ -34,6 +34,7 @@ docker compose --profile bench up -d --build --force-recreate \
   trino \
   trino-init \
   flight-server \
+  flight-server-2 \
   coordinator
 docker compose run --rm metadata-migrate
 

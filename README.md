@@ -37,7 +37,7 @@ Start everything in Docker:
 ./dev/up.sh
 ```
 
-The Compose file contains MinIO, a standalone Hive Metastore, Trino with an Iceberg catalog, the Rust worker, and the Java coordinator. Trino is exposed on `http://127.0.0.1:8080`, the coordinator Arrow Flight service is exposed at `http://127.0.0.1:8088`, coordinator metrics are exposed at `http://127.0.0.1:9091`, and the worker Arrow Flight service is exposed at `http://127.0.0.1:50051`.
+The Compose file contains MinIO, a standalone Hive Metastore, Trino with an Iceberg catalog, two Rust workers, and the Java coordinator. Trino is exposed on `http://127.0.0.1:8080`, the coordinator Arrow Flight service is exposed at `http://127.0.0.1:8088`, coordinator metrics are exposed at `http://127.0.0.1:9091`, worker `local-worker` is exposed at `http://127.0.0.1:50051` with metrics on `http://127.0.0.1:9090`, and worker `local-worker-2` is exposed at `http://127.0.0.1:50052` with metrics on `http://127.0.0.1:9092`.
 
 `trino-init` waits for Trino and best-effort creates the Iceberg schema. Keep `TRINO_INIT_REQUIRE_SCHEMA=false` for raw Flight worker smoke tests; set it to `true` when testing strict Iceberg schema bootstrap.
 
