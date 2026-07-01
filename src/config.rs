@@ -213,37 +213,37 @@ impl WorkerConfig {
             flight_uri: env_string("WORKER_FLIGHT_URI", "http://127.0.0.1:50051"),
             zone: env_optional_string("WORKER_ZONE"),
             draining: env_bool("WORKER_DRAINING", false),
-            max_active_put_streams: env_usize_auto("PUT_MAX_ACTIVE_STREAMS", auto_put_streams)?
+            max_active_put_streams: env_count_auto("PUT_MAX_ACTIVE_STREAMS", auto_put_streams)?
                 .max(1),
-            max_put_streams_per_upload: env_usize_auto(
+            max_put_streams_per_upload: env_count_auto(
                 "PUT_MAX_STREAMS_PER_UPLOAD",
                 auto_put_streams.min(4),
             )?
             .max(1),
-            put_scheduler_reserved_slots: env_usize_auto(
+            put_scheduler_reserved_slots: env_count_auto(
                 "PUT_SCHEDULER_RESERVED_SLOTS",
                 auto_reserved_slots(auto_put_streams),
             )?,
-            put_slot_wait_ms: env_usize("PUT_SLOT_WAIT_MS", 30_000)? as u64,
-            put_first_batch_timeout_ms: env_usize("PUT_FIRST_BATCH_TIMEOUT_MS", 10_000)? as u64,
+            put_slot_wait_ms: env_count("PUT_SLOT_WAIT_MS", 30_000)? as u64,
+            put_first_batch_timeout_ms: env_count("PUT_FIRST_BATCH_TIMEOUT_MS", 10_000)? as u64,
             max_put_stream_bytes: env_optional_u64("PUT_MAX_STREAM_BYTES")?,
             require_staging_prefix: env_bool("PUT_REQUIRE_STAGING_PREFIX", false),
-            max_active_read_streams: env_usize_auto("READ_MAX_ACTIVE_STREAMS", auto_read_streams)?
+            max_active_read_streams: env_count_auto("READ_MAX_ACTIVE_STREAMS", auto_read_streams)?
                 .max(1),
-            max_read_streams_per_operation: env_usize_auto(
+            max_read_streams_per_operation: env_count_auto(
                 "READ_MAX_STREAMS_PER_OPERATION",
                 auto_read_streams.min(8),
             )?
             .max(1),
-            read_scheduler_reserved_slots: env_usize_auto(
+            read_scheduler_reserved_slots: env_count_auto(
                 "READ_SCHEDULER_RESERVED_SLOTS",
                 auto_reserved_slots(auto_read_streams),
             )?,
-            read_slot_wait_ms: env_usize("READ_SLOT_WAIT_MS", 30_000)? as u64,
+            read_slot_wait_ms: env_count("READ_SLOT_WAIT_MS", 30_000)? as u64,
             require_structured_tickets: env_bool("WORKER_REQUIRE_STRUCTURED_TICKETS", false),
-            registry_heartbeat_interval_ms: env_usize("WORKER_HEARTBEAT_INTERVAL_MS", 5_000)?
+            registry_heartbeat_interval_ms: env_count("WORKER_HEARTBEAT_INTERVAL_MS", 5_000)?
                 as u64,
-            registry_ttl_ms: env_usize("WORKER_REGISTRY_TTL_MS", 15_000)? as u64,
+            registry_ttl_ms: env_count("WORKER_REGISTRY_TTL_MS", 15_000)? as u64,
         })
     }
 }
@@ -414,13 +414,25 @@ fn env_usize(key: &str, default: usize) -> Result<usize> {
     }
 }
 
-fn env_usize_auto(key: &str, default: usize) -> Result<usize> {
+fn env_count(key: &str, default: usize) -> Result<usize> {
+    match env::var(key) {
+        Ok(value) => value
+            .trim()
+            .parse::<usize>()
+            .with_context(|| format!("{key} must be an integer")),
+        Err(_) => Ok(default),
+    }
+}
+
+fn env_count_auto(key: &str, default: usize) -> Result<usize> {
     match env::var(key) {
         Ok(value) if value.trim().is_empty() || value.trim().eq_ignore_ascii_case("auto") => {
             Ok(default)
         }
-        Ok(value) => crate::util::parse_size(&value)
-            .with_context(|| format!("{key} must be auto, a number, or a size-like integer")),
+        Ok(value) => value
+            .trim()
+            .parse::<usize>()
+            .with_context(|| format!("{key} must be auto or an integer")),
         Err(_) => Ok(default),
     }
 }

@@ -116,6 +116,7 @@ services:
       "
 
   flight-server: &flight-server-service
+    image: "${FLIGHT_SERVER_IMAGE:-arrow-flight-s3-mvp-flight-server:local}"
     build:
       context: .
       target: server
