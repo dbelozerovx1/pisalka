@@ -46,6 +46,16 @@ final class Config {
     final long defaultGetMaxRecordBatchBytes;
     final int flightMaxMessageSize;
     final Duration trinoRequestTimeout;
+    final boolean workerClientEndpointsRequired;
+    final long workerClientEndpointTtlMs;
+    final boolean k8sWorkerDiscoveryEnabled;
+    final String k8sNamespace;
+    final String k8sWorkerServiceSelector;
+    final String k8sWorkerIdLabel;
+    final String k8sWorkerFlightPortName;
+    final String workerClientUriScheme;
+    final long k8sInformerResyncMs;
+    final long k8sInformerInitialSyncTimeoutMs;
 
     private Config(
             InetSocketAddress listenAddress,
@@ -85,7 +95,17 @@ final class Config {
             int defaultGetMaxBatchRows,
             long defaultGetMaxRecordBatchBytes,
             int flightMaxMessageSize,
-            Duration trinoRequestTimeout
+            Duration trinoRequestTimeout,
+            boolean workerClientEndpointsRequired,
+            long workerClientEndpointTtlMs,
+            boolean k8sWorkerDiscoveryEnabled,
+            String k8sNamespace,
+            String k8sWorkerServiceSelector,
+            String k8sWorkerIdLabel,
+            String k8sWorkerFlightPortName,
+            String workerClientUriScheme,
+            long k8sInformerResyncMs,
+            long k8sInformerInitialSyncTimeoutMs
     ) {
         this.listenAddress = listenAddress;
         this.coordinatorMetricsEnabled = coordinatorMetricsEnabled;
@@ -125,10 +145,21 @@ final class Config {
         this.defaultGetMaxRecordBatchBytes = defaultGetMaxRecordBatchBytes;
         this.flightMaxMessageSize = flightMaxMessageSize;
         this.trinoRequestTimeout = trinoRequestTimeout;
+        this.workerClientEndpointsRequired = workerClientEndpointsRequired;
+        this.workerClientEndpointTtlMs = workerClientEndpointTtlMs;
+        this.k8sWorkerDiscoveryEnabled = k8sWorkerDiscoveryEnabled;
+        this.k8sNamespace = k8sNamespace;
+        this.k8sWorkerServiceSelector = k8sWorkerServiceSelector;
+        this.k8sWorkerIdLabel = k8sWorkerIdLabel;
+        this.k8sWorkerFlightPortName = k8sWorkerFlightPortName;
+        this.workerClientUriScheme = workerClientUriScheme;
+        this.k8sInformerResyncMs = k8sInformerResyncMs;
+        this.k8sInformerInitialSyncTimeoutMs = k8sInformerInitialSyncTimeoutMs;
     }
 
     static Config fromEnv() {
         long capabilityTtlMs = envLong("COORDINATOR_CAPABILITY_TTL_MS", 15 * 60 * 1000L);
+        boolean k8sWorkerDiscoveryEnabled = envBool("COORDINATOR_K8S_WORKER_DISCOVERY_ENABLED", false);
         return new Config(
                 parseListenAddress(env("COORDINATOR_ADDR", "0.0.0.0:8088"), "COORDINATOR_ADDR"),
                 envBool("COORDINATOR_METRICS_ENABLED", true),
@@ -167,7 +198,17 @@ final class Config {
                 envInt("COORDINATOR_DEFAULT_GET_MAX_BATCH_ROWS", 65_536),
                 envLong("COORDINATOR_DEFAULT_GET_MAX_RECORD_BATCH_BYTES", 128L * 1024 * 1024),
                 envInt("FLIGHT_MAX_MESSAGE_SIZE", 256 * 1024 * 1024),
-                Duration.ofMillis(envLong("TRINO_REQUEST_TIMEOUT_MS", 30_000))
+                Duration.ofMillis(envLong("TRINO_REQUEST_TIMEOUT_MS", 30_000)),
+                envBool("COORDINATOR_WORKER_CLIENT_ENDPOINTS_REQUIRED", k8sWorkerDiscoveryEnabled),
+                envLong("COORDINATOR_WORKER_CLIENT_ENDPOINT_TTL_MS", 2 * 60 * 1000L),
+                k8sWorkerDiscoveryEnabled,
+                env("COORDINATOR_K8S_NAMESPACE", env("POD_NAMESPACE", "default")),
+                env("COORDINATOR_K8S_WORKER_SERVICE_SELECTOR", "role=flight-worker-client-endpoint"),
+                env("COORDINATOR_K8S_WORKER_ID_LABEL", "worker-id"),
+                env("COORDINATOR_K8S_WORKER_FLIGHT_PORT_NAME", "flight"),
+                normalizeUriScheme(env("COORDINATOR_WORKER_CLIENT_URI_SCHEME", "http")),
+                envLong("COORDINATOR_K8S_INFORMER_RESYNC_MS", 30_000L),
+                envLong("COORDINATOR_K8S_INFORMER_INITIAL_SYNC_TIMEOUT_MS", 30_000L)
         );
     }
 
@@ -239,6 +280,16 @@ final class Config {
             throw new IllegalArgumentException("COORDINATOR_OBJECT_STORE_URI_PREFIX must not be empty");
         }
         return value;
+    }
+
+    private static String normalizeUriScheme(String raw) {
+        String value = raw == null ? "" : raw.trim().toLowerCase(Locale.ROOT);
+        return switch (value) {
+            case "http", "https" -> value;
+            default -> throw new IllegalArgumentException(
+                    "COORDINATOR_WORKER_CLIENT_URI_SCHEME must be http or https"
+            );
+        };
     }
 
     private static String env(String key, String defaultValue) {

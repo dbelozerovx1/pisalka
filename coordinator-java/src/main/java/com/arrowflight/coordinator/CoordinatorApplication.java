@@ -19,7 +19,8 @@ public final class CoordinatorApplication {
                 config.listenAddress.getPort()
         );
 
-        try (CoordinatorMetricsServer ignored = CoordinatorMetricsServer.start(config, metrics);
+        try (WorkerEndpointDiscovery ignoredDiscovery = WorkerEndpointDiscovery.start(config, coordinator.metadataStore());
+             CoordinatorMetricsServer ignored = CoordinatorMetricsServer.start(config, metrics);
              BufferAllocator allocator = new RootAllocator();
              FlightServer server = FlightServer.builder(allocator, location, producer)
                      .maxInboundMessageSize(config.flightMaxMessageSize)

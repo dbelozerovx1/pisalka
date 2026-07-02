@@ -21,9 +21,11 @@ import java.util.Properties;
 import org.postgresql.util.PGobject;
 
 final class CoordinatorMetadataStore {
+    private final Config config;
     private final Optional<JdbcTarget> jdbcTarget;
 
     CoordinatorMetadataStore(Config config) {
+        this.config = config;
         this.jdbcTarget = config.metadataDatabaseUrl.map(CoordinatorMetadataStore::parseJdbcTarget);
     }
 
@@ -34,6 +36,50 @@ final class CoordinatorMetadataStore {
     void requireEnabled() {
         if (jdbcTarget.isEmpty()) {
             throw new CoordinatorException(503, "coordinator metadata database is not configured");
+        }
+    }
+
+    void upsertWorkerClientEndpoint(WorkerClientEndpoint endpoint) {
+        requireEnabled();
+        try (Connection connection = connect();
+             PreparedStatement statement = connection.prepareStatement("""
+                     INSERT INTO worker_client_endpoints (
+                         worker_id,
+                         flight_uri,
+                         source,
+                         observed_at,
+                         expires_at,
+                         error_message
+                     ) VALUES (?, ?, ?, now(), ?, ?)
+                     ON CONFLICT (worker_id) DO UPDATE SET
+                         flight_uri = EXCLUDED.flight_uri,
+                         source = EXCLUDED.source,
+                         observed_at = EXCLUDED.observed_at,
+                         expires_at = EXCLUDED.expires_at,
+                         error_message = EXCLUDED.error_message
+                     """)) {
+            statement.setString(1, endpoint.workerId());
+            statement.setString(2, endpoint.flightUri());
+            statement.setString(3, endpoint.source());
+            statement.setTimestamp(4, Timestamp.from(endpoint.expiresAt()));
+            statement.setString(5, endpoint.errorMessage().orElse(null));
+            statement.executeUpdate();
+        } catch (SQLException error) {
+            throw new IllegalStateException("failed to upsert worker client endpoint", error);
+        }
+    }
+
+    void deleteWorkerClientEndpoint(String workerId) {
+        requireEnabled();
+        try (Connection connection = connect();
+             PreparedStatement statement = connection.prepareStatement("""
+                     DELETE FROM worker_client_endpoints
+                     WHERE worker_id = ?
+                     """)) {
+            statement.setString(1, workerId);
+            statement.executeUpdate();
+        } catch (SQLException error) {
+            throw new IllegalStateException("failed to delete worker client endpoint", error);
         }
     }
 
@@ -163,6 +209,12 @@ final class CoordinatorMetadataStore {
             }
 
             if (assignments.isEmpty()) {
+                if (config.workerClientEndpointsRequired) {
+                    throw new CoordinatorException(
+                            503,
+                            "no live data-plane worker has available DoPut capacity and a fresh client endpoint"
+                    );
+                }
                 throw new CoordinatorException(503, "no live data-plane worker has available DoPut capacity");
             }
             return assignments;
@@ -173,29 +225,60 @@ final class CoordinatorMetadataStore {
 
     WorkerAssignment selectReadWorker() {
         requireEnabled();
+        String sql = config.workerClientEndpointsRequired
+                ? """
+                SELECT registry.worker_id,
+                       client.flight_uri,
+                       registry.read_recommended_streams,
+                       registry.read_selection_score,
+                       registry.read_utilization_per_mille,
+                       registry.read_admission_wait_ms_ewma,
+                       registry.read_throughput_bytes_per_sec_ewma,
+                       registry.last_heartbeat_at
+                FROM worker_registry registry
+                JOIN worker_client_endpoints client
+                  ON client.worker_id = registry.worker_id
+                 AND client.expires_at > now()
+                WHERE registry.state = 'ACTIVE'
+                  AND registry.draining = false
+                  AND registry.read_recommended_streams > 0
+                  AND extract(epoch FROM (now() - registry.last_heartbeat_at)) * 1000 <= registry.registry_ttl_ms
+                ORDER BY registry.read_selection_score DESC,
+                         registry.read_recommended_streams DESC,
+                         registry.read_admission_wait_ms_ewma ASC,
+                         registry.last_heartbeat_at DESC
+                LIMIT 1
+                """
+                : """
+                SELECT worker_id,
+                       flight_uri,
+                       read_recommended_streams,
+                       read_selection_score,
+                       read_utilization_per_mille,
+                       read_admission_wait_ms_ewma,
+                       read_throughput_bytes_per_sec_ewma,
+                       last_heartbeat_at
+                FROM worker_registry
+                WHERE state = 'ACTIVE'
+                  AND draining = false
+                  AND read_recommended_streams > 0
+                  AND extract(epoch FROM (now() - last_heartbeat_at)) * 1000 <= registry_ttl_ms
+                ORDER BY read_selection_score DESC,
+                         read_recommended_streams DESC,
+                         read_admission_wait_ms_ewma ASC,
+                         last_heartbeat_at DESC
+                LIMIT 1
+                """;
         try (Connection connection = connect();
-             PreparedStatement statement = connection.prepareStatement("""
-                     SELECT worker_id,
-                            flight_uri,
-                            read_recommended_streams,
-                            read_selection_score,
-                            read_utilization_per_mille,
-                            read_admission_wait_ms_ewma,
-                            read_throughput_bytes_per_sec_ewma,
-                            last_heartbeat_at
-                     FROM worker_registry
-                     WHERE state = 'ACTIVE'
-                       AND draining = false
-                       AND read_recommended_streams > 0
-                       AND extract(epoch FROM (now() - last_heartbeat_at)) * 1000 <= registry_ttl_ms
-                     ORDER BY read_selection_score DESC,
-                              read_recommended_streams DESC,
-                              read_admission_wait_ms_ewma ASC,
-                              last_heartbeat_at DESC
-                     LIMIT 1
-                     """)) {
+             PreparedStatement statement = connection.prepareStatement(sql)) {
             try (ResultSet rows = statement.executeQuery()) {
                 if (!rows.next()) {
+                    if (config.workerClientEndpointsRequired) {
+                        throw new CoordinatorException(
+                                503,
+                                "no live data-plane worker has available DoGet capacity and a fresh client endpoint"
+                        );
+                    }
                     throw new CoordinatorException(503, "no live data-plane worker has available DoGet capacity");
                 }
                 return new WorkerAssignment(
@@ -620,7 +703,30 @@ final class CoordinatorMetadataStore {
     }
 
     private List<WorkerRegistryEntry> loadPutCandidates(Connection connection) throws SQLException {
-        try (PreparedStatement statement = connection.prepareStatement("""
+        String sql = config.workerClientEndpointsRequired
+                ? """
+                SELECT registry.worker_id,
+                       client.flight_uri,
+                       registry.put_recommended_streams,
+                       registry.put_selection_score,
+                       registry.put_utilization_per_mille,
+                       registry.put_admission_wait_ms_ewma,
+                       registry.put_throughput_bytes_per_sec_ewma,
+                       registry.last_heartbeat_at
+                FROM worker_registry registry
+                JOIN worker_client_endpoints client
+                  ON client.worker_id = registry.worker_id
+                 AND client.expires_at > now()
+                WHERE registry.state = 'ACTIVE'
+                  AND registry.draining = false
+                  AND registry.put_recommended_streams > 0
+                  AND extract(epoch FROM (now() - registry.last_heartbeat_at)) * 1000 <= registry.registry_ttl_ms
+                ORDER BY registry.put_selection_score DESC,
+                         registry.put_recommended_streams DESC,
+                         registry.put_admission_wait_ms_ewma ASC,
+                         registry.last_heartbeat_at DESC
+                """
+                : """
                 SELECT worker_id,
                        flight_uri,
                        put_recommended_streams,
@@ -638,7 +744,8 @@ final class CoordinatorMetadataStore {
                          put_recommended_streams DESC,
                          put_admission_wait_ms_ewma ASC,
                          last_heartbeat_at DESC
-                """)) {
+                """;
+        try (PreparedStatement statement = connection.prepareStatement(sql)) {
             try (ResultSet rows = statement.executeQuery()) {
                 ArrayList<WorkerRegistryEntry> workers = new ArrayList<>();
                 while (rows.next()) {
@@ -1126,6 +1233,15 @@ record WorkerAssignment(
         body.put("throughputBytesPerSecEwma", throughputBytesPerSecEwma);
         return body;
     }
+}
+
+record WorkerClientEndpoint(
+        String workerId,
+        String flightUri,
+        String source,
+        Instant expiresAt,
+        Optional<String> errorMessage
+) {
 }
 
 record JdbcTarget(String jdbcUrl, Properties properties) {

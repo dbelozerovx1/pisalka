@@ -198,7 +198,7 @@ Useful environment variables:
 - `READ_SCHEDULER_RESERVED_SLOTS=auto` defaults to 1 only when the auto slot count is at least 4
 - `READ_SLOT_WAIT_MS=30000`
 - `WORKER_ZONE=` optional coordinator locality hint
-- `WORKER_FLIGHT_URI=http://127.0.0.1:50051` worker-published URI stored in `worker_registry`; in Docker Compose this defaults to `http://flight-server:50051`
+- `WORKER_FLIGHT_URI=http://127.0.0.1:50051` worker-published URI stored in `worker_registry`; in Docker Compose this defaults to `http://flight-server:50051`; in Kubernetes endpoint mode it may be internal because `worker_client_endpoints` supplies the final client URI
 - `WORKER_REQUIRE_STRUCTURED_TICKETS=false`
 - `WORKER_REQUIRE_SIGNED_CAPABILITIES=false`
 - `WORKER_CAPABILITY_SECRET=`
@@ -211,6 +211,12 @@ Useful environment variables:
 - `COORDINATOR_ADDR=0.0.0.0:8088`
 - `COORDINATOR_METRICS_ENABLED=true`
 - `COORDINATOR_METRICS_ADDR=0.0.0.0:9091`
+- `COORDINATOR_K8S_WORKER_DISCOVERY_ENABLED=false` watches labeled Kubernetes Services and writes client-routable worker endpoints to Postgres when enabled
+- `COORDINATOR_WORKER_CLIENT_ENDPOINTS_REQUIRED=false` requires a fresh `worker_client_endpoints` row during worker selection; defaults to `true` when Kubernetes discovery is enabled
+- `COORDINATOR_K8S_WORKER_SERVICE_SELECTOR=role=flight-worker-client-endpoint`
+- `COORDINATOR_K8S_WORKER_ID_LABEL=worker-id`
+- `COORDINATOR_K8S_WORKER_FLIGHT_PORT_NAME=flight`
+- `COORDINATOR_WORKER_CLIENT_URI_SCHEME=http`
 - `TRINO_VERSION=476`
 - `HIVE_VERSION=3.1.3`
 - `HIVE_PLATFORM=linux/amd64`
@@ -254,7 +260,7 @@ Standard Flight methods:
 
 Flight actions:
 
-- `coordinator.create-upload`: creates a durable upload session, selects workers from `worker_registry`, persists planned stream attempts, and returns one signed `DoPut` ticket per granted stream. Repeating the action with the same `uploadId` and same parameters can land on any coordinator replica and returns the persisted plan. When the planned mode is `overwrite` / `replace`, the coordinator first drops the target table through Trino and best-effort cleans the target table location, then issues tickets under the clean table `data/` directory.
+- `coordinator.create-upload`: creates a durable upload session, selects workers from `worker_registry`, resolves client endpoints when required, persists planned stream attempts, and returns one signed `DoPut` ticket per granted stream. Repeating the action with the same `uploadId` and same parameters can land on any coordinator replica and returns the persisted plan. When the planned mode is `overwrite` / `replace`, the coordinator first drops the target table through Trino and best-effort cleans the target table location, then issues tickets under the clean table `data/` directory.
 - `coordinator.commit-upload`: explicit commit gate. The client calls it after it considers all `DoPut` streams complete. The coordinator reads currently recorded worker file rows, loads or creates the Iceberg table metadata through the Hive catalog, collects Parquet footer metrics, and commits that DB-backed file list. `append` requires an existing table and checks the uploaded Arrow-derived Iceberg schema against the existing table schema before committing. `overwrite` is recreate-style when planned at `create-upload`: old table/location are removed before data moves, then the new table metadata is created from the recorded Arrow schema and committed with the uploaded files.
 - `coordinator.do-commit`: compatibility alias for `coordinator.commit-upload`.
 - `coordinator.abort-upload`: marks an upload `ABORTED` and best-effort deletes the upload staging prefix.
@@ -275,14 +281,15 @@ For multi-coordinator and multi-worker Kubernetes deployment shape, see [docs/k8
 Commit/readiness flow:
 
 1. Workers publish `worker_registry` heartbeats with their Flight URI, live read/write capacity, memory-derived recommended streams, utilization, EWMA wait/throughput, and selection score.
-2. `create-upload` selects active, non-draining, heartbeat-fresh workers from `worker_registry`; coordinator has no configured worker id/url.
-3. `create-upload` persists `coordinator_upload_sessions` and `coordinator_upload_streams` rows before data moves.
-4. Each worker `DoPut` persists its stream status, Arrow schema JSON from the first decoded batch, and written Parquet file rows in `worker_put_streams` / `worker_put_files`.
-5. The client decides when upload streams are complete and calls `commit-upload`.
-6. `commit-upload` appends or overwrites Iceberg with the exact files currently stored in `worker_put_files`. If the client commits too early, only files recorded at that moment are part of the table. For `overwrite`, the destructive table drop/location cleanup happens during `create-upload`, before new data files are written.
-7. A successful commit stores mode, table name, snapshot id, and commit summary on the upload session. Repeating `commit-upload` for an already committed upload returns the stored result instead of appending the same files again.
-8. If a coordinator dies or fails around the Iceberg commit boundary, a later `commit-upload` on any coordinator first checks Iceberg snapshots for `coordinator.upload-id` and repairs the DB row when the snapshot already landed.
-9. If commit fails before a committed Iceberg snapshot is visible, the coordinator marks the upload `FAILED`, best-effort deletes the upload's exact planned/recorded objects, and drops the table only for overwrite when the table did not exist before this commit attempt. Append failures never drop or clean the existing table location; only files recorded for this upload are cleaned. After a committed snapshot is visible, raw object deletion is skipped because the files are table data.
+2. In Kubernetes endpoint mode, the coordinator watches labeled worker Services and writes client-routable `ip:port` URIs into `worker_client_endpoints`.
+3. `create-upload` selects active, non-draining, heartbeat-fresh workers from `worker_registry`; when client endpoints are required, it also requires a fresh `worker_client_endpoints` row and returns that URI to the client.
+4. `create-upload` persists `coordinator_upload_sessions` and `coordinator_upload_streams` rows before data moves.
+5. Each worker `DoPut` persists its stream status, Arrow schema JSON from the first decoded batch, and written Parquet file rows in `worker_put_streams` / `worker_put_files`.
+6. The client decides when upload streams are complete and calls `commit-upload`.
+7. `commit-upload` appends or overwrites Iceberg with the exact files currently stored in `worker_put_files`. If the client commits too early, only files recorded at that moment are part of the table. For `overwrite`, the destructive table drop/location cleanup happens during `create-upload`, before new data files are written.
+8. A successful commit stores mode, table name, snapshot id, and commit summary on the upload session. Repeating `commit-upload` for an already committed upload returns the stored result instead of appending the same files again.
+9. If a coordinator dies or fails around the Iceberg commit boundary, a later `commit-upload` on any coordinator first checks Iceberg snapshots for `coordinator.upload-id` and repairs the DB row when the snapshot already landed.
+10. If commit fails before a committed Iceberg snapshot is visible, the coordinator marks the upload `FAILED`, best-effort deletes the upload's exact planned/recorded objects, and drops the table only for overwrite when the table did not exist before this commit attempt. Append failures never drop or clean the existing table location; only files recorded for this upload are cleaned. After a committed snapshot is visible, raw object deletion is skipped because the files are table data.
 
 Coordinator-created uploads place Parquet files under the Iceberg table data directory: `<warehouse>/<schema>/<table>/data/`. Each planned stream receives a `flight-<uuid>.parquet` descriptor path. Without `--file-size` / `TARGET_FILE_SIZE`, `DoPut` writes that single Parquet object. With a target file size, `DoPut` writes ordered sibling part files such as `flight-<uuid>-part-00000.parquet` under the same `data/` directory and returns the file list in the `DoPut` result and metadata DB. `PUT_PARALLELISM` controls the maximum number of active part writers. `DoGet` accepts a direct physical Parquet path ticket and streams that file back.
 
@@ -390,7 +397,7 @@ Coordinator-facing worker status shape:
 }
 ```
 
-Only the worker fields needed for coordinator scheduling are persisted into `worker_registry`: direct Flight URI, state/draining, read/write recommended streams, scores, utilization, admission wait EWMA, throughput EWMA, TTL, and heartbeat time. The full worker payload remains available through worker status actions and Prometheus metrics instead of being duplicated in Postgres.
+Only the worker fields needed for coordinator scheduling are persisted into `worker_registry`: worker-published Flight URI, state/draining, read/write recommended streams, scores, utilization, admission wait EWMA, throughput EWMA, TTL, and heartbeat time. When Kubernetes endpoint discovery is enabled, client-routable addresses live in `worker_client_endpoints`. The full worker payload remains available through worker status actions and Prometheus metrics instead of being duplicated in Postgres.
 
 Worker metrics are exposed as Prometheus text at `http://127.0.0.1:9090/metrics`; coordinator metrics are exposed at `http://127.0.0.1:9091/metrics`. Both listeners also expose cheap `/healthz` endpoints. Metrics are intentionally low-cardinality and request-level only: no per-batch metrics, no object-path labels, no upload-id labels, no query-id labels, and no `errorId` labels. This keeps the hot path to a few atomic increments while logs retain the exact request ids for investigation.
 

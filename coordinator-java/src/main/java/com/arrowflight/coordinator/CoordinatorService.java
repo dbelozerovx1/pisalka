@@ -36,6 +36,10 @@ final class CoordinatorService {
         return metadataStore.enabled();
     }
 
+    CoordinatorMetadataStore metadataStore() {
+        return metadataStore;
+    }
+
     Map<String, Object> configJson() {
         LinkedHashMap<String, Object> body = new LinkedHashMap<>();
         body.put("protocol", "arrow-flight");
@@ -53,6 +57,11 @@ final class CoordinatorService {
         body.put("metricsEnabled", config.coordinatorMetricsEnabled);
         body.put("metricsAddress", config.coordinatorMetricsAddress.toString());
         body.put("queryRegistryTtlMs", config.queryRegistryTtlMs);
+        body.put("workerClientEndpointsRequired", config.workerClientEndpointsRequired);
+        body.put("k8sWorkerDiscoveryEnabled", config.k8sWorkerDiscoveryEnabled);
+        body.put("k8sNamespace", config.k8sNamespace);
+        body.put("k8sWorkerServiceSelector", config.k8sWorkerServiceSelector);
+        body.put("workerClientUriScheme", config.workerClientUriScheme);
         body.put("tempCleanupAction", "coordinator.drop-temp");
         return body;
     }
