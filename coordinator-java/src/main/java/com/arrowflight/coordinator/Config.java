@@ -21,6 +21,7 @@ final class Config {
     final String icebergCatalogName;
     final String icebergCatalogUri;
     final String icebergWarehouse;
+    final boolean icebergHiveLockEnabled;
     final Optional<String> s3Endpoint;
     final String s3Region;
     final Optional<String> s3AccessKey;
@@ -71,6 +72,7 @@ final class Config {
             String icebergCatalogName,
             String icebergCatalogUri,
             String icebergWarehouse,
+            boolean icebergHiveLockEnabled,
             Optional<String> s3Endpoint,
             String s3Region,
             Optional<String> s3AccessKey,
@@ -120,6 +122,7 @@ final class Config {
         this.icebergCatalogName = icebergCatalogName;
         this.icebergCatalogUri = icebergCatalogUri;
         this.icebergWarehouse = normalizeObjectStoreUriPrefix(icebergWarehouse);
+        this.icebergHiveLockEnabled = icebergHiveLockEnabled;
         this.s3Endpoint = s3Endpoint;
         this.s3Region = s3Region;
         this.s3AccessKey = s3AccessKey;
@@ -174,6 +177,7 @@ final class Config {
                 env("ICEBERG_CATALOG_NAME", env("TRINO_CATALOG", "iceberg")),
                 env("ICEBERG_CATALOG_URI", "thrift://host.docker.internal:9083"),
                 env("ICEBERG_WAREHOUSE", env("COORDINATOR_OBJECT_STORE_URI_PREFIX", "s3://arrow-flight") + "/iceberg"),
+                envBool("ICEBERG_HIVE_LOCK_ENABLED", false),
                 envOptional("S3_ENDPOINT"),
                 env("AWS_REGION", env("S3_REGION", "us-east-1")),
                 envOptional("AWS_ACCESS_KEY_ID"),

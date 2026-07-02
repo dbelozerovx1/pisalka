@@ -51,6 +51,7 @@ final class CoordinatorService {
         body.put("icebergCatalogName", config.icebergCatalogName);
         body.put("icebergCatalogUri", config.icebergCatalogUri);
         body.put("icebergWarehouse", config.icebergWarehouse);
+        body.put("icebergHiveLockEnabled", config.icebergHiveLockEnabled);
         body.put("capabilitySigningConfigured", config.capabilitySecret.isPresent());
         body.put("adminTokenConfigured", config.adminToken.isPresent());
         body.put("metadataDatabaseConfigured", metadataStore.enabled());

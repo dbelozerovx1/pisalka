@@ -36,6 +36,9 @@ import org.apache.iceberg.types.CheckCompatibility;
 import org.apache.iceberg.types.Types;
 
 final class IcebergCommitter {
+    private static final String HIVE_LOCK_CONF = "iceberg.engine.hive.lock-enabled";
+    private static final String HIVE_LOCK_TABLE_PROPERTY = "engine.hive.lock-enabled";
+
     private final Config config;
     private final Configuration hadoopConf;
     private final HiveCatalog catalog;
@@ -45,11 +48,12 @@ final class IcebergCommitter {
         this.hadoopConf = hadoopConfiguration(config);
         this.catalog = new HiveCatalog();
         this.catalog.setConf(hadoopConf);
-        this.catalog.initialize(config.icebergCatalogName, Map.of(
-                CatalogProperties.URI, config.icebergCatalogUri,
-                CatalogProperties.WAREHOUSE_LOCATION, config.icebergWarehouse,
-                CatalogProperties.FILE_IO_IMPL, "org.apache.iceberg.hadoop.HadoopFileIO"
-        ));
+        LinkedHashMap<String, String> catalogProperties = new LinkedHashMap<>();
+        catalogProperties.put(CatalogProperties.URI, config.icebergCatalogUri);
+        catalogProperties.put(CatalogProperties.WAREHOUSE_LOCATION, config.icebergWarehouse);
+        catalogProperties.put(CatalogProperties.FILE_IO_IMPL, "org.apache.iceberg.hadoop.HadoopFileIO");
+        catalogProperties.put(HIVE_LOCK_CONF, Boolean.toString(config.icebergHiveLockEnabled));
+        this.catalog.initialize(config.icebergCatalogName, catalogProperties);
     }
 
     CommitOutcome commit(String uploadId, String tableName, String mode, List<UploadFile> files) {
@@ -217,6 +221,7 @@ final class IcebergCommitter {
                 TableProperties.DEFAULT_NAME_MAPPING,
                 NameMappingParser.toJson(MappingUtil.create(schema))
         );
+        properties.put(HIVE_LOCK_TABLE_PROPERTY, Boolean.toString(config.icebergHiveLockEnabled));
         try {
             catalog.createTable(identifier, schema, PartitionSpec.unpartitioned(), location, properties);
             return true;
@@ -331,6 +336,7 @@ final class IcebergCommitter {
     static Configuration hadoopConfiguration(Config config) {
         Configuration configuration = new Configuration();
         configuration.set("hive.metastore.uris", config.icebergCatalogUri);
+        configuration.setBoolean(HIVE_LOCK_CONF, config.icebergHiveLockEnabled);
         configuration.set("fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem");
         configuration.set("fs.s3.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem");
         configuration.set("fs.s3a.path.style.access", Boolean.toString(config.s3PathStyleAccess));

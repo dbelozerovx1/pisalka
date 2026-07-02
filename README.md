@@ -227,6 +227,7 @@ Useful environment variables:
 - `ICEBERG_CATALOG_NAME=iceberg`
 - `ICEBERG_CATALOG_URI=thrift://hive-metastore:9083`
 - `ICEBERG_WAREHOUSE=s3a://arrow-flight/iceberg`
+- `ICEBERG_HIVE_LOCK_ENABLED=false` disables Iceberg Hive metastore locks from the coordinator; this sets Hadoop config `iceberg.engine.hive.lock-enabled` and writes table property `engine.hive.lock-enabled` on coordinator-created tables
 - `CTAS_DEFAULT_CATALOG=iceberg`
 - `CTAS_DEFAULT_SCHEMA=arrow`
 - `COORDINATOR_CAPABILITY_SECRET=local-dev-secret`
