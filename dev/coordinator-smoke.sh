@@ -29,14 +29,12 @@ docker compose --profile bench up -d --build --force-recreate \
   minio \
   minio-create-bucket \
   metadata-db \
-  metadata-migrate \
   hive-metastore \
   trino \
   trino-init \
   flight-server \
   flight-server-2 \
   coordinator
-docker compose run --rm metadata-migrate
 
 echo "generating_input=$input size=$size"
 docker compose run --rm --entrypoint gen-arrow bench \

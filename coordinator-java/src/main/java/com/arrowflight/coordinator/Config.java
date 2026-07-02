@@ -31,6 +31,8 @@ final class Config {
     final Optional<String> capabilitySecret;
     final Optional<String> adminToken;
     final Optional<String> metadataDatabaseUrl;
+    final boolean metadataMigrationsEnabled;
+    final boolean metadataMigrationsBaselineOnMigrate;
     final long capabilityTtlMs;
     final long putCapabilityTtlMs;
     final long getCapabilityTtlMs;
@@ -82,6 +84,8 @@ final class Config {
             Optional<String> capabilitySecret,
             Optional<String> adminToken,
             Optional<String> metadataDatabaseUrl,
+            boolean metadataMigrationsEnabled,
+            boolean metadataMigrationsBaselineOnMigrate,
             long capabilityTtlMs,
             long putCapabilityTtlMs,
             long getCapabilityTtlMs,
@@ -132,6 +136,8 @@ final class Config {
         this.capabilitySecret = capabilitySecret;
         this.adminToken = adminToken;
         this.metadataDatabaseUrl = metadataDatabaseUrl;
+        this.metadataMigrationsEnabled = metadataMigrationsEnabled;
+        this.metadataMigrationsBaselineOnMigrate = metadataMigrationsBaselineOnMigrate;
         this.capabilityTtlMs = capabilityTtlMs;
         this.putCapabilityTtlMs = putCapabilityTtlMs;
         this.getCapabilityTtlMs = getCapabilityTtlMs;
@@ -187,6 +193,8 @@ final class Config {
                 envOptional("COORDINATOR_CAPABILITY_SECRET").or(() -> envOptional("WORKER_CAPABILITY_SECRET")),
                 envOptional("COORDINATOR_ADMIN_TOKEN"),
                 envOptional("COORDINATOR_METADATA_DATABASE_URL").or(() -> envOptional("METADATA_DATABASE_URL")),
+                envBool("COORDINATOR_METADATA_MIGRATIONS_ENABLED", true),
+                envBool("COORDINATOR_METADATA_MIGRATIONS_BASELINE_ON_MIGRATE", true),
                 capabilityTtlMs,
                 envLong("COORDINATOR_PUT_CAPABILITY_TTL_MS", capabilityTtlMs),
                 envLong("COORDINATOR_GET_CAPABILITY_TTL_MS", 5 * 60 * 1000L),

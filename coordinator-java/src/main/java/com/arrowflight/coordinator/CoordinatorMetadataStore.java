@@ -853,7 +853,7 @@ final class CoordinatorMetadataStore {
         return DriverManager.getConnection(target.jdbcUrl(), target.properties());
     }
 
-    private static JdbcTarget parseJdbcTarget(String raw) {
+    static JdbcTarget parseJdbcTarget(String raw) {
         if (raw.startsWith("jdbc:")) {
             return new JdbcTarget(raw, new Properties());
         }

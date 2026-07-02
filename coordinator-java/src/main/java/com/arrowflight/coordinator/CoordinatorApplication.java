@@ -11,6 +11,7 @@ public final class CoordinatorApplication {
 
     public static void main(String[] args) throws Exception {
         Config config = Config.fromEnv();
+        CoordinatorMigrations.migrate(config);
         CoordinatorMetrics metrics = new CoordinatorMetrics();
         CoordinatorService coordinator = new CoordinatorService(config);
         CoordinatorFlightProducer producer = new CoordinatorFlightProducer(coordinator, metrics);

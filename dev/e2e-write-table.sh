@@ -86,14 +86,12 @@ start_stack() {
     minio \
     minio-create-bucket \
     metadata-db \
-    metadata-migrate \
     hive-metastore \
     trino \
     trino-init \
     flight-server \
     flight-server-2 \
     coordinator
-  docker compose run --rm metadata-migrate
 }
 
 ensure_input() {

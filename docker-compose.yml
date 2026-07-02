@@ -98,23 +98,6 @@ services:
       timeout: 5s
       retries: 20
 
-  metadata-migrate:
-    image: postgres:16-alpine
-    depends_on:
-      metadata-db:
-        condition: service_healthy
-    environment:
-      PGPASSWORD: flight
-    volumes:
-      - ./db/migrations:/migrations:ro
-    entrypoint: >
-      /bin/sh -c "
-      for migration in /migrations/*.sql; do
-        echo applying $$migration;
-        psql -h metadata-db -U flight -d flight_metadata -v ON_ERROR_STOP=1 -f $$migration;
-      done;
-      "
-
   flight-server: &flight-server-service
     image: "${FLIGHT_SERVER_IMAGE:-arrow-flight-s3-mvp-flight-server:local}"
     build:
@@ -125,8 +108,6 @@ services:
         condition: service_completed_successfully
       metadata-db:
         condition: service_healthy
-      metadata-migrate:
-        condition: service_completed_successfully
     environment: &flight-server-environment
       RUST_LOG: info
       FLIGHT_ADDR: 0.0.0.0:50051
@@ -205,10 +186,8 @@ services:
     build:
       context: ./coordinator-java
     depends_on:
-      flight-server:
-        condition: service_started
-      flight-server-2:
-        condition: service_started
+      metadata-db:
+        condition: service_healthy
       trino-init:
         condition: service_completed_successfully
     environment:
@@ -218,6 +197,8 @@ services:
       COORDINATOR_ADMIN_TOKEN: "${COORDINATOR_ADMIN_TOKEN:-}"
       COORDINATOR_CAPABILITY_SECRET: "${COORDINATOR_CAPABILITY_SECRET:-local-dev-secret}"
       COORDINATOR_METADATA_DATABASE_URL: "${COORDINATOR_METADATA_DATABASE_URL:-postgres://flight:flight@metadata-db:5432/flight_metadata}"
+      COORDINATOR_METADATA_MIGRATIONS_ENABLED: "${COORDINATOR_METADATA_MIGRATIONS_ENABLED:-true}"
+      COORDINATOR_METADATA_MIGRATIONS_BASELINE_ON_MIGRATE: "${COORDINATOR_METADATA_MIGRATIONS_BASELINE_ON_MIGRATE:-true}"
       COORDINATOR_CAPABILITY_TTL_MS: "${COORDINATOR_CAPABILITY_TTL_MS:-900000}"
       COORDINATOR_PUT_CAPABILITY_TTL_MS: "${COORDINATOR_PUT_CAPABILITY_TTL_MS:-900000}"
       COORDINATOR_GET_CAPABILITY_TTL_MS: "${COORDINATOR_GET_CAPABILITY_TTL_MS:-300000}"

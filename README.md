@@ -16,8 +16,8 @@ Current MVP readiness, intentional Flight boundaries, and first Kubernetes test 
 - `src/resource.rs`: weighted memory-budget limiter used by admission and scheduler signals.
 - `src/ticket.rs`: worker `DoGet` ticket parser.
 - `src/metrics.rs`: low-overhead Prometheus text metrics endpoint.
-- `coordinator-java/`: dependency-light Java coordinator MVP for Trino CTAS and signed worker capability minting.
-- `db/migrations/`: SQL DDL owned by the control plane/coordinator in production. Local Compose applies it with `metadata-migrate`.
+- `coordinator-java/`: dependency-light Java coordinator MVP for Trino CTAS, signed worker capability minting, and Flyway metadata migrations.
+- `db/migrations/`: plain SQL DDL reference for the shared metadata schema.
 - `benchmarks/tools/`: benchmark/data-generation Rust binaries.
 - `benchmarks/tools/common/`: benchmark-only profiling/output helpers.
 - `benchmarks/scripts/`: benchmark shell entrypoints.
@@ -486,7 +486,7 @@ For compatibility with local benchmarks, raw path tickets are still allowed when
 
 That compatibility mode should not be exposed outside a trusted local/dev network.
 
-Worker metadata DDL lives in `db/migrations/0001_worker_metadata.sql`. The worker can still run this migration for local experiments with `METADATA_DB_AUTO_MIGRATE=true`, but the default is `false`; production should apply migrations from the coordinator/control-plane release process.
+The Java coordinator runs Flyway metadata migrations on startup by default when `COORDINATOR_METADATA_DATABASE_URL` is configured. Set `COORDINATOR_METADATA_MIGRATIONS_ENABLED=false` only when your deployment pipeline applies the same migrations before the coordinator starts. Workers should keep `METADATA_DB_AUTO_MIGRATE=false`; their old auto-migrate path is only for isolated local experiments.
 
 For real S3 over a slower link, try `PARQUET_COMPRESSION=lz4_raw` or `snappy`, and benchmark `TARGET_FILE_SIZE`, `PUT_PARALLELISM`, `S3_MULTIPART_PART_SIZE`, and `S3_MULTIPART_MAX_CONCURRENCY` as a set.
 
