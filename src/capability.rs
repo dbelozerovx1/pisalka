@@ -363,7 +363,7 @@ mod tests {
     fn worker() -> WorkerConfig {
         WorkerConfig {
             worker_id: "worker-1".to_owned(),
-            flight_uri: "http://worker-1:50051".to_owned(),
+            flight_uri: "grpc+tcp://worker-1:50051".to_owned(),
             zone: Some("zone-a".to_owned()),
             draining: false,
             max_active_put_streams: 16,

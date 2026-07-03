@@ -104,7 +104,7 @@ mod tests {
     fn worker(require_structured_tickets: bool) -> WorkerConfig {
         WorkerConfig {
             worker_id: "worker-1".to_owned(),
-            flight_uri: "http://worker-1:50051".to_owned(),
+            flight_uri: "grpc+tcp://worker-1:50051".to_owned(),
             zone: None,
             draining: false,
             max_active_put_streams: 16,

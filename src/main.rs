@@ -1,16 +1,16 @@
-use std::{sync::Arc, time::Duration};
+use std::{fs, sync::Arc, time::Duration};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use arrow_flight::flight_service_server::FlightServiceServer;
 use arrow_flight_s3_mvp::{
-    config::AppConfig,
+    config::{AppConfig, FlightTlsConfig},
     flight_service::WorkerFlightService,
     metadata_store::MetadataStore,
     metrics::{WorkerMetrics, spawn_metrics_server},
     util::build_object_store,
 };
 use tokio::time::sleep;
-use tonic::transport::Server;
+use tonic::transport::{Identity, Server, ServerTlsConfig};
 use tracing::{error, info};
 
 #[tokio::main(flavor = "multi_thread")]
@@ -47,6 +47,8 @@ async fn main() -> Result<()> {
         metadata_db = config.metadata.database_url.is_some(),
         worker_id = %config.worker.worker_id,
         worker_flight_uri = %config.worker.flight_uri,
+        flight_tls_enabled = config.flight_tls.enabled,
+        flight_tls_cert_path = config.flight_tls.cert_path.as_deref().unwrap_or(""),
         metrics_enabled = config.metrics.enabled,
         metrics_addr = %config.metrics.addr,
         read_slots = config.worker.max_active_read_streams,
@@ -58,7 +60,14 @@ async fn main() -> Result<()> {
         "starting raw Parquet data-plane worker"
     );
 
-    Server::builder()
+    let mut server = Server::builder();
+    if let Some(identity) = load_tls_identity(&config.flight_tls)? {
+        server = server
+            .tls_config(ServerTlsConfig::new().identity(identity))
+            .context("failed to configure Flight server TLS")?;
+    }
+
+    server
         .add_service(flight_service)
         .serve_with_shutdown(config.flight_addr, shutdown_signal())
         .await?;
@@ -68,6 +77,27 @@ async fn main() -> Result<()> {
 
 async fn shutdown_signal() {
     let _ = tokio::signal::ctrl_c().await;
+}
+
+fn load_tls_identity(config: &FlightTlsConfig) -> Result<Option<Identity>> {
+    if !config.enabled {
+        return Ok(None);
+    }
+
+    let cert_path = config
+        .cert_path
+        .as_deref()
+        .context("FLIGHT_TLS_CERT_PATH must be set when Flight TLS is enabled")?;
+    let key_path = config
+        .key_path
+        .as_deref()
+        .context("FLIGHT_TLS_KEY_PATH must be set when Flight TLS is enabled")?;
+    let cert = fs::read(cert_path)
+        .with_context(|| format!("failed to read Flight TLS certificate from {cert_path}"))?;
+    let key = fs::read(key_path)
+        .with_context(|| format!("failed to read Flight TLS private key from {key_path}"))?;
+
+    Ok(Some(Identity::from_pem(cert, key)))
 }
 
 fn spawn_worker_registry_heartbeat(

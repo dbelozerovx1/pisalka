@@ -218,7 +218,7 @@ final class Config {
                 env("COORDINATOR_K8S_WORKER_SERVICE_SELECTOR", "role=flight-worker-client-endpoint"),
                 env("COORDINATOR_K8S_WORKER_ID_LABEL", "worker-id"),
                 env("COORDINATOR_K8S_WORKER_FLIGHT_PORT_NAME", "flight"),
-                normalizeUriScheme(env("COORDINATOR_WORKER_CLIENT_URI_SCHEME", "http")),
+                normalizeUriScheme(env("COORDINATOR_WORKER_CLIENT_URI_SCHEME", "grpc+tcp")),
                 envLong("COORDINATOR_K8S_INFORMER_RESYNC_MS", 30_000L),
                 envLong("COORDINATOR_K8S_INFORMER_INITIAL_SYNC_TIMEOUT_MS", 30_000L)
         );
@@ -297,9 +297,9 @@ final class Config {
     private static String normalizeUriScheme(String raw) {
         String value = raw == null ? "" : raw.trim().toLowerCase(Locale.ROOT);
         return switch (value) {
-            case "http", "https" -> value;
+            case "grpc+tcp", "grpc+tls", "http", "https" -> value;
             default -> throw new IllegalArgumentException(
-                    "COORDINATOR_WORKER_CLIENT_URI_SCHEME must be http or https"
+                    "COORDINATOR_WORKER_CLIENT_URI_SCHEME must be grpc+tcp, grpc+tls, http, or https"
             );
         };
     }

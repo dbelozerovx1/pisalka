@@ -37,7 +37,7 @@ Start everything in Docker:
 ./dev/up.sh
 ```
 
-The Compose file contains MinIO, a standalone Hive Metastore, Trino with an Iceberg catalog, two Rust workers, and the Java coordinator. Trino is exposed on `http://127.0.0.1:8080`, the coordinator Arrow Flight service is exposed at `http://127.0.0.1:8088`, coordinator metrics are exposed at `http://127.0.0.1:9091`, worker `local-worker` is exposed at `http://127.0.0.1:50051` with metrics on `http://127.0.0.1:9090`, and worker `local-worker-2` is exposed at `http://127.0.0.1:50052` with metrics on `http://127.0.0.1:9092`.
+The Compose file contains MinIO, a standalone Hive Metastore, Trino with an Iceberg catalog, two Rust workers, and the Java coordinator. Trino is exposed on `http://127.0.0.1:8080`, the coordinator Arrow Flight service is exposed at `http://127.0.0.1:8088`, coordinator metrics are exposed at `http://127.0.0.1:9091`, worker `local-worker` is exposed as `grpc+tcp://127.0.0.1:50051` with metrics on `http://127.0.0.1:9090`, and worker `local-worker-2` is exposed as `grpc+tcp://127.0.0.1:50052` with metrics on `http://127.0.0.1:9092`.
 
 `trino-init` waits for Trino and best-effort creates the Iceberg schema. Keep `TRINO_INIT_REQUIRE_SCHEMA=false` for raw Flight worker smoke tests; set it to `true` when testing strict Iceberg schema bootstrap.
 
@@ -198,7 +198,10 @@ Useful environment variables:
 - `READ_SCHEDULER_RESERVED_SLOTS=auto` defaults to 1 only when the auto slot count is at least 4
 - `READ_SLOT_WAIT_MS=30000`
 - `WORKER_ZONE=` optional coordinator locality hint
-- `WORKER_FLIGHT_URI=http://127.0.0.1:50051` worker-published URI stored in `worker_registry`; in Docker Compose this defaults to `http://flight-server:50051`; in Kubernetes endpoint mode it may be internal because `worker_client_endpoints` supplies the final client URI
+- `WORKER_FLIGHT_URI=grpc+tcp://127.0.0.1:50051` worker-published Flight URI stored in `worker_registry`; in Docker Compose this defaults to `grpc+tcp://flight-server:50051`; in Kubernetes endpoint mode it may be internal because `worker_client_endpoints` supplies the final client URI
+- `FLIGHT_TLS_ENABLED=false` enables TLS for the worker Arrow Flight listener; if omitted, TLS is auto-enabled when both `FLIGHT_TLS_CERT_PATH` and `FLIGHT_TLS_KEY_PATH` are set
+- `FLIGHT_TLS_CERT_PATH=` PEM certificate chain path mounted into the worker pod
+- `FLIGHT_TLS_KEY_PATH=` PEM private key path mounted into the worker pod
 - `WORKER_REQUIRE_STRUCTURED_TICKETS=false`
 - `WORKER_REQUIRE_SIGNED_CAPABILITIES=false`
 - `WORKER_CAPABILITY_SECRET=`
@@ -216,7 +219,7 @@ Useful environment variables:
 - `COORDINATOR_K8S_WORKER_SERVICE_SELECTOR=role=flight-worker-client-endpoint`
 - `COORDINATOR_K8S_WORKER_ID_LABEL=worker-id`
 - `COORDINATOR_K8S_WORKER_FLIGHT_PORT_NAME=flight`
-- `COORDINATOR_WORKER_CLIENT_URI_SCHEME=http`
+- `COORDINATOR_WORKER_CLIENT_URI_SCHEME=grpc+tcp` use `grpc+tls` when Kubernetes-discovered worker endpoints point to TLS-enabled worker Flight servers
 - `TRINO_VERSION=476`
 - `HIVE_VERSION=3.1.3`
 - `HIVE_PLATFORM=linux/amd64`
@@ -347,7 +350,7 @@ Coordinator-facing worker status shape:
 ```json
 {
   "worker_id": "local-worker",
-  "flight_uri": "http://127.0.0.1:50051",
+  "flight_uri": "grpc+tcp://127.0.0.1:50051",
   "locality": { "zone": null },
   "state": "ACTIVE",
   "put": { "limit": 16, "active": 0, "available": 16, "slot_wait_ms": 30000 },

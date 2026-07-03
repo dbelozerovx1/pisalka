@@ -25,6 +25,11 @@ use arrow_flight_s3_mvp::{
     util::{batch_memory_size, parse_size, pretty_bytes, throughput},
 };
 
+#[path = "common/flight_uri.rs"]
+mod flight_uri;
+
+use flight_uri::tonic_uri;
+
 #[derive(Debug, Parser)]
 struct Args {
     #[arg(long)]
@@ -466,7 +471,7 @@ impl CoordinatorClient {
     ) -> Result<Self> {
         let channel = tokio::time::timeout(
             Duration::from_secs(timeout_seconds.max(1)),
-            Channel::from_shared(uri.clone())?.connect(),
+            Channel::from_shared(tonic_uri(&uri)?)?.connect(),
         )
         .await
         .with_context(|| format!("timed out connecting to coordinator {uri}"))??;
@@ -787,7 +792,7 @@ async fn run_put_stream(
         .with_metadata(Bytes::from(ticket.app_metadata.clone()))
         .build(batch_stream);
 
-    let channel = Channel::from_shared(ticket.flight_uri.clone())?
+    let channel = Channel::from_shared(tonic_uri(&ticket.flight_uri)?)?
         .connect()
         .await?;
     let mut client = FlightClient::new_from_inner(
@@ -830,7 +835,7 @@ async fn run_put_stream(
 }
 
 async fn run_get(ticket: GetTicketResponse, config: &BenchConfig) -> Result<GetRunSummary> {
-    let channel = Channel::from_shared(ticket.flight_uri.clone())?
+    let channel = Channel::from_shared(tonic_uri(&ticket.flight_uri)?)?
         .connect()
         .await?;
     let mut client = FlightClient::new_from_inner(

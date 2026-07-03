@@ -6,6 +6,7 @@ use parquet::basic::Compression;
 #[derive(Debug, Clone)]
 pub struct AppConfig {
     pub flight_addr: SocketAddr,
+    pub flight_tls: FlightTlsConfig,
     pub s3: S3Config,
     pub parquet: ParquetTuning,
     pub worker: WorkerConfig,
@@ -23,6 +24,13 @@ pub struct BenchConfig {
     pub uri: String,
     pub max_message_size: usize,
     pub flight_data_chunk_size: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct FlightTlsConfig {
+    pub enabled: bool,
+    pub cert_path: Option<String>,
+    pub key_path: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -119,6 +127,7 @@ impl AppConfig {
 
         Ok(Self {
             flight_addr,
+            flight_tls: FlightTlsConfig::from_env()?,
             s3: S3Config::from_env(),
             parquet: ParquetTuning::from_env()?,
             worker,
@@ -163,9 +172,37 @@ impl WorkerFlavor {
 impl BenchConfig {
     pub fn from_env() -> Result<Self> {
         Ok(Self {
-            uri: env_string("FLIGHT_URI", "http://127.0.0.1:50051"),
+            uri: env_string("FLIGHT_URI", "grpc+tcp://127.0.0.1:50051"),
             max_message_size: env_usize("FLIGHT_MAX_MESSAGE_SIZE", 256 * 1024 * 1024)?,
             flight_data_chunk_size: env_usize("FLIGHT_DATA_CHUNK_SIZE", 16 * 1024 * 1024)?,
+        })
+    }
+}
+
+impl FlightTlsConfig {
+    fn from_env() -> Result<Self> {
+        let cert_path = env_optional_string("FLIGHT_TLS_CERT_PATH")
+            .or_else(|| env_optional_string("WORKER_TLS_CERT_PATH"));
+        let key_path = env_optional_string("FLIGHT_TLS_KEY_PATH")
+            .or_else(|| env_optional_string("WORKER_TLS_KEY_PATH"));
+        let enabled = env_optional_bool("FLIGHT_TLS_ENABLED")?
+            .unwrap_or_else(|| cert_path.is_some() || key_path.is_some());
+
+        if enabled && cert_path.is_none() {
+            anyhow::bail!(
+                "FLIGHT_TLS_CERT_PATH must be set when FLIGHT_TLS_ENABLED=true or TLS key/cert paths are provided"
+            );
+        }
+        if enabled && key_path.is_none() {
+            anyhow::bail!(
+                "FLIGHT_TLS_KEY_PATH must be set when FLIGHT_TLS_ENABLED=true or TLS key/cert paths are provided"
+            );
+        }
+
+        Ok(Self {
+            enabled,
+            cert_path,
+            key_path,
         })
     }
 }
@@ -210,7 +247,7 @@ impl WorkerConfig {
         let auto_read_streams = auto_read_streams(flavor.cpu_millicores);
         Ok(Self {
             worker_id: env_string("WORKER_ID", "local-worker"),
-            flight_uri: env_string("WORKER_FLIGHT_URI", "http://127.0.0.1:50051"),
+            flight_uri: env_string("WORKER_FLIGHT_URI", "grpc+tcp://127.0.0.1:50051"),
             zone: env_optional_string("WORKER_ZONE"),
             draining: env_bool("WORKER_DRAINING", false),
             max_active_put_streams: env_count_auto("PUT_MAX_ACTIVE_STREAMS", auto_put_streams)?
@@ -404,6 +441,21 @@ fn env_bool(key: &str, default: bool) -> bool {
             _ => None,
         })
         .unwrap_or(default)
+}
+
+fn env_optional_bool(key: &str) -> Result<Option<bool>> {
+    let Ok(value) = env::var(key) else {
+        return Ok(None);
+    };
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(None);
+    }
+    match value.to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(Some(true)),
+        "0" | "false" | "no" | "off" => Ok(Some(false)),
+        _ => anyhow::bail!("{key} must be a boolean value"),
+    }
 }
 
 fn env_usize(key: &str, default: usize) -> Result<usize> {

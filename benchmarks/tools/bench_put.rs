@@ -18,7 +18,10 @@ use arrow_flight_s3_mvp::{
 
 mod common;
 
-use common::profile::{ClientSourceProfile, print_server_profile};
+use common::{
+    flight_uri::tonic_uri,
+    profile::{ClientSourceProfile, print_server_profile},
+};
 
 #[derive(Debug, Parser)]
 struct Args {
@@ -141,7 +144,7 @@ async fn main() -> Result<()> {
 
     let flight_stream = encoder.build(batch_stream);
 
-    let channel = Channel::from_shared(uri.clone())?.connect().await?;
+    let channel = Channel::from_shared(tonic_uri(&uri)?)?.connect().await?;
     let mut client = FlightClient::new_from_inner(
         arrow_flight::flight_service_client::FlightServiceClient::new(channel)
             .max_decoding_message_size(config.max_message_size)

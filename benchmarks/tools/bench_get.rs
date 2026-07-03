@@ -12,6 +12,11 @@ use arrow_flight_s3_mvp::{
     util::{batch_memory_size, pretty_bytes, throughput},
 };
 
+#[path = "common/flight_uri.rs"]
+mod flight_uri;
+
+use flight_uri::tonic_uri;
+
 #[derive(Debug, Parser)]
 struct Args {
     #[arg(long)]
@@ -33,7 +38,7 @@ async fn main() -> Result<()> {
     let config = BenchConfig::from_env()?;
     let uri = args.uri.unwrap_or(config.uri);
 
-    let channel = Channel::from_shared(uri.clone())?.connect().await?;
+    let channel = Channel::from_shared(tonic_uri(&uri)?)?.connect().await?;
     let mut client = FlightClient::new_from_inner(
         arrow_flight::flight_service_client::FlightServiceClient::new(channel)
             .max_decoding_message_size(config.max_message_size)

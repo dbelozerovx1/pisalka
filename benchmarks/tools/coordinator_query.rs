@@ -16,6 +16,11 @@ use arrow_flight_s3_mvp::{
     util::{batch_memory_size, pretty_bytes, throughput},
 };
 
+#[path = "common/flight_uri.rs"]
+mod flight_uri;
+
+use flight_uri::tonic_uri;
+
 #[derive(Debug, Parser)]
 struct Args {
     #[arg(long, env = "COORDINATOR_URI", default_value = "http://127.0.0.1:8088")]
@@ -56,7 +61,7 @@ struct Args {
 async fn main() -> Result<()> {
     let args = Args::parse();
     let bench_config = BenchConfig::from_env()?;
-    let channel = Channel::from_shared(args.coordinator_uri.clone())?
+    let channel = Channel::from_shared(tonic_uri(&args.coordinator_uri)?)?
         .connect()
         .await
         .with_context(|| format!("failed to connect to coordinator {}", args.coordinator_uri))?;
@@ -243,7 +248,7 @@ async fn read_endpoint(
         .unwrap_or("unknown")
         .to_owned();
 
-    let channel = Channel::from_shared(flight_uri.clone())?
+    let channel = Channel::from_shared(tonic_uri(&flight_uri)?)?
         .connect()
         .await
         .with_context(|| format!("failed to connect to worker {flight_uri}"))?;
