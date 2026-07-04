@@ -50,7 +50,7 @@ final class CoordinatorFlightProducer implements FlightProducer {
         Map<String, Object> request = Map.of();
         try {
             request = descriptorRequest(descriptor);
-            FlightInfo response = flightInfo(coordinator.startFlight(request), false);
+            FlightInfo response = flightInfo(coordinator.startFlight(request, endpointRewrite(context)), false);
             metrics.recordSuccess("GetFlightInfo", null);
             return response;
         } catch (RuntimeException error) {
@@ -67,7 +67,7 @@ final class CoordinatorFlightProducer implements FlightProducer {
         Map<String, Object> request = Map.of();
         try {
             request = descriptorRequest(descriptor);
-            PollResult result = coordinator.pollFlight(request);
+            PollResult result = coordinator.pollFlight(request, endpointRewrite(context));
             FlightDescriptor nextDescriptor = result.complete()
                     ? null
                     : FlightDescriptor.command(jsonBytes(Map.of("type", "poll", "queryId", result.plan().queryId())));
@@ -100,14 +100,15 @@ final class CoordinatorFlightProducer implements FlightProducer {
         Map<String, Object> request = Map.of();
         try {
             request = actionBody(action);
+            WorkerEndpointRewrite endpointRewrite = endpointRewrite(context);
             Map<String, Object> response = switch (action.getType()) {
                 case "coordinator.config" -> coordinator.configJson();
-                case "coordinator.create-upload" -> coordinator.createUpload(request);
+                case "coordinator.create-upload" -> coordinator.createUpload(request, endpointRewrite);
                 case "coordinator.commit-upload", "coordinator.do-commit" -> coordinator.commitUpload(request);
                 case "coordinator.abort-upload" -> coordinator.abortUpload(request);
                 case "coordinator.drop-temp", "coordinator.drop_temp" -> coordinator.dropTemp(request);
-                case "coordinator.put-ticket" -> coordinator.putTicket(request);
-                case "coordinator.get-ticket" -> coordinator.getTicket(request);
+                case "coordinator.put-ticket" -> coordinator.putTicket(request, endpointRewrite);
+                case "coordinator.get-ticket" -> coordinator.getTicket(request, endpointRewrite);
                 default -> throw new CoordinatorException(400, "unknown coordinator action: " + action.getType());
             };
             listener.onNext(new Result(jsonBytes(response)));
@@ -190,5 +191,13 @@ final class CoordinatorFlightProducer implements FlightProducer {
 
     private byte[] jsonBytes(Object value) {
         return Json.stringify(value).getBytes(StandardCharsets.UTF_8);
+    }
+
+    private WorkerEndpointRewrite endpointRewrite(CallContext context) {
+        BaseHostnameMiddleware middleware = context.getMiddleware(BaseHostnameMiddleware.KEY);
+        if (middleware == null) {
+            return WorkerEndpointRewrite.NONE;
+        }
+        return WorkerEndpointRewrite.fromBaseHostname(middleware.baseHostname());
     }
 }

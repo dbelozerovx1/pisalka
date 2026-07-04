@@ -216,10 +216,12 @@ Useful environment variables:
 - `COORDINATOR_METRICS_ADDR=0.0.0.0:9091`
 - `COORDINATOR_K8S_WORKER_DISCOVERY_ENABLED=false` watches labeled Kubernetes Services and writes client-routable worker endpoints to Postgres when enabled
 - `COORDINATOR_WORKER_CLIENT_ENDPOINTS_REQUIRED=false` requires a fresh `worker_client_endpoints` row during worker selection; defaults to `true` when Kubernetes discovery is enabled
+- `COORDINATOR_WORKER_SELECTION_GRACE_MS=0` delays coordinator worker selection after a worker/endpoint first appears, while still exposing it through `GET /workers`; set this above the HAProxy sidecar poll+reload interval, for example `10000` or `30000`
 - `COORDINATOR_K8S_WORKER_SERVICE_SELECTOR=role=flight-worker-client-endpoint`
 - `COORDINATOR_K8S_WORKER_ID_LABEL=worker-id`
 - `COORDINATOR_K8S_WORKER_FLIGHT_PORT_NAME=flight`
 - `COORDINATOR_WORKER_CLIENT_URI_SCHEME=grpc+tcp` use `grpc+tls` when Kubernetes-discovered worker endpoints point to TLS-enabled worker Flight servers
+- Coordinator HTTP `GET /workers` and `GET /worker-endpoints` on `COORDINATOR_METRICS_ADDR` return live worker id -> URI/address maps for an HAProxy sidecar. Flight requests with header `x-base-hostname` return worker locations as `<worker-id>.<basehostname>:<port>` with the original `grpc+tcp` / `grpc+tls` scheme; without the header, canonical worker URIs are returned unchanged.
 - `TRINO_VERSION=476`
 - `HIVE_VERSION=3.1.3`
 - `HIVE_PLATFORM=linux/amd64`

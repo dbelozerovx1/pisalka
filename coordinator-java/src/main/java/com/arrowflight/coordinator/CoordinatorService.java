@@ -59,6 +59,7 @@ final class CoordinatorService {
         body.put("metricsAddress", config.coordinatorMetricsAddress.toString());
         body.put("queryRegistryTtlMs", config.queryRegistryTtlMs);
         body.put("workerClientEndpointsRequired", config.workerClientEndpointsRequired);
+        body.put("workerSelectionGraceMs", config.workerSelectionGraceMs);
         body.put("k8sWorkerDiscoveryEnabled", config.k8sWorkerDiscoveryEnabled);
         body.put("k8sNamespace", config.k8sNamespace);
         body.put("k8sWorkerServiceSelector", config.k8sWorkerServiceSelector);
@@ -68,6 +69,10 @@ final class CoordinatorService {
     }
 
     Map<String, Object> createUpload(Map<String, Object> request) {
+        return createUpload(request, WorkerEndpointRewrite.NONE);
+    }
+
+    Map<String, Object> createUpload(Map<String, Object> request, WorkerEndpointRewrite endpointRewrite) {
         requireAdminIfConfigured(request);
         cleanupQueriesIfDue();
 
@@ -98,7 +103,8 @@ final class CoordinatorService {
                     maxStreamBytes,
                     maxRecordBatchBytes,
                     Optional.empty(),
-                    true
+                    true,
+                    endpointRewrite
             );
         }
 
@@ -153,7 +159,8 @@ final class CoordinatorService {
                     maxStreamBytes,
                     maxRecordBatchBytes,
                     Optional.empty(),
-                    true
+                    true,
+                    endpointRewrite
             );
         }
 
@@ -177,7 +184,8 @@ final class CoordinatorService {
                 maxStreamBytes,
                 maxRecordBatchBytes,
                 overwritePreparation,
-                false
+                false,
+                endpointRewrite
         );
     }
 
@@ -190,7 +198,8 @@ final class CoordinatorService {
             Optional<Long> requestedMaxStreamBytes,
             Optional<Long> requestedMaxRecordBatchBytes,
             Optional<Map<String, Object>> overwritePreparation,
-            boolean alreadyCreated
+            boolean alreadyCreated,
+            WorkerEndpointRewrite endpointRewrite
     ) {
         UploadSessionRecord session = snapshot.session();
         validateCreateUploadRetry(
@@ -202,14 +211,15 @@ final class CoordinatorService {
                 requestedMaxRecordBatchBytes
         );
         if (session.status().equals("PREPARING")) {
-            LinkedHashMap<String, Object> body = baseCreateUploadResponse(session, snapshot, request, alreadyCreated);
+            LinkedHashMap<String, Object> body =
+                    baseCreateUploadResponse(session, snapshot, request, alreadyCreated, endpointRewrite);
             body.put("status", "PREPARING");
             body.put("retryAfterMs", 500);
             body.put("tickets", List.of());
             return body;
         }
         if (session.status().equals("FAILED")) {
-            return failedUploadResponse(snapshot);
+            return failedUploadResponse(snapshot, endpointRewrite);
         }
         if (session.status().equals("COMMITTING")) {
             throw new CoordinatorException(
@@ -232,9 +242,10 @@ final class CoordinatorService {
         }
 
         List<Map<String, Object>> ticketBodies = snapshot.streams().stream()
-                .map(stream -> uploadTicket(session, stream))
+                .map(stream -> uploadTicket(session, stream, endpointRewrite))
                 .toList();
-        LinkedHashMap<String, Object> body = baseCreateUploadResponse(session, snapshot, request, alreadyCreated);
+        LinkedHashMap<String, Object> body =
+                baseCreateUploadResponse(session, snapshot, request, alreadyCreated, endpointRewrite);
         body.put("status", session.status());
         overwritePreparation.ifPresent(value -> body.put("overwritePreparation", value));
         body.put("tickets", ticketBodies);
@@ -245,7 +256,8 @@ final class CoordinatorService {
             UploadSessionRecord session,
             UploadSnapshot snapshot,
             Map<String, Object> request,
-            boolean alreadyCreated
+            boolean alreadyCreated,
+            WorkerEndpointRewrite endpointRewrite
     ) {
         LinkedHashMap<String, Object> body = new LinkedHashMap<>();
         body.put("uploadId", session.uploadId());
@@ -259,7 +271,9 @@ final class CoordinatorService {
         body.put("outputPrefix", session.stagingPrefix() + "/");
         body.put("targetFileSizeBytes", session.targetFileSize());
         body.put("expiresAtMs", session.expiresAt().toEpochMilli());
-        body.put("selectedWorkers", snapshot.streams().stream().map(this::selectedWorkerJson).toList());
+        body.put("selectedWorkers", snapshot.streams().stream()
+                .map(stream -> selectedWorkerJson(stream, endpointRewrite))
+                .toList());
         body.put("alreadyCreated", alreadyCreated);
         return body;
     }
@@ -314,7 +328,11 @@ final class CoordinatorService {
         }
     }
 
-    private Map<String, Object> uploadTicket(UploadSessionRecord session, UploadStreamState stream) {
+    private Map<String, Object> uploadTicket(
+            UploadSessionRecord session,
+            UploadStreamState stream,
+            WorkerEndpointRewrite endpointRewrite
+    ) {
         long ttlMs = session.expiresAt().toEpochMilli() - Instant.now().toEpochMilli();
         if (ttlMs <= 0) {
             throw new CoordinatorException(
@@ -329,7 +347,7 @@ final class CoordinatorService {
         ticketRequest.put("uploadId", session.uploadId());
         ticketRequest.put("streamId", stream.streamId());
         ticketRequest.put("workerId", stream.workerId());
-        ticketRequest.put("flightUri", stream.flightUri());
+        ticketRequest.put("flightUri", endpointRewrite.rewrite(stream.workerId(), stream.flightUri()));
         ticketRequest.put("stagingPrefix", session.stagingPrefix());
         ticketRequest.put("path", stream.descriptorPath());
         ticketRequest.put("targetFileSizeBytes", session.targetFileSize());
@@ -340,11 +358,11 @@ final class CoordinatorService {
         return capabilitySigner.putPayload(ticketRequest);
     }
 
-    private Map<String, Object> selectedWorkerJson(UploadStreamState stream) {
+    private Map<String, Object> selectedWorkerJson(UploadStreamState stream, WorkerEndpointRewrite endpointRewrite) {
         LinkedHashMap<String, Object> body = new LinkedHashMap<>();
         body.put("streamId", stream.streamId());
         body.put("workerId", stream.workerId());
-        body.put("flightUri", stream.flightUri());
+        body.put("flightUri", endpointRewrite.rewrite(stream.workerId(), stream.flightUri()));
         return body;
     }
 
@@ -603,6 +621,13 @@ final class CoordinatorService {
     }
 
     private LinkedHashMap<String, Object> failedUploadResponse(UploadSnapshot snapshot) {
+        return failedUploadResponse(snapshot, WorkerEndpointRewrite.NONE);
+    }
+
+    private LinkedHashMap<String, Object> failedUploadResponse(
+            UploadSnapshot snapshot,
+            WorkerEndpointRewrite endpointRewrite
+    ) {
         UploadSessionRecord session = snapshot.session();
         LinkedHashMap<String, Object> body = new LinkedHashMap<>();
         body.put("uploadId", session.uploadId());
@@ -610,7 +635,15 @@ final class CoordinatorService {
         session.errorMessage().ifPresent(value -> body.put("errorMessage", value));
         session.tableName().ifPresent(value -> body.put("tableName", value));
         body.put("files", snapshot.files().stream().map(UploadFile::toJson).toList());
-        body.put("streams", snapshot.streams().stream().map(UploadStreamState::toJson).toList());
+        body.put("streams", snapshot.streams().stream()
+                .map(stream -> streamJson(stream, endpointRewrite))
+                .toList());
+        return body;
+    }
+
+    private Map<String, Object> streamJson(UploadStreamState stream, WorkerEndpointRewrite endpointRewrite) {
+        LinkedHashMap<String, Object> body = new LinkedHashMap<>(stream.toJson());
+        body.put("flightUri", endpointRewrite.rewrite(stream.workerId(), stream.flightUri()));
         return body;
     }
 
@@ -664,56 +697,73 @@ final class CoordinatorService {
     }
 
     Map<String, Object> putTicket(Map<String, Object> request) {
+        return putTicket(request, WorkerEndpointRewrite.NONE);
+    }
+
+    Map<String, Object> putTicket(Map<String, Object> request, WorkerEndpointRewrite endpointRewrite) {
         requireAdminIfConfigured(request);
         WorkerAssignment worker = metadataStore.selectPutWorkers(1).getFirst();
         LinkedHashMap<String, Object> signedRequest = new LinkedHashMap<>(request);
         signedRequest.put("workerId", worker.workerId());
-        signedRequest.put("flightUri", worker.flightUri());
+        signedRequest.put("flightUri", endpointRewrite.rewrite(worker.workerId(), worker.flightUri()));
         return capabilitySigner.putPayload(signedRequest);
     }
 
     Map<String, Object> getTicket(Map<String, Object> request) {
+        return getTicket(request, WorkerEndpointRewrite.NONE);
+    }
+
+    Map<String, Object> getTicket(Map<String, Object> request, WorkerEndpointRewrite endpointRewrite) {
         requireAdminIfConfigured(request);
-        return planReadEndpoint(
+        return endpointRewrite.rewriteEndpoint(planReadEndpoint(
                 stringOrDefault(request, "operationId", "read-" + UUID.randomUUID()),
                 Config.normalizePath(Json.requiredString(request, "path")),
                 request
-        );
+        ));
     }
 
     FlightPlan startFlight(Map<String, Object> request) {
+        return startFlight(request, WorkerEndpointRewrite.NONE);
+    }
+
+    FlightPlan startFlight(Map<String, Object> request, WorkerEndpointRewrite endpointRewrite) {
         cleanupQueriesIfDue();
         String type = requestType(request);
-        return switch (type) {
+        FlightPlan plan = switch (type) {
             case "read" -> startRead(request);
             case "ctas" -> startCtas(request);
             default -> throw new CoordinatorException(400, "unsupported GetFlightInfo request type: " + type);
         };
+        return rewritePlan(plan, endpointRewrite);
     }
 
     PollResult pollFlight(Map<String, Object> request) {
+        return pollFlight(request, WorkerEndpointRewrite.NONE);
+    }
+
+    PollResult pollFlight(Map<String, Object> request, WorkerEndpointRewrite endpointRewrite) {
         cleanupQueriesIfDue();
         String queryId = Json.requiredString(request, "queryId");
         QueryRegistryRecord record = metadataStore.loadQuery(queryId);
         if (record.terminal()) {
-            return new PollResult(flightPlanFromRecord(record), true, record.progress(), record.expiresAt());
+            return new PollResult(rewritePlan(flightPlanFromRecord(record), endpointRewrite), true, record.progress(), record.expiresAt());
         }
         if (Instant.now().isAfter(record.expiresAt())) {
             metadataStore.markQueryFailed(queryId, "query registry entry expired", record.trinoStatsJson());
             QueryRegistryRecord failed = metadataStore.loadQuery(queryId);
-            return new PollResult(flightPlanFromRecord(failed), true, failed.progress(), failed.expiresAt());
+            return new PollResult(rewritePlan(flightPlanFromRecord(failed), endpointRewrite), true, failed.progress(), failed.expiresAt());
         }
         if (!record.queryType().equals("ctas")) {
-            return new PollResult(flightPlanFromRecord(record), record.terminal(), record.progress(), record.expiresAt());
+            return new PollResult(rewritePlan(flightPlanFromRecord(record), endpointRewrite), record.terminal(), record.progress(), record.expiresAt());
         }
 
         try {
             QueryRegistryRecord updated = advanceCtas(record, request);
-            return new PollResult(flightPlanFromRecord(updated), updated.terminal(), updated.progress(), updated.expiresAt());
+            return new PollResult(rewritePlan(flightPlanFromRecord(updated), endpointRewrite), updated.terminal(), updated.progress(), updated.expiresAt());
         } catch (Exception error) {
             metadataStore.markQueryFailed(queryId, error.getMessage(), record.trinoStatsJson());
             QueryRegistryRecord failed = metadataStore.loadQuery(queryId);
-            return new PollResult(flightPlanFromRecord(failed), true, failed.progress(), failed.expiresAt());
+            return new PollResult(rewritePlan(flightPlanFromRecord(failed), endpointRewrite), true, failed.progress(), failed.expiresAt());
         }
     }
 
@@ -990,6 +1040,24 @@ final class CoordinatorService {
         long totalRows = sumLong(record.resultFilesJson(), "files", "rows").orElse(-1L);
         long totalBytes = sumLong(record.resultFilesJson(), "files", "bytes").orElse(-1L);
         return new FlightPlan(record.queryId(), record.status(), metadata, endpoints, totalRows, totalBytes, record.expiresAt());
+    }
+
+    private FlightPlan rewritePlan(FlightPlan plan, WorkerEndpointRewrite endpointRewrite) {
+        if (!endpointRewrite.enabled() || plan.endpoints().isEmpty()) {
+            return plan;
+        }
+        List<Map<String, Object>> endpoints = plan.endpoints().stream()
+                .map(endpointRewrite::rewriteEndpoint)
+                .toList();
+        return new FlightPlan(
+                plan.queryId(),
+                plan.status(),
+                plan.metadata(),
+                endpoints,
+                plan.totalRecords(),
+                plan.totalBytes(),
+                plan.expiresAt()
+        );
     }
 
     @SuppressWarnings("unchecked")

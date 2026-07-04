@@ -51,6 +51,7 @@ final class Config {
     final Duration trinoRequestTimeout;
     final boolean workerClientEndpointsRequired;
     final long workerClientEndpointTtlMs;
+    final long workerSelectionGraceMs;
     final boolean k8sWorkerDiscoveryEnabled;
     final String k8sNamespace;
     final String k8sWorkerServiceSelector;
@@ -104,6 +105,7 @@ final class Config {
             Duration trinoRequestTimeout,
             boolean workerClientEndpointsRequired,
             long workerClientEndpointTtlMs,
+            long workerSelectionGraceMs,
             boolean k8sWorkerDiscoveryEnabled,
             String k8sNamespace,
             String k8sWorkerServiceSelector,
@@ -156,6 +158,7 @@ final class Config {
         this.trinoRequestTimeout = trinoRequestTimeout;
         this.workerClientEndpointsRequired = workerClientEndpointsRequired;
         this.workerClientEndpointTtlMs = workerClientEndpointTtlMs;
+        this.workerSelectionGraceMs = workerSelectionGraceMs;
         this.k8sWorkerDiscoveryEnabled = k8sWorkerDiscoveryEnabled;
         this.k8sNamespace = k8sNamespace;
         this.k8sWorkerServiceSelector = k8sWorkerServiceSelector;
@@ -213,6 +216,7 @@ final class Config {
                 Duration.ofMillis(envLong("TRINO_REQUEST_TIMEOUT_MS", 30_000)),
                 envBool("COORDINATOR_WORKER_CLIENT_ENDPOINTS_REQUIRED", k8sWorkerDiscoveryEnabled),
                 envLong("COORDINATOR_WORKER_CLIENT_ENDPOINT_TTL_MS", 2 * 60 * 1000L),
+                workerSelectionGraceMs(),
                 k8sWorkerDiscoveryEnabled,
                 env("COORDINATOR_K8S_NAMESPACE", env("POD_NAMESPACE", "default")),
                 env("COORDINATOR_K8S_WORKER_SERVICE_SELECTOR", "role=flight-worker-client-endpoint"),
@@ -317,6 +321,13 @@ final class Config {
     private static long envLong(String key, long defaultValue) {
         String value = System.getenv(key);
         return value == null || value.isBlank() ? defaultValue : Long.parseLong(value.trim());
+    }
+
+    private static long workerSelectionGraceMs() {
+        return Math.max(0L, envLong(
+                "COORDINATOR_WORKER_SELECTION_GRACE_MS",
+                envLong("COORDINATOR_WORKER_PICKUP_GRACE_MS", 0L)
+        ));
     }
 
     private static int envInt(String key, int defaultValue) {

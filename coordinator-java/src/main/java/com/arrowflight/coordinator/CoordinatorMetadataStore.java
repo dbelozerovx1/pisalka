@@ -48,13 +48,20 @@ final class CoordinatorMetadataStore {
                          flight_uri,
                          source,
                          observed_at,
+                         first_observed_at,
                          expires_at,
                          error_message
-                     ) VALUES (?, ?, ?, now(), ?, ?)
+                     ) VALUES (?, ?, ?, now(), now(), ?, ?)
                      ON CONFLICT (worker_id) DO UPDATE SET
                          flight_uri = EXCLUDED.flight_uri,
                          source = EXCLUDED.source,
                          observed_at = EXCLUDED.observed_at,
+                         first_observed_at = CASE
+                             WHEN worker_client_endpoints.flight_uri IS DISTINCT FROM EXCLUDED.flight_uri
+                               OR worker_client_endpoints.expires_at <= now()
+                             THEN EXCLUDED.first_observed_at
+                             ELSE worker_client_endpoints.first_observed_at
+                         END,
                          expires_at = EXCLUDED.expires_at,
                          error_message = EXCLUDED.error_message
                      """)) {
@@ -243,6 +250,8 @@ final class CoordinatorMetadataStore {
                   AND registry.draining = false
                   AND registry.read_recommended_streams > 0
                   AND extract(epoch FROM (now() - registry.last_heartbeat_at)) * 1000 <= registry.registry_ttl_ms
+                  AND extract(epoch FROM (now() - registry.first_seen_at)) * 1000 >= ?
+                  AND extract(epoch FROM (now() - client.first_observed_at)) * 1000 >= ?
                 ORDER BY registry.read_selection_score DESC,
                          registry.read_recommended_streams DESC,
                          registry.read_admission_wait_ms_ewma ASC,
@@ -263,6 +272,7 @@ final class CoordinatorMetadataStore {
                   AND draining = false
                   AND read_recommended_streams > 0
                   AND extract(epoch FROM (now() - last_heartbeat_at)) * 1000 <= registry_ttl_ms
+                  AND extract(epoch FROM (now() - first_seen_at)) * 1000 >= ?
                 ORDER BY read_selection_score DESC,
                          read_recommended_streams DESC,
                          read_admission_wait_ms_ewma ASC,
@@ -271,6 +281,10 @@ final class CoordinatorMetadataStore {
                 """;
         try (Connection connection = connect();
              PreparedStatement statement = connection.prepareStatement(sql)) {
+            statement.setLong(1, config.workerSelectionGraceMs);
+            if (config.workerClientEndpointsRequired) {
+                statement.setLong(2, config.workerSelectionGraceMs);
+            }
             try (ResultSet rows = statement.executeQuery()) {
                 if (!rows.next()) {
                     if (config.workerClientEndpointsRequired) {
@@ -292,6 +306,58 @@ final class CoordinatorMetadataStore {
             }
         } catch (SQLException error) {
             throw new IllegalStateException("failed to select DoGet worker from registry", error);
+        }
+    }
+
+    List<WorkerEndpointSnapshot> listWorkerEndpoints() {
+        requireEnabled();
+        try (Connection connection = connect();
+             PreparedStatement statement = connection.prepareStatement("""
+                SELECT registry.worker_id,
+                       COALESCE(client.flight_uri, registry.flight_uri) AS flight_uri,
+                       registry.flight_uri AS registry_flight_uri,
+                       client.flight_uri AS client_flight_uri,
+                       registry.put_recommended_streams,
+                       registry.read_recommended_streams,
+                       GREATEST(registry.put_utilization_per_mille, registry.read_utilization_per_mille) AS utilization_per_mille,
+                       registry.first_seen_at,
+                       client.first_observed_at,
+                       registry.last_heartbeat_at
+                FROM worker_registry registry
+                LEFT JOIN worker_client_endpoints client
+                  ON client.worker_id = registry.worker_id
+                 AND client.expires_at > now()
+                WHERE registry.state = 'ACTIVE'
+                  AND registry.draining = false
+                  AND extract(epoch FROM (now() - registry.last_heartbeat_at)) * 1000 <= registry.registry_ttl_ms
+                  AND (? = false OR client.worker_id IS NOT NULL)
+                ORDER BY registry.worker_id ASC
+                """)) {
+            statement.setBoolean(1, config.workerClientEndpointsRequired);
+            try (ResultSet rows = statement.executeQuery()) {
+                ArrayList<WorkerEndpointSnapshot> endpoints = new ArrayList<>();
+                while (rows.next()) {
+                    endpoints.add(new WorkerEndpointSnapshot(
+                            rows.getString("worker_id"),
+                            rows.getString("flight_uri"),
+                            rows.getString("registry_flight_uri"),
+                            Optional.ofNullable(rows.getString("client_flight_uri")),
+                            rows.getInt("put_recommended_streams"),
+                            rows.getInt("read_recommended_streams"),
+                            rows.getInt("utilization_per_mille"),
+                            rows.getTimestamp("first_seen_at").toInstant(),
+                            nullableTimestamp(rows, "first_observed_at"),
+                            workerSelectionEligibleAt(
+                                    rows.getTimestamp("first_seen_at").toInstant(),
+                                    nullableTimestamp(rows, "first_observed_at")
+                            ),
+                            rows.getTimestamp("last_heartbeat_at").toInstant()
+                    ));
+                }
+                return endpoints;
+            }
+        } catch (SQLException error) {
+            throw new IllegalStateException("failed to list live worker endpoints", error);
         }
     }
 
@@ -721,6 +787,8 @@ final class CoordinatorMetadataStore {
                   AND registry.draining = false
                   AND registry.put_recommended_streams > 0
                   AND extract(epoch FROM (now() - registry.last_heartbeat_at)) * 1000 <= registry.registry_ttl_ms
+                  AND extract(epoch FROM (now() - registry.first_seen_at)) * 1000 >= ?
+                  AND extract(epoch FROM (now() - client.first_observed_at)) * 1000 >= ?
                 ORDER BY registry.put_selection_score DESC,
                          registry.put_recommended_streams DESC,
                          registry.put_admission_wait_ms_ewma ASC,
@@ -740,12 +808,17 @@ final class CoordinatorMetadataStore {
                   AND draining = false
                   AND put_recommended_streams > 0
                   AND extract(epoch FROM (now() - last_heartbeat_at)) * 1000 <= registry_ttl_ms
+                  AND extract(epoch FROM (now() - first_seen_at)) * 1000 >= ?
                 ORDER BY put_selection_score DESC,
                          put_recommended_streams DESC,
                          put_admission_wait_ms_ewma ASC,
                          last_heartbeat_at DESC
                 """;
         try (PreparedStatement statement = connection.prepareStatement(sql)) {
+            statement.setLong(1, config.workerSelectionGraceMs);
+            if (config.workerClientEndpointsRequired) {
+                statement.setLong(2, config.workerSelectionGraceMs);
+            }
             try (ResultSet rows = statement.executeQuery()) {
                 ArrayList<WorkerRegistryEntry> workers = new ArrayList<>();
                 while (rows.next()) {
@@ -904,6 +977,18 @@ final class CoordinatorMetadataStore {
     private static Optional<Double> nullableDouble(ResultSet rows, String name) throws SQLException {
         double value = rows.getDouble(name);
         return rows.wasNull() ? Optional.empty() : Optional.of(value);
+    }
+
+    private static Optional<Instant> nullableTimestamp(ResultSet rows, String name) throws SQLException {
+        Timestamp value = rows.getTimestamp(name);
+        return value == null ? Optional.empty() : Optional.of(value.toInstant());
+    }
+
+    private Instant workerSelectionEligibleAt(Instant firstSeenAt, Optional<Instant> firstObservedAt) {
+        Instant base = firstObservedAt
+                .filter(value -> value.isAfter(firstSeenAt))
+                .orElse(firstSeenAt);
+        return base.plusMillis(config.workerSelectionGraceMs);
     }
 
     private static void setNullableDouble(PreparedStatement statement, int index, Optional<Double> value) throws SQLException {
@@ -1231,6 +1316,46 @@ record WorkerAssignment(
         body.put("utilizationPerMille", utilizationPerMille);
         body.put("admissionWaitMsEwma", admissionWaitMsEwma);
         body.put("throughputBytesPerSecEwma", throughputBytesPerSecEwma);
+        return body;
+    }
+}
+
+record WorkerEndpointSnapshot(
+        String workerId,
+        String flightUri,
+        String registryFlightUri,
+        Optional<String> clientFlightUri,
+        int putRecommendedStreams,
+        int readRecommendedStreams,
+        int utilizationPerMille,
+        Instant firstSeenAt,
+        Optional<Instant> firstObservedAt,
+        Instant selectionEligibleAt,
+        Instant lastHeartbeatAt
+) {
+    Map<String, Object> toJson() {
+        WorkerFlightUri parsed = WorkerFlightUri.parse(flightUri);
+        LinkedHashMap<String, Object> body = new LinkedHashMap<>();
+        body.put("workerId", workerId);
+        body.put("uri", flightUri);
+        body.put("flightUri", flightUri);
+        body.put("address", parsed.address());
+        body.put("scheme", parsed.scheme());
+        body.put("host", parsed.host());
+        body.put("port", parsed.port());
+        body.put("registryFlightUri", registryFlightUri);
+        clientFlightUri.ifPresent(value -> body.put("clientFlightUri", value));
+        body.put("putRecommendedStreams", putRecommendedStreams);
+        body.put("readRecommendedStreams", readRecommendedStreams);
+        body.put("utilizationPerMille", utilizationPerMille);
+        body.put("firstSeenAtMs", firstSeenAt.toEpochMilli());
+        firstObservedAt.ifPresent(value -> body.put("firstObservedAtMs", value.toEpochMilli()));
+        body.put("selectionEligibleAtMs", selectionEligibleAt.toEpochMilli());
+        body.put("selectionGraceRemainingMs", Math.max(
+                0L,
+                selectionEligibleAt.toEpochMilli() - Instant.now().toEpochMilli()
+        ));
+        body.put("lastHeartbeatAtMs", lastHeartbeatAt.toEpochMilli());
         return body;
     }
 }

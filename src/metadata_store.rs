@@ -352,6 +352,12 @@ ON CONFLICT (worker_id) DO UPDATE SET
     read_admission_wait_ms_ewma = EXCLUDED.read_admission_wait_ms_ewma,
     read_throughput_bytes_per_sec_ewma = EXCLUDED.read_throughput_bytes_per_sec_ewma,
     registry_ttl_ms = EXCLUDED.registry_ttl_ms,
+    first_seen_at = CASE
+        WHEN worker_registry.flight_uri IS DISTINCT FROM EXCLUDED.flight_uri
+          OR extract(epoch FROM (now() - worker_registry.last_heartbeat_at)) * 1000 > worker_registry.registry_ttl_ms
+        THEN now()
+        ELSE worker_registry.first_seen_at
+    END,
     last_heartbeat_at = now()
 "#,
                 &[
