@@ -19,6 +19,7 @@ import org.apache.arrow.vector.types.pojo.Schema;
 
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -49,7 +50,7 @@ final class CoordinatorFlightProducer implements FlightProducer {
     public FlightInfo getFlightInfo(CallContext context, FlightDescriptor descriptor) {
         Map<String, Object> request = Map.of();
         try {
-            request = descriptorRequest(descriptor);
+            request = requestWithHeaders(context, descriptorRequest(descriptor));
             FlightInfo response = flightInfo(coordinator.startFlight(request, endpointRewrite(context)), false);
             metrics.recordSuccess("GetFlightInfo", null);
             return response;
@@ -66,7 +67,7 @@ final class CoordinatorFlightProducer implements FlightProducer {
     public PollInfo pollFlightInfo(CallContext context, FlightDescriptor descriptor) {
         Map<String, Object> request = Map.of();
         try {
-            request = descriptorRequest(descriptor);
+            request = requestWithHeaders(context, descriptorRequest(descriptor));
             PollResult result = coordinator.pollFlight(request, endpointRewrite(context));
             FlightDescriptor nextDescriptor = result.complete()
                     ? null
@@ -99,7 +100,7 @@ final class CoordinatorFlightProducer implements FlightProducer {
     public void doAction(CallContext context, Action action, StreamListener<Result> listener) {
         Map<String, Object> request = Map.of();
         try {
-            request = actionBody(action);
+            request = requestWithHeaders(context, actionBody(action));
             WorkerEndpointRewrite endpointRewrite = endpointRewrite(context);
             Map<String, Object> response = switch (action.getType()) {
                 case "coordinator.config" -> coordinator.configJson();
@@ -199,5 +200,16 @@ final class CoordinatorFlightProducer implements FlightProducer {
             return WorkerEndpointRewrite.NONE;
         }
         return WorkerEndpointRewrite.fromBaseHostname(middleware.baseHostname());
+    }
+
+    private Map<String, Object> requestWithHeaders(CallContext context, Map<String, Object> request) {
+        BaseHostnameMiddleware middleware = context.getMiddleware(BaseHostnameMiddleware.KEY);
+        if (middleware == null || (middleware.authorization().isEmpty() && middleware.trinoUser().isEmpty())) {
+            return request;
+        }
+        LinkedHashMap<String, Object> merged = new LinkedHashMap<>(request);
+        middleware.authorization().ifPresent(value -> merged.put("authorization", value));
+        middleware.trinoUser().ifPresent(value -> merged.put("user", value));
+        return merged;
     }
 }

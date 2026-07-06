@@ -9,13 +9,23 @@ import java.util.Optional;
 
 final class BaseHostnameMiddleware implements FlightServerMiddleware {
     static final String HEADER_NAME = "x-base-hostname";
+    static final String AUTHORIZATION_HEADER = "authorization";
+    static final String TRINO_USER_HEADER = "x-trino-user";
     static final FlightServerMiddleware.Key<BaseHostnameMiddleware> KEY =
             FlightServerMiddleware.Key.of("base-hostname");
 
     private final Optional<String> baseHostname;
+    private final Optional<String> authorization;
+    private final Optional<String> trinoUser;
 
-    private BaseHostnameMiddleware(Optional<String> baseHostname) {
+    private BaseHostnameMiddleware(
+            Optional<String> baseHostname,
+            Optional<String> authorization,
+            Optional<String> trinoUser
+    ) {
         this.baseHostname = baseHostname;
+        this.authorization = authorization;
+        this.trinoUser = trinoUser;
     }
 
     static FlightServerMiddleware.Factory<BaseHostnameMiddleware> factory() {
@@ -24,6 +34,14 @@ final class BaseHostnameMiddleware implements FlightServerMiddleware {
 
     Optional<String> baseHostname() {
         return baseHostname;
+    }
+
+    Optional<String> authorization() {
+        return authorization;
+    }
+
+    Optional<String> trinoUser() {
+        return trinoUser;
     }
 
     @Override
@@ -43,8 +61,25 @@ final class BaseHostnameMiddleware implements FlightServerMiddleware {
             CallHeaders incomingHeaders,
             RequestContext context
     ) {
-        return new BaseHostnameMiddleware(Optional.ofNullable(incomingHeaders.get(HEADER_NAME))
+        return new BaseHostnameMiddleware(
+                trimHeader(incomingHeaders, HEADER_NAME),
+                trimHeader(incomingHeaders, AUTHORIZATION_HEADER).map(BaseHostnameMiddleware::bearerAuthorization),
+                trimHeader(incomingHeaders, TRINO_USER_HEADER)
+        );
+    }
+
+    private static Optional<String> trimHeader(CallHeaders headers, String name) {
+        return Optional.ofNullable(headers.get(name))
+                .or(() -> Optional.ofNullable(headers.get(name.toUpperCase(java.util.Locale.ROOT))))
                 .map(String::trim)
-                .filter(value -> !value.isBlank()));
+                .filter(value -> !value.isBlank());
+    }
+
+    private static String bearerAuthorization(String raw) {
+        String value = raw.trim();
+        if (value.regionMatches(true, 0, "Bearer ", 0, "Bearer ".length())) {
+            value = value.substring("Bearer".length()).trim();
+        }
+        return "Bearer " + value;
     }
 }
