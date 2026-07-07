@@ -1,6 +1,7 @@
 package com.arrowflight.coordinator;
 
 import java.util.Properties;
+import java.util.Map;
 
 import org.flywaydb.core.Flyway;
 import org.flywaydb.core.api.output.MigrateResult;
@@ -11,11 +12,15 @@ final class CoordinatorMigrations {
 
     static void migrate(Config config) {
         if (!config.metadataMigrationsEnabled) {
-            System.out.println("coordinator metadata migrations disabled");
+            CoordinatorLog.info("coordinator_migrations_skipped", Map.of(
+                    "reason", "disabled"
+            ));
             return;
         }
         if (config.metadataDatabaseUrl.isEmpty()) {
-            System.out.println("coordinator metadata migrations skipped: metadata database is not configured");
+            CoordinatorLog.info("coordinator_migrations_skipped", Map.of(
+                    "reason", "metadata database is not configured"
+            ));
             return;
         }
 
@@ -33,9 +38,8 @@ final class CoordinatorMigrations {
                 .load();
 
         MigrateResult result = flyway.migrate();
-        System.out.printf(
-                "coordinator metadata migrations complete: executed=%d%n",
-                result.migrationsExecuted
-        );
+        CoordinatorLog.info("coordinator_migrations_complete", Map.of(
+                "migrationsExecuted", result.migrationsExecuted
+        ));
     }
 }

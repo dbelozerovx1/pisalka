@@ -46,11 +46,10 @@ final class KubernetesWorkerEndpointDiscovery implements WorkerEndpointDiscovery
 
     KubernetesWorkerEndpointDiscovery start() {
         client = new KubernetesClientBuilder().build();
-        System.out.printf(
-                "starting Kubernetes worker endpoint discovery namespace=%s selector=%s%n",
-                config.k8sNamespace,
-                config.k8sWorkerServiceSelector
-        );
+        CoordinatorLog.info("worker_endpoint_discovery_started", Map.of(
+                "k8sNamespace", config.k8sNamespace,
+                "selector", config.k8sWorkerServiceSelector
+        ));
         informer = client.services()
                 .inNamespace(config.k8sNamespace)
                 .withLabelSelector(config.k8sWorkerServiceSelector)
@@ -84,21 +83,18 @@ final class KubernetesWorkerEndpointDiscovery implements WorkerEndpointDiscovery
                 break;
             }
         }
-        System.out.printf(
-                "Kubernetes worker endpoint discovery synced=%s%n",
-                informer.hasSynced()
-        );
+        CoordinatorLog.info("worker_endpoint_discovery_synced", Map.of(
+                "synced", informer.hasSynced()
+        ));
     }
 
     private void safeUpsert(Service service) {
         try {
             upsert(service);
         } catch (RuntimeException error) {
-            System.err.printf(
-                    "failed to update worker client endpoint from service=%s error=%s%n",
-                    serviceName(service),
-                    error.getMessage()
-            );
+            CoordinatorLog.error("worker_endpoint_update_failed", Map.of(
+                    "service", serviceName(service)
+            ), error);
         }
     }
 
@@ -106,11 +102,9 @@ final class KubernetesWorkerEndpointDiscovery implements WorkerEndpointDiscovery
         try {
             remove(service);
         } catch (RuntimeException error) {
-            System.err.printf(
-                    "failed to remove worker client endpoint from service=%s error=%s%n",
-                    serviceName(service),
-                    error.getMessage()
-            );
+            CoordinatorLog.error("worker_endpoint_remove_failed", Map.of(
+                    "service", serviceName(service)
+            ), error);
         }
     }
 
@@ -124,7 +118,9 @@ final class KubernetesWorkerEndpointDiscovery implements WorkerEndpointDiscovery
         if (endpoint.isEmpty()) {
             metadataStore.deleteWorkerClientEndpoint(workerId.get());
             if (lastFlightUris.remove(workerId.get()) != null) {
-                System.out.printf("worker client endpoint unavailable worker_id=%s%n", workerId.get());
+                CoordinatorLog.warn("worker_client_endpoint_unavailable", Map.of(
+                        "workerId", workerId.get()
+                ));
             }
             return;
         }
@@ -139,7 +135,10 @@ final class KubernetesWorkerEndpointDiscovery implements WorkerEndpointDiscovery
         metadataStore.upsertWorkerClientEndpoint(clientEndpoint);
         String previous = lastFlightUris.put(workerId.get(), endpoint.get());
         if (!endpoint.get().equals(previous)) {
-            System.out.printf("worker client endpoint updated worker_id=%s flight_uri=%s%n", workerId.get(), endpoint.get());
+            CoordinatorLog.info("worker_client_endpoint_updated", Map.of(
+                    "workerId", workerId.get(),
+                    "flightUri", endpoint.get()
+            ));
         }
     }
 
@@ -147,7 +146,9 @@ final class KubernetesWorkerEndpointDiscovery implements WorkerEndpointDiscovery
         workerId(service).ifPresent(workerId -> {
             metadataStore.deleteWorkerClientEndpoint(workerId);
             if (lastFlightUris.remove(workerId) != null) {
-                System.out.printf("worker client endpoint removed worker_id=%s%n", workerId);
+                CoordinatorLog.info("worker_client_endpoint_removed", Map.of(
+                        "workerId", workerId
+                ));
             }
         });
     }

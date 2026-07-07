@@ -5,6 +5,7 @@ use arrow_flight::flight_service_server::FlightServiceServer;
 use arrow_flight_s3_mvp::{
     config::{AppConfig, FlightTlsConfig},
     flight_service::WorkerFlightService,
+    logging::init_tracing,
     metadata_store::MetadataStore,
     metrics::{WorkerMetrics, spawn_metrics_server},
     util::build_object_store,
@@ -15,9 +16,7 @@ use tracing::{error, info};
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .init();
+    init_tracing("worker");
 
     let config = AppConfig::from_env()?;
     let store = build_object_store(&config.s3)?;

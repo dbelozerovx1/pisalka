@@ -2,7 +2,6 @@ package com.arrowflight.coordinator;
 
 import org.apache.arrow.flight.CallStatus;
 
-import java.time.Instant;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Optional;
@@ -192,7 +191,6 @@ final class CoordinatorErrorFormatter {
 
     private static void log(ErrorEnvelope envelope, RuntimeException error) {
         LinkedHashMap<String, Object> body = new LinkedHashMap<>();
-        body.put("event", "coordinator_error");
         body.put("errorId", envelope.errorId());
         body.put("status", envelope.flightStatus());
         body.put("code", envelope.code());
@@ -201,11 +199,7 @@ final class CoordinatorErrorFormatter {
         body.putAll(envelope.context().ids());
         body.put("message", normalize(error.getMessage()));
         body.put("userMessage", envelope.message());
-        body.put("timestamp", Instant.now().toString());
-        System.err.println(Json.stringify(body));
-        if (envelope.includeCause()) {
-            error.printStackTrace(System.err);
-        }
+        CoordinatorLog.error("coordinator_error", body, envelope.includeCause() ? error : null);
     }
 
     record ErrorContext(

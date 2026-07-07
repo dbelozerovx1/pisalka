@@ -110,6 +110,10 @@ services:
         condition: service_healthy
     environment: &flight-server-environment
       RUST_LOG: info
+      LOG_ENV: "${LOG_ENV:-local}"
+      LOG_GROUP: "${LOG_GROUP:-arrow-flight}"
+      LOG_SYSTEM: "${WORKER_LOG_SYSTEM:-flight-worker}"
+      LOG_NAMESPACE: "${LOG_NAMESPACE:-local}"
       FLIGHT_ADDR: 0.0.0.0:50051
       METRICS_ENABLED: "${METRICS_ENABLED:-true}"
       METRICS_ADDR: "${METRICS_ADDR:-0.0.0.0:9090}"
@@ -193,6 +197,10 @@ services:
       trino-init:
         condition: service_completed_successfully
     environment:
+      LOG_ENV: "${LOG_ENV:-local}"
+      LOG_GROUP: "${LOG_GROUP:-arrow-flight}"
+      LOG_SYSTEM: "${COORDINATOR_LOG_SYSTEM:-flight-coordinator}"
+      LOG_NAMESPACE: "${LOG_NAMESPACE:-local}"
       COORDINATOR_ADDR: 0.0.0.0:8088
       COORDINATOR_METRICS_ENABLED: "${COORDINATOR_METRICS_ENABLED:-true}"
       COORDINATOR_METRICS_ADDR: "${COORDINATOR_METRICS_ADDR:-0.0.0.0:9091}"

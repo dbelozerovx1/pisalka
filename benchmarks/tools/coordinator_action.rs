@@ -64,7 +64,8 @@ async fn main() -> Result<()> {
     let mut count = 0usize;
     while let Some(result) = stream.try_next().await? {
         count += 1;
-        let value: Value = serde_json::from_slice(&result).context("invalid JSON action response")?;
+        let value: Value =
+            serde_json::from_slice(&result).context("invalid JSON action response")?;
         println!("{}", serde_json::to_string_pretty(&value)?);
     }
     anyhow::ensure!(count > 0, "coordinator action returned no results");

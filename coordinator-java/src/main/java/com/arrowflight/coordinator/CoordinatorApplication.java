@@ -5,11 +5,14 @@ import org.apache.arrow.flight.Location;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
 
+import java.util.Map;
+
 public final class CoordinatorApplication {
     private CoordinatorApplication() {
     }
 
     public static void main(String[] args) throws Exception {
+        CoordinatorLog.installStdStreamWrapper();
         Config config = Config.fromEnv();
         CoordinatorMigrations.migrate(config);
         CoordinatorMetrics metrics = new CoordinatorMetrics();
@@ -28,12 +31,11 @@ public final class CoordinatorApplication {
                      .maxInboundMessageSize(config.flightMaxMessageSize)
                      .build()
                      .start()) {
-            System.out.printf(
-                    "coordinator flight service listening on %s, trino=%s, metadata_db=%s%n",
-                    server.getLocation(),
-                    config.trinoUri,
-                    coordinator.metadataEnabled()
-            );
+            CoordinatorLog.info("coordinator_started", Map.of(
+                    "location", server.getLocation().toString(),
+                    "trinoUri", config.trinoUri.toString(),
+                    "metadataDb", coordinator.metadataEnabled()
+            ));
             server.awaitTermination();
         }
     }

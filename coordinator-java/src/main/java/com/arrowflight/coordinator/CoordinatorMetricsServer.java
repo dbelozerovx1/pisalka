@@ -50,7 +50,9 @@ final class CoordinatorMetricsServer implements AutoCloseable {
         });
         server.setExecutor(executor);
         server.start();
-        System.out.printf("coordinator metrics endpoint listening on %s%n", config.coordinatorMetricsAddress);
+        CoordinatorLog.info("coordinator_metrics_started", Map.of(
+                "address", config.coordinatorMetricsAddress.toString()
+        ));
         return new CoordinatorMetricsServer(server, executor);
     }
 
