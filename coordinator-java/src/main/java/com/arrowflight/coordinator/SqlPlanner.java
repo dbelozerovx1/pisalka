@@ -40,6 +40,14 @@ final class SqlPlanner {
         return out.toString();
     }
 
+    static String buildCreateSchema(String schemaName, String location) {
+        return "CREATE SCHEMA IF NOT EXISTS "
+                + quoteIdentifier(validateIdentifier(schemaName, "schemaName"))
+                + " WITH (location = '"
+                + escapeSqlString(location)
+                + "')";
+    }
+
     static String normalizeSourceSql(String sql) {
         if (sql == null || sql.isBlank()) {
             throw new IllegalArgumentException("sql is required");
@@ -78,6 +86,17 @@ final class SqlPlanner {
             throw new IllegalArgumentException(
                     "targetTable must be an unquoted simple identifier such as catalog.schema.table"
             );
+        }
+        return trimmed;
+    }
+
+    static String validateIdentifier(String value, String name) {
+        if (value == null || value.isBlank()) {
+            throw new IllegalArgumentException(name + " is required");
+        }
+        String trimmed = value.trim();
+        if (!trimmed.matches("[A-Za-z_][A-Za-z0-9_]*")) {
+            throw new IllegalArgumentException(name + " must be an unquoted simple identifier");
         }
         return trimmed;
     }

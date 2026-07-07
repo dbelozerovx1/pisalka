@@ -13,7 +13,7 @@ bool_enabled() {
 
 usage() {
   cat >&2 <<'USAGE'
-usage: dev/e2e-write-table.sh <schema.table|catalog.schema.table>
+usage: dev/e2e-write-table.sh <table|schema.table>
 
 Creates an example Arrow dataset, writes it through coordinator-issued DoPut
 tickets, commits it into Iceberg, and verifies that Trino can read it.
@@ -33,7 +33,6 @@ USAGE
 
 qualify_table() {
   local raw="$1"
-  local catalog="${E2E_CATALOG:-iceberg}"
   local schema="${E2E_SCHEMA:-arrow}"
   local dot_count="${raw//[^.]}"
   if [[ -z "$raw" || "$raw" == .* || "$raw" == *. || "$raw" == *..* ]]; then
@@ -41,11 +40,10 @@ qualify_table() {
     return 2
   fi
   case "${#dot_count}" in
-    0) printf '%s.%s.%s\n' "$catalog" "$schema" "$raw" ;;
-    1) printf '%s.%s\n' "$catalog" "$raw" ;;
-    2) printf '%s\n' "$raw" ;;
+    0) printf '%s.%s\n' "$schema" "$raw" ;;
+    1) printf '%s\n' "$raw" ;;
     *)
-      echo "table name must be table, schema.table, or catalog.schema.table: $raw" >&2
+      echo "table name must be table or schema.table: $raw" >&2
       return 2
       ;;
   esac
@@ -54,9 +52,8 @@ qualify_table() {
 table_part() {
   local table="$1"
   local index="$2"
-  IFS='.' read -r catalog schema name <<<"$table"
+  IFS='.' read -r schema name <<<"$table"
   case "$index" in
-    catalog) printf '%s\n' "$catalog" ;;
     schema) printf '%s\n' "$schema" ;;
     name) printf '%s\n' "$name" ;;
   esac
@@ -121,8 +118,9 @@ if [[ -z "$raw_table" || "${raw_table:-}" == "-h" || "${raw_table:-}" == "--help
 fi
 
 table_name="$(qualify_table "$raw_table")"
-catalog="$(table_part "$table_name" catalog)"
+catalog="${E2E_CATALOG:-iceberg}"
 schema="$(table_part "$table_name" schema)"
+trino_table="$catalog.$table_name"
 safe_table="$(printf '%s' "$table_name" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9_' '_')"
 timestamp="$(date +%Y%m%d-%H%M%S)"
 
@@ -139,8 +137,23 @@ ensure_input "$input" "$size"
 
 echo "target_table=$table_name"
 echo "ensuring_schema=$catalog.$schema"
-docker compose run --rm --entrypoint python trino-init \
-  /run_sql.py "CREATE SCHEMA IF NOT EXISTS $catalog.$schema"
+schema_action_body="$(printf '{"schemaName":"%s"}' "$schema")"
+schema_action_args=(
+  --coordinator-uri "${E2E_COORDINATOR_URI:-http://coordinator:8088}"
+  --action coordinator.create-schema
+  --body "$schema_action_body"
+  --user "${TRINO_USER:-local}"
+)
+if [[ -n "${TRINO_AUTHORIZATION:-}" ]]; then
+  schema_action_args+=(--authorization "$TRINO_AUTHORIZATION")
+fi
+if [[ -n "${COORDINATOR_ADMIN_TOKEN:-}" ]]; then
+  schema_action_args+=(--admin-token "$COORDINATOR_ADMIN_TOKEN")
+fi
+docker compose run --rm \
+  --entrypoint coordinator-action \
+  bench \
+  "${schema_action_args[@]}"
 
 args=(
   --input "$input"
@@ -192,11 +205,11 @@ docker compose run --rm \
   bench-coordinator \
   "${args[@]}"
 
-echo "verifying_trino_table=true table=$table_name"
+echo "verifying_trino_table=true table=$trino_table"
 docker compose run --rm --entrypoint python trino-init \
-  /run_sql.py "SELECT count(*) AS row_count FROM $table_name"
+  /run_sql.py "SELECT count(*) AS row_count FROM $trino_table"
 docker compose run --rm --entrypoint python trino-init \
-  /run_sql.py "SELECT * FROM $table_name LIMIT $verify_limit"
+  /run_sql.py "SELECT * FROM $trino_table LIMIT $verify_limit"
 
 echo "table_ready=$table_name"
 echo "read_example=dev/e2e-read-table.sh $table_name"

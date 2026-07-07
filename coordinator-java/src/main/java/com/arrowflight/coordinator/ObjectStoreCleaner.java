@@ -32,12 +32,24 @@ final class ObjectStoreCleaner {
     }
 
     CleanupResult deleteCtasStaging(String queryId) {
-        return deletePrefix("coordinator/ctas/" + queryId);
+        return deleteUriPrefix(config.ctasLocation(queryId));
     }
 
     CleanupResult deletePrefix(String rawPrefix) {
         String prefix = Config.normalizePrefix(rawPrefix);
         String uri = config.objectUriForPrefix(prefix);
+        return deleteUriPrefix(prefix, uri);
+    }
+
+    private CleanupResult deleteUriPrefix(String rawUri) {
+        String uri = rawUri == null ? "" : rawUri.trim();
+        if (uri.isBlank()) {
+            return new CleanupResult("", "", false, false, 1, 0, Optional.of("uri prefix must not be empty"));
+        }
+        return deleteUriPrefix(uri, uri);
+    }
+
+    private CleanupResult deleteUriPrefix(String prefix, String uri) {
         try {
             Path path = new Path(uri);
             FileSystem fs = path.getFileSystem(hadoopConf);

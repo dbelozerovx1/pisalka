@@ -13,7 +13,7 @@ bool_enabled() {
 
 usage() {
   cat >&2 <<'USAGE'
-usage: dev/e2e-read-table.sh <schema.table|catalog.schema.table>
+usage: dev/e2e-read-table.sh <table|schema.table>
 
 Runs the user-facing read path:
   coordinator GetFlightInfo CTAS -> PollFlightInfo -> worker DoGet tickets
@@ -22,7 +22,7 @@ and prints a small Arrow table preview to the console.
 Useful env:
   E2E_READ_LIMIT=20
   E2E_READ_SQL='SELECT ...'
-  E2E_TARGET_TABLE=iceberg.arrow.my_read_tmp  # optional debug override
+  E2E_TARGET_TABLE=arrow.my_read_tmp  # optional debug override
   E2E_PREVIEW_ROWS=20
   E2E_READ_MAX_ENDPOINTS=
   E2E_DROP_TEMP_AFTER=true
@@ -32,7 +32,6 @@ USAGE
 
 qualify_table() {
   local raw="$1"
-  local catalog="${E2E_CATALOG:-iceberg}"
   local schema="${E2E_SCHEMA:-arrow}"
   local dot_count="${raw//[^.]}"
   if [[ -z "$raw" || "$raw" == .* || "$raw" == *. || "$raw" == *..* ]]; then
@@ -40,11 +39,10 @@ qualify_table() {
     return 2
   fi
   case "${#dot_count}" in
-    0) printf '%s.%s.%s\n' "$catalog" "$schema" "$raw" ;;
-    1) printf '%s.%s\n' "$catalog" "$raw" ;;
-    2) printf '%s\n' "$raw" ;;
+    0) printf '%s.%s\n' "$schema" "$raw" ;;
+    1) printf '%s\n' "$raw" ;;
     *)
-      echo "table name must be table, schema.table, or catalog.schema.table: $raw" >&2
+      echo "table name must be table or schema.table: $raw" >&2
       return 2
       ;;
   esac
@@ -53,9 +51,8 @@ qualify_table() {
 table_part() {
   local table="$1"
   local index="$2"
-  IFS='.' read -r catalog schema name <<<"$table"
+  IFS='.' read -r schema name <<<"$table"
   case "$index" in
-    catalog) printf '%s\n' "$catalog" ;;
     schema) printf '%s\n' "$schema" ;;
     name) printf '%s\n' "$name" ;;
   esac
@@ -100,8 +97,9 @@ if [[ -z "$raw_table" || "${raw_table:-}" == "-h" || "${raw_table:-}" == "--help
 fi
 
 source_table="$(qualify_table "$raw_table")"
-source_catalog="$(table_part "$source_table" catalog)"
+source_catalog="${E2E_CATALOG:-iceberg}"
 source_schema="$(table_part "$source_table" schema)"
+source_name="$(table_part "$source_table" name)"
 target_table=""
 if [[ -n "${E2E_TARGET_TABLE:-}" ]]; then
   target_table="$(qualify_table "$E2E_TARGET_TABLE")"
@@ -113,9 +111,9 @@ if [[ -n "${E2E_READ_SQL:-}" ]]; then
 else
   read_limit_lc="$(printf '%s' "$read_limit" | tr '[:upper:]' '[:lower:]')"
   if [[ "$read_limit_lc" == "none" || "$read_limit_lc" == "all" || "$read_limit_lc" == "off" ]]; then
-    sql="SELECT * FROM $source_table"
+    sql="SELECT * FROM $source_name"
   else
-    sql="SELECT * FROM $source_table LIMIT $read_limit"
+    sql="SELECT * FROM $source_name LIMIT $read_limit"
   fi
 fi
 
@@ -123,12 +121,27 @@ start_stack
 
 echo "source_table=$source_table"
 if [[ -n "$target_table" ]]; then
-  target_catalog="$(table_part "$target_table" catalog)"
+  target_catalog="$source_catalog"
   target_schema="$(table_part "$target_table" schema)"
   echo "ctas_table=$target_table"
   echo "ensuring_schema=$target_catalog.$target_schema"
-  docker compose run --rm --entrypoint python trino-init \
-    /run_sql.py "CREATE SCHEMA IF NOT EXISTS $target_catalog.$target_schema"
+  schema_action_body="$(printf '{"schemaName":"%s"}' "$target_schema")"
+  schema_action_args=(
+    --coordinator-uri "${E2E_COORDINATOR_URI:-http://coordinator:8088}"
+    --action coordinator.create-schema
+    --body "$schema_action_body"
+    --user "${TRINO_USER:-local}"
+  )
+  if [[ -n "${TRINO_AUTHORIZATION:-}" ]]; then
+    schema_action_args+=(--authorization "$TRINO_AUTHORIZATION")
+  fi
+  if [[ -n "${COORDINATOR_ADMIN_TOKEN:-}" ]]; then
+    schema_action_args+=(--admin-token "$COORDINATOR_ADMIN_TOKEN")
+  fi
+  docker compose run --rm \
+    --entrypoint coordinator-action \
+    bench \
+    "${schema_action_args[@]}"
 else
   echo "ctas_table=<coordinator-generated-from-query-id>"
 fi
@@ -137,6 +150,7 @@ echo "ctas_sql=$sql"
 args=(
   --coordinator-uri "${E2E_COORDINATOR_URI:-http://coordinator:8088}"
   --sql "$sql"
+  --schema "$source_schema"
   --read-results
   --preview-rows "${E2E_PREVIEW_ROWS:-20}"
 )
@@ -167,6 +181,7 @@ docker compose run --rm \
   --entrypoint env bench \
   -u COORDINATOR_QUERY_SQL \
   -u COORDINATOR_TARGET_TABLE \
+  -u COORDINATOR_SCHEMA \
   -u COORDINATOR_POLL_INTERVAL_MS \
   -u COORDINATOR_MAX_POLLS \
   -u COORDINATOR_READ_RESULTS \

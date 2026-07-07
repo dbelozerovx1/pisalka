@@ -123,6 +123,7 @@ case "$mode" in
 
     for optional_env in \
       COORDINATOR_TABLE_NAME \
+      COORDINATOR_SCHEMA \
       COORDINATOR_COMMIT_MODE \
       GET_MAX_BATCH_ROWS \
       GET_MAX_RECORD_BATCH_BYTES \
@@ -139,7 +140,7 @@ case "$mode" in
     bench-coordinator "${args[@]}"
     ;;
   coordinator-query|coord-query|ctas)
-    target_table="${COORDINATOR_TARGET_TABLE:-iceberg.arrow.ctas_tmp_${timestamp//-/_}}"
+    target_table="${COORDINATOR_TARGET_TABLE:-arrow.ctas_tmp_${timestamp//-/_}}"
     sql="${COORDINATOR_QUERY_SQL:-SELECT * FROM (VALUES (1, 'hello')) AS t(id, name)}"
 
     args=(
@@ -164,6 +165,7 @@ case "$mode" in
     for optional_env in \
       COORDINATOR_POLL_INTERVAL_MS \
       COORDINATOR_MAX_POLLS \
+      COORDINATOR_SCHEMA \
       TRINO_USER \
       TRINO_AUTHORIZATION
     do
@@ -174,6 +176,25 @@ case "$mode" in
 
     coordinator-query "${args[@]}"
     ;;
+  coordinator-action|coord-action|action)
+    args=(
+      --coordinator-uri "${COORDINATOR_URI:-http://coordinator:8088}"
+      --action "${COORDINATOR_ACTION:?COORDINATOR_ACTION is required}"
+      --body "${COORDINATOR_ACTION_BODY:-{}}"
+    )
+
+    if [[ -n "${TRINO_USER:-}" ]]; then
+      args+=(--user "$TRINO_USER")
+    fi
+    if [[ -n "${TRINO_AUTHORIZATION:-}" ]]; then
+      args+=(--authorization "$TRINO_AUTHORIZATION")
+    fi
+    if [[ -n "${COORDINATOR_ADMIN_TOKEN:-}" ]]; then
+      args+=(--admin-token "$COORDINATOR_ADMIN_TOKEN")
+    fi
+
+    coordinator-action "${args[@]}"
+    ;;
   get)
     bench-get --path "$path"
     ;;
@@ -181,7 +202,7 @@ case "$mode" in
     echo "generated_input=$input"
     ;;
   *)
-    echo "unsupported BENCH_MODE=$mode; use single, multi, coordinator, coordinator-query, get, or generate" >&2
+    echo "unsupported BENCH_MODE=$mode; use single, multi, coordinator, coordinator-query, coordinator-action, get, or generate" >&2
     exit 2
     ;;
 esac

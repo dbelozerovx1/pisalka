@@ -23,7 +23,16 @@ final class TrinoClient {
 
     QueryHandle submitStatement(String sql, String trinoUser, Optional<String> authorization)
             throws IOException, InterruptedException {
-        HttpRequest request = baseRequest(config.trinoUri.resolve("/v1/statement"), trinoUser, authorization)
+        return submitStatement(sql, trinoUser, authorization, Optional.empty());
+    }
+
+    QueryHandle submitStatement(
+            String sql,
+            String trinoUser,
+            Optional<String> authorization,
+            Optional<String> schema
+    ) throws IOException, InterruptedException {
+        HttpRequest request = baseRequest(config.trinoUri.resolve("/v1/statement"), trinoUser, authorization, schema)
                 .POST(HttpRequest.BodyPublishers.ofString(sql, StandardCharsets.UTF_8))
                 .header("content-type", "text/plain; charset=utf-8")
                 .build();
@@ -33,7 +42,16 @@ final class TrinoClient {
 
     QueryHandle runStatement(String sql, String trinoUser, Optional<String> authorization)
             throws IOException, InterruptedException {
-        QueryHandle handle = submitStatement(sql, trinoUser, authorization);
+        return runStatement(sql, trinoUser, authorization, Optional.empty());
+    }
+
+    QueryHandle runStatement(
+            String sql,
+            String trinoUser,
+            Optional<String> authorization,
+            Optional<String> schema
+    ) throws IOException, InterruptedException {
+        QueryHandle handle = submitStatement(sql, trinoUser, authorization, schema);
         while (handle.nextUri().isPresent()) {
             handle = pollNext(handle.nextUri().orElseThrow(), trinoUser, authorization);
         }
@@ -42,19 +60,24 @@ final class TrinoClient {
 
     QueryHandle pollNext(String nextUri, String trinoUser, Optional<String> authorization)
             throws IOException, InterruptedException {
-        HttpRequest request = baseRequest(URI.create(nextUri), trinoUser, authorization)
+        HttpRequest request = baseRequest(URI.create(nextUri), trinoUser, authorization, Optional.empty())
                 .GET()
                 .build();
         HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
         return queryHandle(parseTrinoResponse(response));
     }
 
-    private HttpRequest.Builder baseRequest(URI uri, String trinoUser, Optional<String> authorization) {
+    private HttpRequest.Builder baseRequest(
+            URI uri,
+            String trinoUser,
+            Optional<String> authorization,
+            Optional<String> schema
+    ) {
         HttpRequest.Builder builder = HttpRequest.newBuilder(uri)
                 .timeout(config.trinoRequestTimeout)
                 .header("X-Trino-User", trinoUser)
                 .header("X-Trino-Catalog", config.trinoCatalog)
-                .header("X-Trino-Schema", config.trinoSchema)
+                .header("X-Trino-Schema", schema.filter(value -> !value.isBlank()).orElse(config.trinoSchema))
                 .header("X-Trino-Source", config.trinoSource);
         authorization.ifPresent(value -> builder.header("Authorization", value));
         return builder;

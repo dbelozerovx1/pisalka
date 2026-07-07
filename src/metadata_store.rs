@@ -5,8 +5,6 @@ use tracing::error;
 
 use crate::{config::MetadataConfig, worker_status::WorkerStatus};
 
-const WORKER_METADATA_MIGRATION: &str = include_str!("../db/migrations/0001_worker_metadata.sql");
-
 pub struct MetadataStore {
     client: Client,
 }
@@ -54,21 +52,7 @@ impl MetadataStore {
             }
         });
 
-        let store = Self { client };
-        if config.auto_migrate {
-            store.migrate().await?;
-        }
-
-        Ok(Some(store))
-    }
-
-    pub async fn migrate(&self) -> Result<()> {
-        self.client
-            .batch_execute(WORKER_METADATA_MIGRATION)
-            .await
-            .context("failed to migrate metadata database")?;
-
-        Ok(())
+        Ok(Some(Self { client }))
     }
 
     pub async fn record_admitted(&self, record: &PutStreamStartRecord) -> Result<()> {

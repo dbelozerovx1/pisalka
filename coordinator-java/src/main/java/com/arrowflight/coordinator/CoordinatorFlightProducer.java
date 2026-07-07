@@ -104,6 +104,7 @@ final class CoordinatorFlightProducer implements FlightProducer {
             WorkerEndpointRewrite endpointRewrite = endpointRewrite(context);
             Map<String, Object> response = switch (action.getType()) {
                 case "coordinator.config" -> coordinator.configJson();
+                case "coordinator.create-schema", "coordinator.create_schema" -> coordinator.createSchema(request);
                 case "coordinator.create-upload" -> coordinator.createUpload(request, endpointRewrite);
                 case "coordinator.commit-upload", "coordinator.do-commit" -> coordinator.commitUpload(request);
                 case "coordinator.abort-upload" -> coordinator.abortUpload(request);
@@ -127,6 +128,7 @@ final class CoordinatorFlightProducer implements FlightProducer {
     @Override
     public void listActions(CallContext context, StreamListener<ActionType> listener) {
         listener.onNext(new ActionType("coordinator.config", "Return non-secret coordinator configuration"));
+        listener.onNext(new ActionType("coordinator.create-schema", "Create an Iceberg schema through Trino"));
         listener.onNext(new ActionType("coordinator.create-upload", "Create a durable upload session and signed DoPut tickets"));
         listener.onNext(new ActionType("coordinator.commit-upload", "Commit uploaded files to Iceberg with append or overwrite"));
         listener.onNext(new ActionType("coordinator.do-commit", "Alias for coordinator.commit-upload"));

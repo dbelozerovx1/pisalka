@@ -33,6 +33,10 @@ final class CoordinatorMetadataStore {
         return jdbcTarget.isPresent();
     }
 
+    long workerSelectionGraceMs() {
+        return config.workerSelectionGraceMs;
+    }
+
     void requireEnabled() {
         if (jdbcTarget.isEmpty()) {
             throw new CoordinatorException(503, "coordinator metadata database is not configured");

@@ -32,6 +32,9 @@ struct Args {
     #[arg(long, env = "COORDINATOR_TARGET_TABLE")]
     target_table: Option<String>,
 
+    #[arg(long, env = "COORDINATOR_SCHEMA")]
+    schema: Option<String>,
+
     #[arg(long, env = "TRINO_USER", default_value = "local")]
     user: String,
 
@@ -76,6 +79,7 @@ async fn main() -> Result<()> {
     body.insert("sql".to_owned(), Value::String(args.sql.clone()));
     body.insert("user".to_owned(), Value::String(args.user.clone()));
     insert_string(&mut body, "targetTable", args.target_table.clone());
+    insert_string(&mut body, "schema", args.schema.clone());
     insert_string(&mut body, "authorization", args.authorization.clone());
 
     let flight_info = client

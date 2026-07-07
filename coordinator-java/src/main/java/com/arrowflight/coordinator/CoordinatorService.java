@@ -48,6 +48,8 @@ final class CoordinatorService {
         body.put("trinoSchema", config.trinoSchema);
         body.put("ctasCatalog", config.ctasCatalog);
         body.put("ctasSchema", config.ctasSchema);
+        body.put("ctasLocationPrefix", config.ctasLocationPrefix);
+        body.put("defaultSchemaLocationPrefix", config.defaultSchemaLocationPrefix);
         body.put("icebergCatalogName", config.icebergCatalogName);
         body.put("icebergCatalogUri", config.icebergCatalogUri);
         body.put("icebergWarehouse", config.icebergWarehouse);
@@ -68,6 +70,34 @@ final class CoordinatorService {
         return body;
     }
 
+    Map<String, Object> createSchema(Map<String, Object> request) {
+        requireAdminIfConfigured(request);
+        String schemaName = SqlPlanner.validateIdentifier(Json.requiredString(request, "schemaName"), "schemaName");
+        String location = Optional.ofNullable(Json.string(request, "location"))
+                .filter(value -> !value.isBlank())
+                .orElseGet(() -> config.defaultSchemaLocation(schemaName));
+        String trinoUser = stringOrDefault(request, "user", "anonymous");
+        Optional<String> authorization = authorizationFrom(request);
+        String sql = SqlPlanner.buildCreateSchema(schemaName, location);
+        try {
+            TrinoClient.QueryHandle handle = trinoClient.runStatement(sql, trinoUser, authorization);
+            LinkedHashMap<String, Object> body = new LinkedHashMap<>();
+            body.put("schemaName", schemaName);
+            body.put("catalog", config.trinoCatalog);
+            body.put("location", location);
+            body.put("created", true);
+            body.put("sql", sql);
+            handle.queryId().ifPresent(value -> body.put("trinoQueryId", value));
+            return body;
+        } catch (Exception error) {
+            throw new CoordinatorException(
+                    500,
+                    "failed to create schema " + schemaName + " through Trino: " + error.getMessage(),
+                    error
+            );
+        }
+    }
+
     Map<String, Object> createUpload(Map<String, Object> request) {
         return createUpload(request, WorkerEndpointRewrite.NONE);
     }
@@ -78,10 +108,6 @@ final class CoordinatorService {
 
         String operationId = stringOrDefault(request, "operationId", UUID.randomUUID().toString());
         String uploadId = stringOrDefault(request, "uploadId", operationId);
-        String tableName = Optional.ofNullable(Json.string(request, "tableName"))
-                .filter(value -> !value.isBlank())
-                .orElseGet(() -> config.generatedUploadTable(uploadId));
-        String outputPrefix = tableDataPrefix(tableName);
         String mode = requestedCommitMode(request).orElse("append");
         String trinoUser = stringOrDefault(request, "user", "anonymous");
         Optional<String> authorization = authorizationFrom(request);
@@ -94,6 +120,13 @@ final class CoordinatorService {
         );
         Optional<UploadSnapshot> existing = metadataStore.loadUploadIfExists(uploadId);
         if (existing.isPresent()) {
+            String tableName = optionalClientTable(request, "tableName")
+                    .map(ClientTable::name)
+                    .or(() -> existing.get().session().tableName())
+                    .orElseThrow(() -> new CoordinatorException(
+                            409,
+                            "existing upload " + uploadId + " has no target table; create a new uploadId"
+                    ));
             return createUploadResponse(
                     existing.get(),
                     request,
@@ -107,6 +140,11 @@ final class CoordinatorService {
                     endpointRewrite
             );
         }
+
+        ClientTable table = requiredClientTable(request, "tableName");
+        IcebergTableTarget target = icebergCommitter.resolveTableTarget(table, mode);
+        String tableName = target.tableName();
+        String outputPrefix = tableDataPrefix(target.tableLocation());
 
         int requestedStreams = Math.max(1, Math.min(
                 Json.intValue(request, "streams", config.defaultUploadStreams),
@@ -167,7 +205,7 @@ final class CoordinatorService {
         Optional<Map<String, Object>> overwritePreparation = Optional.empty();
         try {
             if (mode.equals("overwrite")) {
-                overwritePreparation = Optional.of(prepareOverwriteUpload(tableName, trinoUser, authorization));
+                overwritePreparation = Optional.of(prepareOverwriteUpload(target, trinoUser, authorization));
                 metadataStore.markPlanned(uploadId);
             }
         } catch (RuntimeException error) {
@@ -413,16 +451,19 @@ final class CoordinatorService {
         boolean icebergCommitStarted = false;
         boolean icebergCommitCompleted = false;
         try {
-            tableExistedBeforeCommit = icebergCommitter.tableExists(plan.tableName());
+            IcebergTableTarget target = icebergCommitter.resolveTableTarget(plan.table(), mode);
+            if (!target.tableLocation().equals(plan.tableLocation())) {
+                throw new CoordinatorException(
+                        409,
+                        "upload " + uploadId + " was planned for table location " + plan.tableLocation()
+                                + " but catalog now resolves " + plan.tableName()
+                                + " to " + target.tableLocation()
+                                + "; create a new upload"
+                );
+            }
+            tableExistedBeforeCommit = target.tableExists();
             Optional<Map<String, Object>> appendCompatibility = Optional.empty();
             if (mode.equals("append")) {
-                if (!tableExistedBeforeCommit) {
-                    throw new CoordinatorException(
-                            409,
-                            "append commit requires an existing Iceberg table when worker files are written directly "
-                                    + "under table data location; use overwrite to recreate the table"
-                    );
-                }
                 appendCompatibility = Optional.of(icebergCommitter.validateAppendSchema(
                         plan.tableName(),
                         plan.arrowSchema()
@@ -431,7 +472,7 @@ final class CoordinatorService {
                 tableCreatedByCoordinator = icebergCommitter.createTableIfMissing(
                         plan.tableName(),
                         plan.arrowSchema(),
-                        tableLocation(plan.tableName())
+                        plan.tableLocation()
                 );
             }
             icebergCommitStarted = true;
@@ -545,16 +586,19 @@ final class CoordinatorService {
 
         String tableName = Optional.ofNullable(Json.string(request, "tableName"))
                 .filter(value -> !value.isBlank())
+                .flatMap(value -> Optional.of(resolveClientTable(value, optionalSchema(request), "tableName").name()))
                 .or(() -> snapshot.session().tableName())
                 .or(() -> snapshot.session().commitTableName())
-                .orElseGet(() -> config.generatedUploadTable(uploadId));
+                .orElseThrow(() -> new CoordinatorException(409, "upload " + uploadId + " has no target table"));
+        ClientTable table = persistedClientTable(tableName);
         Map<String, Object> arrowSchema = Json.parseObject(snapshot.canonicalSchemaJsonForFiles());
+        String tableLocation = tableLocationFromDataPrefix(snapshot.session().stagingPrefix());
         String createTableSql;
         try {
             createTableSql = TrinoDdlPlanner.createTableSql(
                     tableName,
                     arrowSchema,
-                    tableLocation(tableName),
+                    tableLocation,
                     true
             );
         } catch (RuntimeException error) {
@@ -563,40 +607,30 @@ final class CoordinatorService {
             metadataStore.markFailed(uploadId, message);
             throw new CoordinatorException(400, message, error);
         }
-        return new UploadReadyPlan(snapshot, tableName, createTableSql, arrowSchema);
+        return new UploadReadyPlan(snapshot, table, tableName, tableLocation, createTableSql, arrowSchema);
     }
 
-    private String tableLocation(String tableName) {
-        String[] parts = SqlPlanner.validateTableName(tableName).split("\\.");
-        String schema;
-        String table;
-        if (parts.length == 1) {
-            schema = config.ctasSchema;
-            table = parts[0];
-        } else if (parts.length == 2) {
-            schema = parts[0];
-            table = parts[1];
-        } else if (parts.length == 3) {
-            schema = parts[1];
-            table = parts[2];
-        } else {
-            throw new CoordinatorException(400, "tableName must be table, schema.table, or catalog.schema.table");
+    private String tableDataPrefix(String tableLocation) {
+        return objectPrefixFromUri(tableLocation + "/data");
+    }
+
+    private String tablePrefix(String tableLocation) {
+        return objectPrefixFromUri(tableLocation);
+    }
+
+    private String tableLocationFromDataPrefix(String dataPrefix) {
+        String normalized = Config.normalizePrefix(dataPrefix);
+        if (!normalized.endsWith("/data")) {
+            throw new CoordinatorException(409, "upload data prefix does not end with /data: " + dataPrefix);
         }
-        return config.icebergWarehouse + "/" + schema + "/" + table;
-    }
-
-    private String tableDataPrefix(String tableName) {
-        return objectPrefixFromUri(tableLocation(tableName) + "/data");
-    }
-
-    private String tablePrefix(String tableName) {
-        return objectPrefixFromUri(tableLocation(tableName));
+        return config.objectUriForPrefix(normalized.substring(0, normalized.length() - "/data".length()));
     }
 
     private LinkedHashMap<String, Object> uploadPlanResponse(UploadReadyPlan plan) {
         LinkedHashMap<String, Object> body = new LinkedHashMap<>();
         body.put("uploadId", plan.snapshot().session().uploadId());
         body.put("tableName", plan.tableName());
+        body.put("tableLocation", plan.tableLocation());
         body.put("createTableSql", plan.createTableSql());
         body.put("files", plan.snapshot().files().stream().map(UploadFile::toJson).toList());
         body.put("streams", plan.snapshot().streams().stream().map(UploadStreamState::toJson).toList());
@@ -811,11 +845,12 @@ final class CoordinatorService {
         String targetTable = qualifiedTargetTable(Optional.ofNullable(Json.string(request, "targetTable"))
                 .filter(value -> !value.isBlank())
                 .orElseGet(() -> config.generatedCtasTable(queryId)));
-        String ctasLocation = config.objectUriForPrefix("coordinator/ctas/" + queryId);
+        String ctasLocation = config.ctasLocation(queryId);
         String ctasSql = SqlPlanner.buildCtas(targetTable, Json.requiredString(request, "sql"), ctasLocation);
         String trinoUser = stringOrDefault(request, "user", "anonymous");
         Optional<String> authorization = Optional.ofNullable(Json.string(request, "authorization"))
                 .filter(value -> !value.isBlank());
+        Optional<String> sourceSchema = optionalSchema(request);
         Instant now = Instant.now();
         Instant expiresAt = now.plusMillis(config.queryRegistryTtlMs);
         LinkedHashMap<String, Object> metadata = baseFlightMetadata(queryId, "ctas", "RUNNING", Optional.of(0.0));
@@ -823,6 +858,7 @@ final class CoordinatorService {
         metadata.put("targetTable", targetTable);
         metadata.put("submittedSql", ctasSql);
         metadata.put("location", ctasLocation);
+        sourceSchema.ifPresent(value -> metadata.put("sourceSchema", value));
 
         metadataStore.createQuery(new QueryRegistryRecord(
                 queryId,
@@ -847,7 +883,7 @@ final class CoordinatorService {
         ));
 
         try {
-            TrinoClient.QueryHandle handle = trinoClient.submitStatement(ctasSql, trinoUser, authorization);
+            TrinoClient.QueryHandle handle = trinoClient.submitStatement(ctasSql, trinoUser, authorization, sourceSchema);
             metadataStore.markQueryRunning(
                     queryId,
                     handle.queryId(),
@@ -1210,6 +1246,63 @@ final class CoordinatorService {
         return Optional.ofNullable(Json.string(request, "authorization")).filter(value -> !value.isBlank());
     }
 
+    private Optional<String> optionalSchema(Map<String, Object> request) {
+        return Optional.ofNullable(Json.string(request, "schema"))
+                .filter(value -> !value.isBlank())
+                .map(value -> SqlPlanner.validateIdentifier(value, "schema"));
+    }
+
+    private ClientTable requiredClientTable(Map<String, Object> request, String key) {
+        return optionalClientTable(request, key)
+                .orElseThrow(() -> new CoordinatorException(
+                        400,
+                        key + " is required and must be schema.table, or table with schema parameter"
+                ));
+    }
+
+    private Optional<ClientTable> optionalClientTable(Map<String, Object> request, String key) {
+        return Optional.ofNullable(Json.string(request, key))
+                .filter(value -> !value.isBlank())
+                .map(value -> resolveClientTable(value, optionalSchema(request), key));
+    }
+
+    private ClientTable resolveClientTable(String raw, Optional<String> schema, String fieldName) {
+        String[] parts = SqlPlanner.validateTableName(raw).split("\\.");
+        return switch (parts.length) {
+            case 1 -> new ClientTable(
+                    schema.orElseThrow(() -> new CoordinatorException(
+                            400,
+                            "schema is required when " + fieldName + " is passed as table without schema"
+                    )),
+                    parts[0]
+            );
+            case 2 -> {
+                schema.filter(value -> !value.equalsIgnoreCase(parts[0]))
+                        .ifPresent(value -> {
+                            throw new CoordinatorException(
+                                    400,
+                                    "schema parameter " + value + " conflicts with " + fieldName + " schema " + parts[0]
+                            );
+                        });
+                yield new ClientTable(parts[0], parts[1]);
+            }
+            case 3 -> throw new CoordinatorException(
+                    400,
+                    fieldName + " must not include catalog; coordinator uses configured catalog " + config.trinoCatalog
+            );
+            default -> throw new CoordinatorException(400, fieldName + " must be table or schema.table");
+        };
+    }
+
+    private ClientTable persistedClientTable(String tableName) {
+        String[] parts = SqlPlanner.validateTableName(tableName).split("\\.");
+        return switch (parts.length) {
+            case 2 -> new ClientTable(parts[0], parts[1]);
+            case 3 -> new ClientTable(parts[1], parts[2]);
+            default -> throw new CoordinatorException(400, "persisted tableName must be schema.table");
+        };
+    }
+
     private String requestType(Map<String, Object> request) {
         return Optional.ofNullable(Json.string(request, "type"))
                 .or(() -> Optional.ofNullable(Json.string(request, "kind")))
@@ -1264,8 +1357,8 @@ final class CoordinatorService {
         return switch (parts.length) {
             case 1 -> config.ctasCatalog + "." + config.ctasSchema + "." + parts[0];
             case 2 -> config.ctasCatalog + "." + parts[0] + "." + parts[1];
-            case 3 -> raw;
-            default -> throw new IllegalArgumentException("targetTable must be table, schema.table, or catalog.schema.table");
+            case 3 -> throw new IllegalArgumentException("targetTable must not include catalog; coordinator uses configured catalog " + config.ctasCatalog);
+            default -> throw new IllegalArgumentException("targetTable must be table or schema.table");
         };
     }
 
@@ -1276,6 +1369,7 @@ final class CoordinatorService {
                 return Config.normalizePath(raw.substring(normalizedPrefix.length()));
             }
         }
+        rejectUnsupportedObjectUri(raw);
         return Config.normalizePath(raw);
     }
 
@@ -1286,7 +1380,19 @@ final class CoordinatorService {
                 return Config.normalizePrefix(raw.substring(normalizedPrefix.length()));
             }
         }
+        rejectUnsupportedObjectUri(raw);
         return Config.normalizePrefix(raw);
+    }
+
+    private void rejectUnsupportedObjectUri(String raw) {
+        if (raw != null && raw.matches("^[A-Za-z][A-Za-z0-9+.-]*:.*")) {
+            throw new CoordinatorException(
+                    409,
+                    "Iceberg table location " + raw
+                            + " is not under configured object store prefix " + config.objectStoreUriPrefix
+                            + "; create the schema with coordinator.create-schema and an S3-compatible location"
+            );
+        }
     }
 
     private List<String> objectStoreUriPrefixes() {
@@ -1329,23 +1435,36 @@ final class CoordinatorService {
     }
 
     private Map<String, Object> prepareOverwriteUpload(
-            String tableName,
+            IcebergTableTarget target,
             String trinoUser,
             Optional<String> authorization
     ) {
-        Map<String, Object> tableDrop = dropTable(tableName, trinoUser, authorization);
-        CleanupResult locationCleanup = objectStoreCleaner.deletePrefix(tablePrefix(tableName));
+        Map<String, Object> tableDrop = dropTable(target.tableName(), trinoUser, authorization);
+        CleanupResult locationCleanup = objectStoreCleaner.deletePrefix(tablePrefix(target.tableLocation()));
         if (!locationCleanup.succeeded()) {
             throw new CoordinatorException(
                     500,
-                    "failed to clean table location before overwrite upload " + tableName
+                    "failed to clean table location before overwrite upload " + target.tableName()
                             + ": " + locationCleanup.errorMessage().orElse("unknown cleanup error")
             );
         }
+        Optional<CleanupResult> previousLocationCleanup = target.existingTableLocation()
+                .filter(location -> !location.equals(target.tableLocation()))
+                .map(location -> objectStoreCleaner.deletePrefix(tablePrefix(location)));
+        previousLocationCleanup
+                .filter(cleanup -> !cleanup.succeeded())
+                .ifPresent(cleanup -> {
+                    throw new CoordinatorException(
+                            500,
+                            "failed to clean previous table location before overwrite upload " + target.tableName()
+                                    + ": " + cleanup.errorMessage().orElse("unknown cleanup error")
+                    );
+                });
 
         LinkedHashMap<String, Object> body = new LinkedHashMap<>();
         body.put("table", tableDrop);
         body.put("location", locationCleanup.toJson());
+        previousLocationCleanup.ifPresent(cleanup -> body.put("previousLocation", cleanup.toJson()));
         return body;
     }
 
@@ -1437,7 +1556,9 @@ record PollResult(
 
 record UploadReadyPlan(
         UploadSnapshot snapshot,
+        ClientTable table,
         String tableName,
+        String tableLocation,
         String createTableSql,
         Map<String, Object> arrowSchema
 ) {

@@ -133,6 +133,43 @@ final class IcebergCommitter {
         return catalog.tableExists(tableIdentifier(tableName));
     }
 
+    IcebergTableTarget resolveTableTarget(ClientTable table, String mode) {
+        IcebergCommitter.CommitMode commitMode = IcebergCommitter.CommitMode.from(mode);
+        Namespace namespace = Namespace.of(table.schema());
+        if (!catalog.namespaceExists(namespace)) {
+            throw new CoordinatorException(
+                    404,
+                    "schema " + table.schema() + " does not exist in Iceberg catalog " + config.icebergCatalogName
+                            + "; create it first with coordinator.create-schema"
+            );
+        }
+
+        String namespaceLocation = namespaceLocation(namespace, table.schema());
+        TableIdentifier identifier = TableIdentifier.of(namespace, table.table());
+        boolean tableExists = catalog.tableExists(identifier);
+        Optional<String> existingTableLocation = tableExists
+                ? Optional.of(stripTrailingSlashes(catalog.loadTable(identifier).location()))
+                : Optional.empty();
+        if (commitMode == CommitMode.APPEND && existingTableLocation.isEmpty()) {
+            throw new CoordinatorException(
+                    409,
+                    "append upload requires existing Iceberg table " + table.name()
+                            + "; use overwrite to create or recreate the table"
+            );
+        }
+
+        String tableLocation = commitMode == CommitMode.APPEND
+                ? existingTableLocation.orElseThrow()
+                : namespaceLocation + "/" + table.table();
+        return new IcebergTableTarget(
+                table,
+                namespaceLocation,
+                stripTrailingSlashes(tableLocation),
+                tableExists,
+                existingTableLocation
+        );
+    }
+
     Optional<CommitOutcome> committedUpload(String tableName, String uploadId, List<UploadFile> files) {
         TableIdentifier identifier = tableIdentifier(tableName);
         if (!catalog.tableExists(identifier)) {
@@ -310,8 +347,7 @@ final class IcebergCommitter {
         String table;
         String[] namespace;
         if (parts.length == 1) {
-            table = parts[0];
-            namespace = new String[]{config.ctasSchema};
+            throw new CoordinatorException(400, "tableName must include schema as schema.table");
         } else if (parts.length == 2) {
             table = parts[1];
             namespace = new String[]{parts[0]};
@@ -328,9 +364,33 @@ final class IcebergCommitter {
             table = parts[2];
             namespace = new String[]{parts[1]};
         } else {
-            throw new CoordinatorException(400, "tableName must be table, schema.table, or catalog.schema.table");
+            throw new CoordinatorException(400, "tableName must include schema as schema.table");
         }
         return TableIdentifier.of(Namespace.of(namespace), table);
+    }
+
+    private String namespaceLocation(Namespace namespace, String schemaName) {
+        Map<String, String> metadata = catalog.loadNamespaceMetadata(namespace);
+        String location = Optional.ofNullable(metadata.get("location"))
+                .or(() -> Optional.ofNullable(metadata.get("location_uri")))
+                .filter(value -> !value.isBlank())
+                .map(IcebergCommitter::stripTrailingSlashes)
+                .orElseThrow(() -> new CoordinatorException(
+                        500,
+                        "schema " + schemaName + " exists but Iceberg catalog did not return a namespace location"
+                ));
+        return location;
+    }
+
+    private static String stripTrailingSlashes(String raw) {
+        String value = raw == null ? "" : raw.trim();
+        while (value.endsWith("/")) {
+            value = value.substring(0, value.length() - 1);
+        }
+        if (value.isBlank()) {
+            throw new CoordinatorException(500, "Iceberg location must not be empty");
+        }
+        return value;
     }
 
     static Configuration hadoopConfiguration(Config config) {

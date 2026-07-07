@@ -57,6 +57,9 @@ struct Args {
     #[arg(long, alias = "table", env = "COORDINATOR_TABLE_NAME")]
     table_name: Option<String>,
 
+    #[arg(long, env = "COORDINATOR_SCHEMA")]
+    schema: Option<String>,
+
     #[arg(
         long,
         env = "COORDINATOR_COMMIT_MODE",
@@ -263,6 +266,7 @@ async fn main() -> Result<()> {
             operation_id: operation_id.clone(),
             upload_id: args.upload_id.clone(),
             table_name: args.table_name.clone(),
+            schema: args.schema.clone(),
             commit_mode: if args.commit_mode == CommitMode::None {
                 None
             } else {
@@ -502,6 +506,7 @@ impl CoordinatorClient {
         );
         insert_string(&mut body, "uploadId", request.upload_id);
         insert_string(&mut body, "tableName", request.table_name);
+        insert_string(&mut body, "schema", request.schema);
         if let Some(mode) = request.commit_mode {
             body.insert(
                 "mode".to_owned(),
@@ -672,6 +677,7 @@ struct CreateUploadRequest {
     operation_id: String,
     upload_id: Option<String>,
     table_name: Option<String>,
+    schema: Option<String>,
     commit_mode: Option<CommitMode>,
     trino_user: Option<String>,
     trino_authorization: Option<String>,

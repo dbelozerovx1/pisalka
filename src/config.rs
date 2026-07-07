@@ -105,7 +105,6 @@ pub struct ResourceConfig {
 #[derive(Debug, Clone)]
 pub struct MetadataConfig {
     pub database_url: Option<String>,
-    pub auto_migrate: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -289,7 +288,6 @@ impl MetadataConfig {
     pub fn from_env() -> Self {
         Self {
             database_url: env_optional_string("METADATA_DATABASE_URL"),
-            auto_migrate: env_bool("METADATA_DB_AUTO_MIGRATE", false),
         }
     }
 }

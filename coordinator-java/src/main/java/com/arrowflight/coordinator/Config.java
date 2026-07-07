@@ -18,6 +18,8 @@ final class Config {
     final String ctasCatalog;
     final String ctasSchema;
     final String ctasTablePrefix;
+    final String ctasLocationPrefix;
+    final String defaultSchemaLocationPrefix;
     final String icebergCatalogName;
     final String icebergCatalogUri;
     final String icebergWarehouse;
@@ -72,6 +74,8 @@ final class Config {
             String ctasCatalog,
             String ctasSchema,
             String ctasTablePrefix,
+            String ctasLocationPrefix,
+            String defaultSchemaLocationPrefix,
             String icebergCatalogName,
             String icebergCatalogUri,
             String icebergWarehouse,
@@ -125,6 +129,8 @@ final class Config {
         this.ctasCatalog = ctasCatalog;
         this.ctasSchema = ctasSchema;
         this.ctasTablePrefix = ctasTablePrefix;
+        this.ctasLocationPrefix = normalizeObjectStoreUriPrefix(ctasLocationPrefix);
+        this.defaultSchemaLocationPrefix = normalizeObjectStoreUriPrefix(defaultSchemaLocationPrefix);
         this.icebergCatalogName = icebergCatalogName;
         this.icebergCatalogUri = icebergCatalogUri;
         this.icebergWarehouse = normalizeObjectStoreUriPrefix(icebergWarehouse);
@@ -172,20 +178,27 @@ final class Config {
     static Config fromEnv() {
         long capabilityTtlMs = envLong("COORDINATOR_CAPABILITY_TTL_MS", 15 * 60 * 1000L);
         boolean k8sWorkerDiscoveryEnabled = envBool("COORDINATOR_K8S_WORKER_DISCOVERY_ENABLED", false);
+        String objectStoreUriPrefix = env("COORDINATOR_OBJECT_STORE_URI_PREFIX", "s3://arrow-flight");
+        String trinoCatalog = env("TRINO_CATALOG", "iceberg");
+        String trinoSchema = env("TRINO_SCHEMA", "arrow");
+        String icebergWarehouse = env("ICEBERG_WAREHOUSE", objectStoreUriPrefix + "/iceberg");
+        String ctasSchema = env("CTAS_TEMP_SCHEMA", env("CTAS_DEFAULT_SCHEMA", trinoSchema));
         return new Config(
                 parseListenAddress(env("COORDINATOR_ADDR", "0.0.0.0:8088"), "COORDINATOR_ADDR"),
                 envBool("COORDINATOR_METRICS_ENABLED", true),
                 parseListenAddress(env("COORDINATOR_METRICS_ADDR", "0.0.0.0:9091"), "COORDINATOR_METRICS_ADDR"),
                 URI.create(env("TRINO_URI", "http://host.docker.internal:8080")),
-                env("TRINO_CATALOG", "iceberg"),
-                env("TRINO_SCHEMA", "arrow"),
+                trinoCatalog,
+                trinoSchema,
                 env("TRINO_SOURCE", "arrow-flight-coordinator"),
-                env("CTAS_DEFAULT_CATALOG", env("TRINO_CATALOG", "iceberg")),
-                env("CTAS_DEFAULT_SCHEMA", env("TRINO_SCHEMA", "arrow")),
+                trinoCatalog,
+                ctasSchema,
                 env("CTAS_TABLE_PREFIX", "ctas_tmp"),
-                env("ICEBERG_CATALOG_NAME", env("TRINO_CATALOG", "iceberg")),
+                env("CTAS_TEMP_LOCATION_PREFIX", objectStoreUriPrefix + "/coordinator/ctas"),
+                env("COORDINATOR_DEFAULT_SCHEMA_LOCATION_PREFIX", icebergWarehouse),
+                env("ICEBERG_CATALOG_NAME", trinoCatalog),
                 env("ICEBERG_CATALOG_URI", "thrift://host.docker.internal:9083"),
-                env("ICEBERG_WAREHOUSE", env("COORDINATOR_OBJECT_STORE_URI_PREFIX", "s3://arrow-flight") + "/iceberg"),
+                icebergWarehouse,
                 envBool("ICEBERG_HIVE_LOCK_ENABLED", false),
                 envOptional("S3_ENDPOINT"),
                 env("AWS_REGION", env("S3_REGION", "us-east-1")),
@@ -204,7 +217,7 @@ final class Config {
                 envLong("COORDINATOR_UPLOAD_SESSION_TTL_MS", 60 * 60 * 1000L),
                 envLong("COORDINATOR_QUERY_REGISTRY_TTL_MS", 60 * 60 * 1000L),
                 envLong("COORDINATOR_QUERY_REGISTRY_CLEANUP_INTERVAL_MS", 5 * 60 * 1000L),
-                env("COORDINATOR_OBJECT_STORE_URI_PREFIX", "s3://arrow-flight"),
+                objectStoreUriPrefix,
                 envInt("COORDINATOR_DEFAULT_UPLOAD_STREAMS", 1),
                 envLong("COORDINATOR_DEFAULT_TARGET_FILE_SIZE_BYTES", 512L * 1024 * 1024),
                 envLong("COORDINATOR_DEFAULT_MAX_STREAM_BYTES", 10L * 1024 * 1024 * 1024),
@@ -230,16 +243,19 @@ final class Config {
 
     String generatedCtasTable(String queryId) {
         String suffix = queryId.replace("-", "_").replace(".", "_").replace(":", "_").toLowerCase(Locale.ROOT);
-        return ctasCatalog + "." + ctasSchema + "." + ctasTablePrefix + "_" + suffix;
-    }
-
-    String generatedUploadTable(String uploadId) {
-        String suffix = uploadId.replace("-", "_").replace(".", "_").replace(":", "_").toLowerCase(Locale.ROOT);
-        return ctasCatalog + "." + ctasSchema + "." + ctasTablePrefix + "_" + suffix;
+        return ctasSchema + "." + ctasTablePrefix + "_" + suffix;
     }
 
     String objectUriForPrefix(String prefix) {
         return objectStoreUriPrefix + "/" + normalizePrefix(prefix);
+    }
+
+    String ctasLocation(String queryId) {
+        return ctasLocationPrefix + "/" + normalizePrefix(queryId);
+    }
+
+    String defaultSchemaLocation(String schemaName) {
+        return defaultSchemaLocationPrefix + "/" + SqlPlanner.validateIdentifier(schemaName, "schemaName");
     }
 
     private static InetSocketAddress parseListenAddress(String raw, String envName) {

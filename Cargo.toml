@@ -32,6 +32,10 @@ path = "benchmarks/tools/bench_coordinator.rs"
 name = "coordinator-query"
 path = "benchmarks/tools/coordinator_query.rs"
 
+[[bin]]
+name = "coordinator-action"
+path = "benchmarks/tools/coordinator_action.rs"
+
 [dependencies]
 anyhow = "1"
 arrow-array = "=58.3.0"

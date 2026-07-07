@@ -17,7 +17,6 @@ Current MVP readiness, intentional Flight boundaries, and first Kubernetes test 
 - `src/ticket.rs`: worker `DoGet` ticket parser.
 - `src/metrics.rs`: low-overhead Prometheus text metrics endpoint.
 - `coordinator-java/`: dependency-light Java coordinator MVP for Trino CTAS, signed worker capability minting, and Flyway metadata migrations.
-- `db/migrations/`: plain SQL DDL reference for the shared metadata schema.
 - `benchmarks/tools/`: benchmark/data-generation Rust binaries.
 - `benchmarks/tools/common/`: benchmark-only profiling/output helpers.
 - `benchmarks/scripts/`: benchmark shell entrypoints.
@@ -101,7 +100,7 @@ Run a small end-to-end smoke:
 ./dev/smoke.sh
 ```
 
-Run the simpler user-facing local E2E path. The write script accepts `schema.table` or `catalog.schema.table`, generates example Arrow data in Docker, uploads it through coordinator-issued worker `DoPut` tickets, commits the result into Iceberg, and verifies the table through Trino:
+Run the simpler user-facing local E2E path. The write script accepts `table` or `schema.table`, generates example Arrow data in Docker, uploads it through coordinator-issued worker `DoPut` tickets, commits the result into Iceberg, and verifies the table through Trino. The catalog is always coordinator configuration, not client input:
 
 ```bash
 ./dev/e2e-write-table.sh arrow.example_events
@@ -233,8 +232,9 @@ Useful environment variables:
 - `ICEBERG_CATALOG_URI=thrift://hive-metastore:9083`
 - `ICEBERG_WAREHOUSE=s3a://arrow-flight/iceberg`
 - `ICEBERG_HIVE_LOCK_ENABLED=false` disables Iceberg Hive metastore locks from the coordinator; this sets Hadoop config `iceberg.engine.hive.lock-enabled` and writes table property `engine.hive.lock-enabled` on coordinator-created tables
-- `CTAS_DEFAULT_CATALOG=iceberg`
-- `CTAS_DEFAULT_SCHEMA=arrow`
+- `CTAS_TEMP_SCHEMA=arrow`
+- `CTAS_TEMP_LOCATION_PREFIX=s3a://arrow-flight/coordinator/ctas`
+- `COORDINATOR_DEFAULT_SCHEMA_LOCATION_PREFIX=s3a://arrow-flight/iceberg`
 - `COORDINATOR_CAPABILITY_SECRET=local-dev-secret`
 - `COORDINATOR_ADMIN_TOKEN=` optional token required by low-level ticket APIs when set
 - `COORDINATOR_METADATA_DATABASE_URL=postgres://flight:flight@metadata-db:5432/flight_metadata`
@@ -260,13 +260,14 @@ The coordinator is itself an Arrow Flight service. It does not expose REST endpo
 
 Standard Flight methods:
 
-- `GetFlightInfo` with command `{"type":"ctas","sql":"select ...","user":"alice","authorization":"Bearer ..."}` creates a durable query row, generates a CTAS temp table from the returned query id unless `targetTable` is explicitly provided, submits one Trino CTAS request, and returns a `FlightInfo` with `app_metadata.queryId`.
+- `GetFlightInfo` with command `{"type":"ctas","sql":"select ...","schema":"analytics","user":"alice","authorization":"Bearer ..."}` creates a durable query row, generates a CTAS temp table from the returned query id unless `targetTable` is explicitly provided, submits one Trino CTAS request, and returns a `FlightInfo` with `app_metadata.queryId`. The optional `schema` is sent to Trino as the session schema; the coordinator does not rewrite the user SQL.
 - `PollFlightInfo` with command `{"type":"poll","queryId":"ctas_..."}` loads that row and advances one Trino cursor step. When CTAS finishes, polling switches to Iceberg `$files` discovery, persists discovered file rows, and finally returns `FlightInfo.endpoints` with worker `DoGet` tickets.
 - `GetFlightInfo` with command `{"type":"read","path":"bench/file.parquet"}` is a low-level exact-file read planner. When `COORDINATOR_ADMIN_TOKEN` is configured this command must include `adminToken`.
 
 Flight actions:
 
 - `coordinator.create-upload`: creates a durable upload session, selects workers from `worker_registry`, resolves client endpoints when required, persists planned stream attempts, and returns one signed `DoPut` ticket per granted stream. Repeating the action with the same `uploadId` and same parameters can land on any coordinator replica and returns the persisted plan. When the planned mode is `overwrite` / `replace`, the coordinator first drops the target table through Trino and best-effort cleans the target table location, then issues tickets under the clean table `data/` directory.
+- `coordinator.create-schema`: creates an Iceberg schema through Trino. Body: `{"schemaName":"analytics","location":"s3a://bucket/path/analytics"}`. `schemaName` is required; `location` is optional and defaults to `COORDINATOR_DEFAULT_SCHEMA_LOCATION_PREFIX/<schemaName>`.
 - `coordinator.commit-upload`: explicit commit gate. The client calls it after it considers all `DoPut` streams complete. The coordinator reads currently recorded worker file rows, loads or creates the Iceberg table metadata through the Hive catalog, collects Parquet footer metrics, and commits that DB-backed file list. `append` requires an existing table and checks the uploaded Arrow-derived Iceberg schema against the existing table schema before committing. `overwrite` is recreate-style when planned at `create-upload`: old table/location are removed before data moves, then the new table metadata is created from the recorded Arrow schema and committed with the uploaded files.
 - `coordinator.do-commit`: compatibility alias for `coordinator.commit-upload`.
 - `coordinator.abort-upload`: marks an upload `ABORTED` and best-effort deletes the upload staging prefix.
@@ -491,7 +492,7 @@ For compatibility with local benchmarks, raw path tickets are still allowed when
 
 That compatibility mode should not be exposed outside a trusted local/dev network.
 
-The Java coordinator runs Flyway metadata migrations on startup by default when `COORDINATOR_METADATA_DATABASE_URL` is configured. Set `COORDINATOR_METADATA_MIGRATIONS_ENABLED=false` only when your deployment pipeline applies the same migrations before the coordinator starts. Workers should keep `METADATA_DB_AUTO_MIGRATE=false`; their old auto-migrate path is only for isolated local experiments.
+The Java coordinator runs Flyway metadata migrations on startup by default when `COORDINATOR_METADATA_DATABASE_URL` is configured. Set `COORDINATOR_METADATA_MIGRATIONS_ENABLED=false` only when your deployment pipeline applies the same coordinator-packaged migrations before the coordinator starts. Workers do not own database migrations.
 
 For real S3 over a slower link, try `PARQUET_COMPRESSION=lz4_raw` or `snappy`, and benchmark `TARGET_FILE_SIZE`, `PUT_PARALLELISM`, `S3_MULTIPART_PART_SIZE`, and `S3_MULTIPART_MAX_CONCURRENCY` as a set.
 
