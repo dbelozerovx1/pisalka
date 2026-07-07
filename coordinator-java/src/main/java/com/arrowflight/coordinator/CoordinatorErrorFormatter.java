@@ -229,6 +229,7 @@ final class CoordinatorErrorFormatter {
             copy(out, "queryId");
             copy(out, "attemptId");
             copy(out, "streamId");
+            copy(out, "workerId");
             copy(out, "tableName");
             copy(out, "targetTable");
             return out;

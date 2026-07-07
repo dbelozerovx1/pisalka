@@ -22,6 +22,7 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.UUID;
 
 final class CoordinatorFlightProducer implements FlightProducer {
     private static final Schema EMPTY_SCHEMA = new Schema(List.of());
@@ -50,8 +51,15 @@ final class CoordinatorFlightProducer implements FlightProducer {
     public FlightInfo getFlightInfo(CallContext context, FlightDescriptor descriptor) {
         Map<String, Object> request = Map.of();
         try {
-            request = requestWithHeaders(context, descriptorRequest(descriptor));
-            FlightInfo response = flightInfo(coordinator.startFlight(request, endpointRewrite(context)), false);
+            request = ensureRequestId(requestWithHeaders(context, descriptorRequest(descriptor)));
+            FlightPlan plan = withRequestId(coordinator.startFlight(request, endpointRewrite(context)), request);
+            FlightInfo response = flightInfo(plan, false);
+            CoordinatorRequestLog.success("GetFlightInfo", null, request, Map.of(
+                    "queryId", plan.queryId(),
+                    "status", plan.status(),
+                    "requestId", request.get("requestId"),
+                    "endpointCount", plan.endpoints().size()
+            ));
             metrics.recordSuccess("GetFlightInfo", null);
             return response;
         } catch (RuntimeException error) {
@@ -67,17 +75,24 @@ final class CoordinatorFlightProducer implements FlightProducer {
     public PollInfo pollFlightInfo(CallContext context, FlightDescriptor descriptor) {
         Map<String, Object> request = Map.of();
         try {
-            request = requestWithHeaders(context, descriptorRequest(descriptor));
+            request = ensureRequestId(requestWithHeaders(context, descriptorRequest(descriptor)));
             PollResult result = coordinator.pollFlight(request, endpointRewrite(context));
+            FlightPlan plan = withRequestId(result.plan(), request);
             FlightDescriptor nextDescriptor = result.complete()
                     ? null
-                    : FlightDescriptor.command(jsonBytes(Map.of("type", "poll", "queryId", result.plan().queryId())));
+                    : FlightDescriptor.command(jsonBytes(Map.of("type", "poll", "queryId", plan.queryId())));
             PollInfo response = new PollInfo(
-                    flightInfo(result.plan(), result.complete()),
+                    flightInfo(plan, result.complete()),
                     nextDescriptor,
                     result.progress().orElse(null),
                     result.complete() ? null : result.expiresAt()
             );
+            CoordinatorRequestLog.success("PollFlightInfo", null, request, Map.of(
+                    "queryId", plan.queryId(),
+                    "status", plan.status(),
+                    "requestId", request.get("requestId"),
+                    "endpointCount", plan.endpoints().size()
+            ));
             metrics.recordSuccess("PollFlightInfo", null);
             return response;
         } catch (RuntimeException error) {
@@ -100,7 +115,7 @@ final class CoordinatorFlightProducer implements FlightProducer {
     public void doAction(CallContext context, Action action, StreamListener<Result> listener) {
         Map<String, Object> request = Map.of();
         try {
-            request = requestWithHeaders(context, actionBody(action));
+            request = ensureRequestId(requestWithHeaders(context, actionBody(action)));
             WorkerEndpointRewrite endpointRewrite = endpointRewrite(context);
             Map<String, Object> response = switch (action.getType()) {
                 case "coordinator.config" -> coordinator.configJson();
@@ -113,8 +128,10 @@ final class CoordinatorFlightProducer implements FlightProducer {
                 case "coordinator.get-ticket" -> coordinator.getTicket(request, endpointRewrite);
                 default -> throw new CoordinatorException(400, "unknown coordinator action: " + action.getType());
             };
+            response = withRequestContext(response, request);
             listener.onNext(new Result(jsonBytes(response)));
             listener.onCompleted();
+            CoordinatorRequestLog.success("DoAction", action.getType(), request, response);
             metrics.recordSuccess("DoAction", action.getType());
         } catch (RuntimeException error) {
             listener.onError(CoordinatorErrorFormatter.toFlight(
@@ -206,12 +223,61 @@ final class CoordinatorFlightProducer implements FlightProducer {
 
     private Map<String, Object> requestWithHeaders(CallContext context, Map<String, Object> request) {
         BaseHostnameMiddleware middleware = context.getMiddleware(BaseHostnameMiddleware.KEY);
-        if (middleware == null || (middleware.authorization().isEmpty() && middleware.trinoUser().isEmpty())) {
+        if (middleware == null || (middleware.authorization().isEmpty()
+                && middleware.requestId().isEmpty()
+                && middleware.trinoUser().isEmpty())) {
             return request;
         }
         LinkedHashMap<String, Object> merged = new LinkedHashMap<>(request);
         middleware.authorization().ifPresent(value -> merged.put("authorization", value));
+        middleware.requestId().ifPresent(value -> merged.put("requestId", value));
         middleware.trinoUser().ifPresent(value -> merged.put("user", value));
         return merged;
+    }
+
+    private Map<String, Object> ensureRequestId(Map<String, Object> request) {
+        Object existing = request.get("requestId");
+        if (existing != null && !String.valueOf(existing).isBlank()) {
+            return request;
+        }
+        LinkedHashMap<String, Object> merged = new LinkedHashMap<>(request);
+        merged.put("requestId", "coord-req-" + UUID.randomUUID().toString().replace("-", ""));
+        return merged;
+    }
+
+    private Map<String, Object> withRequestContext(Map<String, Object> response, Map<String, Object> request) {
+        LinkedHashMap<String, Object> body = new LinkedHashMap<>(response);
+        copyResponseId(body, request, "requestId");
+        copyResponseId(body, request, "operationId");
+        copyResponseId(body, request, "uploadId");
+        copyResponseId(body, request, "queryId");
+        copyResponseId(body, request, "attemptId");
+        copyResponseId(body, request, "streamId");
+        copyResponseId(body, request, "tableName");
+        return body;
+    }
+
+    private void copyResponseId(LinkedHashMap<String, Object> response, Map<String, Object> request, String key) {
+        if (response.containsKey(key)) {
+            return;
+        }
+        Object value = request.get(key);
+        if (value != null && !String.valueOf(value).isBlank()) {
+            response.put(key, value);
+        }
+    }
+
+    private FlightPlan withRequestId(FlightPlan plan, Map<String, Object> request) {
+        LinkedHashMap<String, Object> metadata = new LinkedHashMap<>(plan.metadata());
+        copyResponseId(metadata, request, "requestId");
+        return new FlightPlan(
+                plan.queryId(),
+                plan.status(),
+                metadata,
+                plan.endpoints(),
+                plan.totalRecords(),
+                plan.totalBytes(),
+                plan.expiresAt()
+        );
     }
 }

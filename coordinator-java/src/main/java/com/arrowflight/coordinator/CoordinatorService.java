@@ -627,8 +627,10 @@ final class CoordinatorService {
     }
 
     private LinkedHashMap<String, Object> uploadPlanResponse(UploadReadyPlan plan) {
+        UploadSessionRecord session = plan.snapshot().session();
         LinkedHashMap<String, Object> body = new LinkedHashMap<>();
-        body.put("uploadId", plan.snapshot().session().uploadId());
+        body.put("uploadId", session.uploadId());
+        body.put("operationId", session.operationId());
         body.put("tableName", plan.tableName());
         body.put("tableLocation", plan.tableLocation());
         body.put("createTableSql", plan.createTableSql());
@@ -642,6 +644,7 @@ final class CoordinatorService {
         UploadSessionRecord session = snapshot.session();
         LinkedHashMap<String, Object> body = new LinkedHashMap<>();
         body.put("uploadId", session.uploadId());
+        body.put("operationId", session.operationId());
         body.put("status", "COMMITTED");
         session.commitTableName().or(session::tableName).ifPresent(value -> body.put("tableName", value));
         session.createTableSql().ifPresent(value -> body.put("createTableSql", value));
@@ -665,6 +668,7 @@ final class CoordinatorService {
         UploadSessionRecord session = snapshot.session();
         LinkedHashMap<String, Object> body = new LinkedHashMap<>();
         body.put("uploadId", session.uploadId());
+        body.put("operationId", session.operationId());
         body.put("status", session.status());
         session.errorMessage().ifPresent(value -> body.put("errorMessage", value));
         session.tableName().ifPresent(value -> body.put("tableName", value));
@@ -695,6 +699,7 @@ final class CoordinatorService {
         metadataStore.markAborted(uploadId, reason);
         return Map.of(
                 "uploadId", uploadId,
+                "operationId", snapshot.session().operationId(),
                 "status", "ABORTED",
                 "cleanup", Map.of("staging", cleanup.toJson())
         );

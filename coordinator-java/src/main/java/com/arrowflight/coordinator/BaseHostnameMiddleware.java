@@ -10,21 +10,25 @@ import java.util.Optional;
 final class BaseHostnameMiddleware implements FlightServerMiddleware {
     static final String HEADER_NAME = "x-base-hostname";
     static final String AUTHORIZATION_HEADER = "authorization";
+    static final String REQUEST_ID_HEADER = "x-request-id";
     static final String TRINO_USER_HEADER = "x-trino-user";
     static final FlightServerMiddleware.Key<BaseHostnameMiddleware> KEY =
             FlightServerMiddleware.Key.of("base-hostname");
 
     private final Optional<String> baseHostname;
     private final Optional<String> authorization;
+    private final Optional<String> requestId;
     private final Optional<String> trinoUser;
 
     private BaseHostnameMiddleware(
             Optional<String> baseHostname,
             Optional<String> authorization,
+            Optional<String> requestId,
             Optional<String> trinoUser
     ) {
         this.baseHostname = baseHostname;
         this.authorization = authorization;
+        this.requestId = requestId;
         this.trinoUser = trinoUser;
     }
 
@@ -38,6 +42,10 @@ final class BaseHostnameMiddleware implements FlightServerMiddleware {
 
     Optional<String> authorization() {
         return authorization;
+    }
+
+    Optional<String> requestId() {
+        return requestId;
     }
 
     Optional<String> trinoUser() {
@@ -64,6 +72,7 @@ final class BaseHostnameMiddleware implements FlightServerMiddleware {
         return new BaseHostnameMiddleware(
                 trimHeader(incomingHeaders, HEADER_NAME),
                 trimHeader(incomingHeaders, AUTHORIZATION_HEADER).map(BaseHostnameMiddleware::bearerAuthorization),
+                trimHeader(incomingHeaders, REQUEST_ID_HEADER),
                 trimHeader(incomingHeaders, TRINO_USER_HEADER)
         );
     }
