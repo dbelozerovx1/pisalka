@@ -50,6 +50,7 @@ final class CapabilitySigner {
 
         LinkedHashMap<String, Object> payload = new LinkedHashMap<>();
         payload.put("op", "put");
+        payload.put("bucket", Json.requiredString(request, "bucket"));
         payload.put("operation_id", operationId);
         payload.put("attempt_id", attemptId);
         payload.put("upload_id", uploadId);
@@ -68,6 +69,7 @@ final class CapabilitySigner {
         Map<String, Object> envelope = sign(payload);
         response.put("workerId", payload.get("worker_id"));
         response.put("flightUri", Json.requiredString(request, "flightUri"));
+        response.put("bucket", payload.get("bucket"));
         response.put("descriptorPath", path);
         response.put("operationId", operationId);
         response.put("attemptId", attemptId);
@@ -87,6 +89,7 @@ final class CapabilitySigner {
 
         LinkedHashMap<String, Object> payload = new LinkedHashMap<>();
         payload.put("op", "get");
+        payload.put("bucket", Json.requiredString(request, "bucket"));
         payload.put("operation_id", operationId);
         payload.put("worker_id", Json.requiredString(request, "workerId"));
         payload.put("issued_at_ms", now);
@@ -99,6 +102,7 @@ final class CapabilitySigner {
         Map<String, Object> envelope = sign(payload);
         response.put("workerId", payload.get("worker_id"));
         response.put("flightUri", Json.requiredString(request, "flightUri"));
+        response.put("bucket", payload.get("bucket"));
         response.put("path", path);
         response.put("operationId", operationId);
         response.put("expiresAtMs", payload.get("expires_at_ms"));

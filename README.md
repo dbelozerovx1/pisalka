@@ -246,10 +246,7 @@ Before production, expect to add or harden:
 
 See also:
 
-- [docs/current-state.md](docs/current-state.md)
-- [docs/k8s-launch.md](docs/k8s-launch.md)
-- [docs/resource-control-guide.md](docs/resource-control-guide.md)
-- [docs/adr/0001-split-coordinator-and-parquet-worker.md](docs/adr/0001-split-coordinator-and-parquet-worker.md)
+- [docs/k8s-env.md](docs/k8s-env.md)
 
 ## Developer Checks
 

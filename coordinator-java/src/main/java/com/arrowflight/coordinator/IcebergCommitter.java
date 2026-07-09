@@ -268,7 +268,8 @@ final class IcebergCommitter {
     }
 
     private BuiltDataFile dataFile(Table table, UploadFile file) {
-        String location = config.objectUriForPrefix(file.filePath());
+        String bucket = Config.bucketNameFromObjectStoreUri(table.location(), "Iceberg table location");
+        String location = config.objectUriForBucket(bucket, file.filePath());
         InputFile inputFile = HadoopInputFile.fromPath(new Path(location), hadoopConf);
         DataFiles.Builder builder = DataFiles.builder(table.spec())
                 .withPath(location)

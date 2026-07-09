@@ -8,7 +8,7 @@ use arrow_flight_s3_mvp::{
     logging::init_tracing,
     metadata_store::MetadataStore,
     metrics::{WorkerMetrics, spawn_metrics_server},
-    util::build_object_store,
+    util::ObjectStoreRegistry,
 };
 use tokio::time::sleep;
 use tonic::transport::{Identity, Server, ServerTlsConfig};
@@ -19,14 +19,14 @@ async fn main() -> Result<()> {
     init_tracing("worker");
 
     let config = AppConfig::from_env()?;
-    let store = build_object_store(&config.s3)?;
+    let stores = Arc::new(ObjectStoreRegistry::new(config.s3.clone())?);
     let metadata_store = MetadataStore::connect(&config.metadata)
         .await?
         .map(Arc::new);
     let metrics = Arc::new(WorkerMetrics::new());
     let service = WorkerFlightService::new(
         config.clone(),
-        store,
+        stores,
         metadata_store.clone(),
         metrics.clone(),
     );
@@ -42,7 +42,9 @@ async fn main() -> Result<()> {
     info!(
         addr = %config.flight_addr,
         s3_endpoint = %config.s3.endpoint,
-        bucket = %config.s3.bucket,
+        s3_presigned_bucket = %config.s3.presigned_bucket,
+        s3_tmp_bucket = %config.s3.tmp_bucket,
+        legacy_default_bucket = config.s3.legacy_default_bucket.as_deref().unwrap_or(""),
         metadata_db = config.metadata.database_url.is_some(),
         worker_id = %config.worker.worker_id,
         worker_flight_uri = %config.worker.flight_uri,

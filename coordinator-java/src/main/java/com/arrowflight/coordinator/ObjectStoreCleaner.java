@@ -20,7 +20,7 @@ final class ObjectStoreCleaner {
         this.hadoopConf = IcebergCommitter.hadoopConfiguration(config);
     }
 
-    CleanupResult deleteUploadObjects(UploadSnapshot snapshot) {
+    CleanupResult deleteUploadObjects(UploadSnapshot snapshot, String bucket) {
         LinkedHashSet<String> keys = new LinkedHashSet<>();
         for (UploadStreamState stream : snapshot.streams()) {
             keys.add(Config.normalizePath(stream.descriptorPath()));
@@ -28,17 +28,15 @@ final class ObjectStoreCleaner {
         for (UploadFile file : snapshot.files()) {
             keys.add(Config.normalizePath(file.filePath()));
         }
-        return deleteObjects(snapshot.session().stagingPrefix(), keys);
+        return deleteObjects(bucket, snapshot.session().stagingPrefix(), keys);
     }
 
     CleanupResult deleteCtasStaging(String queryId) {
         return deleteUriPrefix(config.ctasLocation(queryId));
     }
 
-    CleanupResult deletePrefix(String rawPrefix) {
-        String prefix = Config.normalizePrefix(rawPrefix);
-        String uri = config.objectUriForPrefix(prefix);
-        return deleteUriPrefix(prefix, uri);
+    CleanupResult deleteLocationPrefix(String rawUri) {
+        return deleteUriPrefix(rawUri);
     }
 
     private CleanupResult deleteUriPrefix(String rawUri) {
@@ -61,14 +59,14 @@ final class ObjectStoreCleaner {
         }
     }
 
-    private CleanupResult deleteObjects(String rawPrefix, Set<String> keys) {
+    private CleanupResult deleteObjects(String bucket, String rawPrefix, Set<String> keys) {
         String prefix = Config.normalizePrefix(rawPrefix);
-        String uri = config.objectUriForPrefix(prefix);
+        String uri = config.objectUriForBucket(bucket, prefix);
         boolean existed = false;
         int deletedObjects = 0;
         ArrayList<String> errors = new ArrayList<>();
         for (String key : keys) {
-            String objectUri = config.objectUriForPrefix(key);
+            String objectUri = config.objectUriForBucket(bucket, key);
             try {
                 Path path = new Path(objectUri);
                 FileSystem fs = path.getFileSystem(hadoopConf);

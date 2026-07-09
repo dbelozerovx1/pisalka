@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::{collections::HashMap, sync::Mutex, time::Duration};
 
 use anyhow::{Context, Result};
 use arrow_array::RecordBatch;
@@ -8,10 +8,53 @@ use std::sync::Arc;
 
 use crate::S3Config;
 
-pub fn build_object_store(config: &S3Config) -> Result<Arc<dyn ObjectStore>> {
+pub struct ObjectStoreRegistry {
+    config: S3Config,
+    stores: Mutex<HashMap<String, Arc<dyn ObjectStore>>>,
+}
+
+impl ObjectStoreRegistry {
+    pub fn new(config: S3Config) -> Result<Self> {
+        validate_bucket_name(&config.presigned_bucket)?;
+        validate_bucket_name(&config.tmp_bucket)?;
+        if let Some(bucket) = config.legacy_default_bucket.as_deref() {
+            validate_bucket_name(bucket)?;
+        }
+        let mut stores = HashMap::new();
+        let default_bucket = config.default_bucket().to_owned();
+        stores.insert(
+            default_bucket.clone(),
+            build_object_store_for_bucket(&config, &default_bucket)?,
+        );
+        Ok(Self {
+            config,
+            stores: Mutex::new(stores),
+        })
+    }
+
+    pub fn default_bucket(&self) -> &str {
+        self.config.default_bucket()
+    }
+
+    pub fn store_for_bucket(&self, bucket: &str) -> Result<Arc<dyn ObjectStore>> {
+        validate_bucket_name(bucket)?;
+        let mut stores = self
+            .stores
+            .lock()
+            .map_err(|_| anyhow::anyhow!("object store registry mutex was poisoned"))?;
+        if let Some(store) = stores.get(bucket) {
+            return Ok(store.clone());
+        }
+        let store = build_object_store_for_bucket(&self.config, bucket)?;
+        stores.insert(bucket.to_owned(), store.clone());
+        Ok(store)
+    }
+}
+
+fn build_object_store_for_bucket(config: &S3Config, bucket: &str) -> Result<Arc<dyn ObjectStore>> {
     let store = AmazonS3Builder::new()
         .with_endpoint(&config.endpoint)
-        .with_bucket_name(&config.bucket)
+        .with_bucket_name(bucket)
         .with_region(&config.region)
         .with_access_key_id(&config.access_key_id)
         .with_secret_access_key(&config.secret_access_key)
@@ -21,6 +64,24 @@ pub fn build_object_store(config: &S3Config) -> Result<Arc<dyn ObjectStore>> {
         .context("failed to build S3 object store")?;
 
     Ok(Arc::new(store))
+}
+
+pub fn build_object_store(config: &S3Config) -> Result<Arc<dyn ObjectStore>> {
+    build_object_store_for_bucket(config, config.default_bucket())
+}
+
+pub fn validate_bucket_name(bucket: &str) -> Result<()> {
+    if bucket.is_empty()
+        || bucket.starts_with("s3://")
+        || bucket.starts_with("s3a://")
+        || bucket.contains('/')
+        || bucket.contains('\\')
+    {
+        anyhow::bail!(
+            "bucket must be a plain bucket name without s3://, s3a://, or subdirectories"
+        );
+    }
+    Ok(())
 }
 
 pub fn descriptor_to_object_key(descriptor: Option<&FlightDescriptor>) -> String {

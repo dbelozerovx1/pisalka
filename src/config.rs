@@ -36,7 +36,9 @@ pub struct FlightTlsConfig {
 #[derive(Debug, Clone)]
 pub struct S3Config {
     pub endpoint: String,
-    pub bucket: String,
+    pub presigned_bucket: String,
+    pub tmp_bucket: String,
+    pub legacy_default_bucket: Option<String>,
     pub region: String,
     pub access_key_id: String,
     pub secret_access_key: String,
@@ -180,10 +182,8 @@ impl BenchConfig {
 
 impl FlightTlsConfig {
     fn from_env() -> Result<Self> {
-        let cert_path = env_optional_string("FLIGHT_TLS_CERT_PATH")
-            .or_else(|| env_optional_string("WORKER_TLS_CERT_PATH"));
-        let key_path = env_optional_string("FLIGHT_TLS_KEY_PATH")
-            .or_else(|| env_optional_string("WORKER_TLS_KEY_PATH"));
+        let cert_path = env_optional_string("FLIGHT_TLS_CERT_PATH");
+        let key_path = env_optional_string("FLIGHT_TLS_KEY_PATH");
         let enabled = env_optional_bool("FLIGHT_TLS_ENABLED")?
             .unwrap_or_else(|| cert_path.is_some() || key_path.is_some());
 
@@ -208,14 +208,40 @@ impl FlightTlsConfig {
 
 impl S3Config {
     pub fn from_env() -> Self {
+        let legacy_default_bucket = env_optional_string("S3_BUCKET");
+        let presigned_bucket = env_optional_string("S3_PRESIGNED_BUCKET")
+            .or_else(|| env_optional_string("COORDINATOR_BUCKET"))
+            .or_else(|| legacy_default_bucket.clone())
+            .unwrap_or_else(|| "arrow-flight".to_owned());
+        let tmp_bucket = env_optional_string("S3_TMP_BUCKET")
+            .or_else(|| env_optional_string("COORDINATOR_TMP_BUCKET"))
+            .or_else(|| legacy_default_bucket.clone())
+            .unwrap_or_else(|| presigned_bucket.clone());
         Self {
             endpoint: env_string("S3_ENDPOINT", "http://127.0.0.1:9000"),
-            bucket: env_string("S3_BUCKET", "arrow-flight"),
+            presigned_bucket,
+            tmp_bucket,
+            legacy_default_bucket,
             region: env_string("S3_REGION", "us-east-1"),
             access_key_id: env_string("AWS_ACCESS_KEY_ID", "minioadmin"),
             secret_access_key: env_string("AWS_SECRET_ACCESS_KEY", "minioadmin"),
             allow_http: env_bool("AWS_ALLOW_HTTP", true),
         }
+    }
+
+    pub fn default_bucket(&self) -> &str {
+        self.legacy_default_bucket
+            .as_deref()
+            .unwrap_or(&self.presigned_bucket)
+    }
+
+    pub fn is_allowed_bucket(&self, bucket: &str) -> bool {
+        bucket == self.presigned_bucket
+            || bucket == self.tmp_bucket
+            || self
+                .legacy_default_bucket
+                .as_deref()
+                .is_some_and(|default_bucket| bucket == default_bucket)
     }
 }
 

@@ -36,7 +36,10 @@ use tracing::{debug, error, info, warn};
 
 use crate::{
     admission::{GuardedResponseStream, PutAdmission, ReadAdmission},
-    capability::{CAPABILITY_VERSION, parse_capability_envelope, verify_put_capability},
+    capability::{
+        CAPABILITY_VERSION, parse_capability_envelope, validate_optional_bucket,
+        verify_put_capability,
+    },
     config::{AppConfig, ParquetTuning},
     metadata_store::{MetadataStore, PutFileRecord, PutStreamCompleteRecord, PutStreamStartRecord},
     metrics::{MeasuredReadStream, WorkerMetrics},
@@ -46,7 +49,7 @@ use crate::{
     },
     resource::ResourceLimiter,
     ticket::parse_read_ticket,
-    util::{descriptor_to_object_key, path_from_key},
+    util::{ObjectStoreRegistry, descriptor_to_object_key, path_from_key},
     worker_status::{
         WorkerCapabilities, WorkerCapacity, WorkerLocality, WorkerResourcePool,
         WorkerResourceStatus, WorkerSchedulerStatus, WorkerSchedulingPolicy,
@@ -59,7 +62,7 @@ type ResponseStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send + '
 #[derive(Clone)]
 pub struct WorkerFlightService {
     config: Arc<AppConfig>,
-    store: Arc<dyn ObjectStore>,
+    stores: Arc<ObjectStoreRegistry>,
     metadata_store: Option<Arc<MetadataStore>>,
     put_slots: Arc<Semaphore>,
     read_slots: Arc<Semaphore>,
@@ -75,7 +78,7 @@ pub struct WorkerFlightService {
 impl WorkerFlightService {
     pub fn new(
         config: AppConfig,
-        store: Arc<dyn ObjectStore>,
+        stores: Arc<ObjectStoreRegistry>,
         metadata_store: Option<Arc<MetadataStore>>,
         metrics: Arc<WorkerMetrics>,
     ) -> Self {
@@ -86,7 +89,7 @@ impl WorkerFlightService {
         let draining = Arc::new(AtomicBool::new(config.worker.draining));
         Self {
             config: Arc::new(config),
-            store,
+            stores,
             metadata_store,
             put_slots,
             read_slots,
@@ -247,6 +250,18 @@ impl WorkerFlightService {
         let option_attempt_id = validate_worker_id("attempt_id", options.attempt_id.as_deref())?;
         let option_upload_id = validate_worker_id("upload_id", options.upload_id.as_deref())?;
         let option_stream_id = validate_worker_id("stream_id", options.stream_id.as_deref())?;
+        let option_bucket = validate_optional_bucket(options.bucket.clone())?;
+        let bucket = reconcile_optional_value(
+            "bucket",
+            option_bucket,
+            capability
+                .as_ref()
+                .and_then(|capability| capability.bucket.clone()),
+        )?
+        .unwrap_or_else(|| self.stores.default_bucket().to_owned());
+        self.stores
+            .store_for_bucket(&bucket)
+            .map_err(|err| Status::permission_denied(err.to_string()))?;
         let option_staging_prefix = options
             .staging_prefix
             .as_deref()
@@ -363,6 +378,7 @@ impl WorkerFlightService {
         }
 
         Ok(PutContext {
+            bucket,
             operation_id: capability.and_then(|capability| capability.operation_id),
             attempt_id,
             upload_id,
@@ -459,6 +475,7 @@ impl WorkerFlightService {
             .record_put_admission_wait(u128_to_u64(admission_wait_ms));
         let summary = WorkerPutSummary {
             worker_id: self.config.worker.worker_id.clone(),
+            bucket: context.bucket.clone(),
             operation_id: context.operation_id.clone(),
             attempt_id: context.attempt_id.clone(),
             upload_id: context.upload_id.clone(),
@@ -701,10 +718,15 @@ impl WorkerFlightService {
         let error_operation_id = put_context.operation_id.clone();
         let error_upload_id = put_context.upload_id.clone();
         let error_stream_id = put_context.stream_id.clone();
+        let cleanup_bucket = put_context.bucket.clone();
         let cleanup_key = key.clone();
         let cleanup_target_file_size = put_context.target_file_size;
         let result = async {
             let profile_enabled = put_options.profile;
+            let store = self
+                .stores
+                .store_for_bucket(&put_context.bucket)
+                .map_err(|err| Status::permission_denied(err.to_string()))?;
             let path = path_from_key(&key);
             let flight_stream_bytes = Arc::new(AtomicU64::new(0));
             let flight_data_messages = Arc::new(AtomicU64::new(0));
@@ -748,6 +770,7 @@ impl WorkerFlightService {
             if let Some(target_file_size) = put_context.target_file_size {
                 return self
                     .write_sized_dataset(
+                        store,
                         key,
                         target_file_size,
                         put_options.input_file_bytes,
@@ -769,6 +792,7 @@ impl WorkerFlightService {
             }
 
             self.write_single_file(
+                store,
                 key,
                 path,
                 put_options.input_file_bytes,
@@ -804,18 +828,40 @@ impl WorkerFlightService {
                     Some(&attempt_id),
                 );
                 self.record_put_failed(&attempt_id, &status).await;
-                self.cleanup_failed_put_objects(&cleanup_key, cleanup_target_file_size)
-                    .await;
+                self.cleanup_failed_put_objects(
+                    &cleanup_bucket,
+                    &cleanup_key,
+                    cleanup_target_file_size,
+                )
+                .await;
                 Err(status)
             }
         }
     }
 
-    async fn cleanup_failed_put_objects(&self, key: &str, target_file_size: Option<usize>) {
+    async fn cleanup_failed_put_objects(
+        &self,
+        bucket: &str,
+        key: &str,
+        target_file_size: Option<usize>,
+    ) {
+        let store = match self.stores.store_for_bucket(bucket) {
+            Ok(store) => store,
+            Err(error) => {
+                warn!(
+                    bucket,
+                    key,
+                    error = %error,
+                    "failed DoPut cleanup skipped because bucket could not be opened"
+                );
+                return;
+            }
+        };
         let path = path_from_key(key);
-        match self.store.delete(&path).await {
-            Ok(()) => debug!(key = %key, "deleted failed DoPut object"),
+        match store.delete(&path).await {
+            Ok(()) => debug!(bucket, key = %key, "deleted failed DoPut object"),
             Err(error) => warn!(
+                bucket,
                 key = %key,
                 error = %error,
                 "failed DoPut exact-object cleanup skipped or failed"
@@ -828,10 +874,10 @@ impl WorkerFlightService {
 
         let prefix = Path::from(dataset_parts_prefix(key));
         let mut deleted = 0usize;
-        let mut listed = self.store.list(Some(&prefix));
+        let mut listed = store.list(Some(&prefix));
         while let Some(item) = listed.next().await {
             match item {
-                Ok(meta) => match self.store.delete(&meta.location).await {
+                Ok(meta) => match store.delete(&meta.location).await {
                     Ok(()) => deleted += 1,
                     Err(error) => warn!(
                         path = %meta.location,
@@ -861,6 +907,7 @@ impl WorkerFlightService {
 
     async fn write_single_file<S>(
         &self,
+        store: Arc<dyn ObjectStore>,
         key: String,
         path: Path,
         client_input_file_bytes: Option<u64>,
@@ -882,7 +929,7 @@ impl WorkerFlightService {
     {
         let props = writer_properties(&self.config.parquet);
         let object_writer =
-            parquet_object_writer(self.store.clone(), path.clone(), &self.config.parquet);
+            parquet_object_writer(store.clone(), path.clone(), &self.config.parquet);
         let mut writer =
             AsyncArrowWriter::try_new(object_writer, first_batch.schema(), Some(props))
                 .map_err(status_from_anyhow)?;
@@ -933,7 +980,7 @@ impl WorkerFlightService {
             writer_profile.close_ms += started.elapsed().as_millis();
         }
         let head_started = profile_enabled.then(Instant::now);
-        let object_meta = self.store.head(&path).await.ok();
+        let object_meta = store.head(&path).await.ok();
         if let Some(started) = head_started {
             writer_profile.head_ms += started.elapsed().as_millis();
         }
@@ -1022,6 +1069,7 @@ impl WorkerFlightService {
 
     async fn write_sized_dataset<S>(
         &self,
+        store: Arc<dyn ObjectStore>,
         key: String,
         target_file_size: usize,
         client_input_file_bytes: Option<u64>,
@@ -1058,7 +1106,7 @@ impl WorkerFlightService {
             &mut active_writers,
             &mut parts,
             max_part_writers,
-            self.store.clone(),
+            store.clone(),
             self.config.parquet.clone(),
             &key,
             &mut next_part,
@@ -1110,7 +1158,7 @@ impl WorkerFlightService {
                 &mut active_writers,
                 &mut parts,
                 max_part_writers,
-                self.store.clone(),
+                store.clone(),
                 self.config.parquet.clone(),
                 &key,
                 &mut next_part,
@@ -1289,18 +1337,23 @@ impl FlightService for WorkerFlightService {
                 &self.config.worker,
                 &self.config.security,
             )?;
+            let bucket = ticket
+                .bucket
+                .unwrap_or_else(|| self.stores.default_bucket().to_owned());
+            let store = self
+                .stores
+                .store_for_bucket(&bucket)
+                .map_err(|err| Status::permission_denied(err.to_string()))?;
             let key = ticket.key;
 
             let path = path_from_key(&key);
             let read_admission = self.admit_read().await?;
-            let meta = self
-                .store
+            let meta = store
                 .head(&path)
                 .await
                 .map_err(|err| Status::not_found(err.to_string()))?;
 
-            let reader =
-                ParquetObjectReader::new(self.store.clone(), path).with_file_size(meta.size);
+            let reader = ParquetObjectReader::new(store.clone(), path).with_file_size(meta.size);
             let builder = ParquetRecordBatchStreamBuilder::new(reader)
                 .await
                 .map_err(status_from_anyhow)?;

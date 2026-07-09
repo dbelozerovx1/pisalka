@@ -19,6 +19,7 @@ pub(crate) const CAPABILITY_VERSION: u16 = 1;
 
 #[derive(Debug, Clone)]
 pub(crate) struct VerifiedPutCapability {
+    pub(crate) bucket: Option<String>,
     pub(crate) operation_id: Option<String>,
     pub(crate) attempt_id: Option<String>,
     pub(crate) upload_id: Option<String>,
@@ -33,6 +34,7 @@ pub(crate) struct VerifiedPutCapability {
 
 #[derive(Debug, Clone)]
 pub(crate) struct VerifiedGetCapability {
+    pub(crate) bucket: Option<String>,
     pub(crate) operation_id: Option<String>,
     pub(crate) path: String,
     pub(crate) max_batch_rows: Option<usize>,
@@ -55,6 +57,7 @@ struct CapabilityPayload {
     attempt_id: Option<String>,
     upload_id: Option<String>,
     stream_id: Option<String>,
+    bucket: Option<String>,
     path: Option<String>,
     allowed_output_prefix: Option<String>,
     staging_prefix: Option<String>,
@@ -101,6 +104,7 @@ pub(crate) fn verify_put_capability(
         .transpose()?;
 
     Ok(VerifiedPutCapability {
+        bucket: validate_optional_bucket(payload.bucket)?,
         operation_id: validate_optional_id("operation_id", payload.operation_id)?,
         attempt_id: validate_optional_id("attempt_id", payload.attempt_id)?,
         upload_id: validate_optional_id("upload_id", payload.upload_id)?,
@@ -133,6 +137,7 @@ pub(crate) fn verify_get_capability(
         .ok_or_else(|| Status::permission_denied("DoGet capability requires exact parquet path"))?;
 
     Ok(VerifiedGetCapability {
+        bucket: validate_optional_bucket(payload.bucket)?,
         operation_id: validate_optional_id("operation_id", payload.operation_id)?,
         path: normalize_object_key(path),
         max_batch_rows: payload.max_batch_rows,
@@ -320,6 +325,23 @@ pub(crate) fn validate_optional_id(
     }
 
     Ok(Some(value.to_owned()))
+}
+
+pub(crate) fn validate_optional_bucket(bucket: Option<String>) -> Result<Option<String>, Status> {
+    let Some(bucket) = bucket else {
+        return Ok(None);
+    };
+    if bucket.is_empty()
+        || bucket.starts_with("s3://")
+        || bucket.starts_with("s3a://")
+        || bucket.contains('/')
+        || bucket.contains('\\')
+    {
+        return Err(Status::permission_denied(
+            "capability bucket must be a plain bucket name without s3://, s3a://, or subdirectories",
+        ));
+    }
+    Ok(Some(bucket))
 }
 
 fn now_ms() -> Result<u64, Status> {

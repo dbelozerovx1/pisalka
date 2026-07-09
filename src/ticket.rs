@@ -5,13 +5,17 @@ use serde::Deserialize;
 use tonic::Status;
 
 use crate::{
-    capability::{parse_capability_envelope, validate_optional_id, verify_get_capability},
+    capability::{
+        parse_capability_envelope, validate_optional_bucket, validate_optional_id,
+        verify_get_capability,
+    },
     config::{SecurityConfig, WorkerConfig},
     util::normalize_object_key,
 };
 
 #[derive(Debug, Clone)]
 pub(crate) struct ReadTicket {
+    pub(crate) bucket: Option<String>,
     pub(crate) key: String,
     pub(crate) operation_id: Option<String>,
     pub(crate) max_batch_rows: Option<usize>,
@@ -20,6 +24,7 @@ pub(crate) struct ReadTicket {
 
 #[derive(Debug, Deserialize)]
 struct StructuredReadTicket {
+    bucket: Option<String>,
     #[serde(alias = "key", alias = "file_path")]
     path: String,
     operation_id: Option<String>,
@@ -38,6 +43,7 @@ pub(crate) fn parse_read_ticket(
     if let Some(value) = parse_capability_envelope(bytes) {
         let capability = verify_get_capability(value, worker, security)?;
         return Ok(ReadTicket {
+            bucket: capability.bucket,
             key: capability.path,
             operation_id: capability.operation_id,
             max_batch_rows: capability.max_batch_rows,
@@ -56,6 +62,7 @@ pub(crate) fn parse_read_ticket(
             .map_err(|err| Status::invalid_argument(format!("invalid DoGet ticket JSON: {err}")))?;
         validate_expiry(ticket.expires_at_ms)?;
         return Ok(ReadTicket {
+            bucket: validate_optional_bucket(ticket.bucket)?,
             key: normalize_object_key(&ticket.path),
             operation_id: validate_optional_id("operation_id", ticket.operation_id)?,
             max_batch_rows: None,
@@ -72,6 +79,7 @@ pub(crate) fn parse_read_ticket(
     let raw = std::str::from_utf8(bytes)
         .map_err(|err| Status::invalid_argument(format!("DoGet ticket is not utf8: {err}")))?;
     Ok(ReadTicket {
+        bucket: None,
         key: normalize_object_key(raw),
         operation_id: None,
         max_batch_rows: None,

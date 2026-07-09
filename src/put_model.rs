@@ -42,6 +42,7 @@ pub(crate) struct PutFileSummary {
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct WorkerPutSummary {
     pub(crate) worker_id: String,
+    pub(crate) bucket: String,
     pub(crate) operation_id: Option<String>,
     pub(crate) attempt_id: String,
     pub(crate) upload_id: Option<String>,
@@ -126,6 +127,7 @@ pub(crate) struct DatasetPart {
 pub(crate) struct PutOptions {
     #[serde(default)]
     pub(crate) capability: Option<Value>,
+    pub(crate) bucket: Option<String>,
     pub(crate) attempt_id: Option<String>,
     pub(crate) upload_id: Option<String>,
     pub(crate) stream_id: Option<String>,
@@ -140,6 +142,7 @@ pub(crate) struct PutOptions {
 
 #[derive(Debug, Clone)]
 pub(crate) struct PutContext {
+    pub(crate) bucket: String,
     pub(crate) operation_id: Option<String>,
     pub(crate) attempt_id: String,
     pub(crate) upload_id: Option<String>,

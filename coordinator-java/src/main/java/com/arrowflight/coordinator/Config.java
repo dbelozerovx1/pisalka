@@ -41,6 +41,8 @@ final class Config {
     final long uploadSessionTtlMs;
     final long queryRegistryTtlMs;
     final long queryRegistryCleanupIntervalMs;
+    final String s3PresignedBucket;
+    final String s3TmpBucket;
     final String objectStoreUriPrefix;
     final int defaultUploadStreams;
     final long defaultTargetFileSizeBytes;
@@ -97,6 +99,8 @@ final class Config {
             long uploadSessionTtlMs,
             long queryRegistryTtlMs,
             long queryRegistryCleanupIntervalMs,
+            String s3PresignedBucket,
+            String s3TmpBucket,
             String objectStoreUriPrefix,
             int defaultUploadStreams,
             long defaultTargetFileSizeBytes,
@@ -152,6 +156,8 @@ final class Config {
         this.uploadSessionTtlMs = uploadSessionTtlMs;
         this.queryRegistryTtlMs = queryRegistryTtlMs;
         this.queryRegistryCleanupIntervalMs = queryRegistryCleanupIntervalMs;
+        this.s3PresignedBucket = s3PresignedBucket;
+        this.s3TmpBucket = s3TmpBucket;
         this.objectStoreUriPrefix = normalizeObjectStoreUriPrefix(objectStoreUriPrefix);
         this.defaultUploadStreams = defaultUploadStreams;
         this.defaultTargetFileSizeBytes = defaultTargetFileSizeBytes;
@@ -178,11 +184,10 @@ final class Config {
     static Config fromEnv() {
         long capabilityTtlMs = envLong("COORDINATOR_CAPABILITY_TTL_MS", 15 * 60 * 1000L);
         boolean k8sWorkerDiscoveryEnabled = envBool("COORDINATOR_K8S_WORKER_DISCOVERY_ENABLED", false);
-        String objectStoreUriPrefix = env("COORDINATOR_OBJECT_STORE_URI_PREFIX", "s3://arrow-flight");
         String trinoCatalog = env("TRINO_CATALOG", "iceberg");
-        String trinoSchema = env("TRINO_SCHEMA", "arrow");
-        String icebergWarehouse = env("ICEBERG_WAREHOUSE", objectStoreUriPrefix + "/iceberg");
-        String ctasSchema = env("CTAS_TEMP_SCHEMA", env("CTAS_DEFAULT_SCHEMA", trinoSchema));
+        String ctasSchema = env("CTAS_TEMP_SCHEMA", env("TRINO_SCHEMA", "arrow"));
+        String trinoSchema = env("TRINO_SCHEMA", ctasSchema);
+        BucketLocations bucketLocations = bucketLocations(trinoCatalog);
         return new Config(
                 parseListenAddress(env("COORDINATOR_ADDR", "0.0.0.0:8088"), "COORDINATOR_ADDR"),
                 envBool("COORDINATOR_METRICS_ENABLED", true),
@@ -194,11 +199,11 @@ final class Config {
                 trinoCatalog,
                 ctasSchema,
                 env("CTAS_TABLE_PREFIX", "ctas_tmp"),
-                env("CTAS_TEMP_LOCATION_PREFIX", objectStoreUriPrefix + "/coordinator/ctas"),
-                env("COORDINATOR_DEFAULT_SCHEMA_LOCATION_PREFIX", icebergWarehouse),
-                env("ICEBERG_CATALOG_NAME", trinoCatalog),
+                bucketLocations.ctasLocationPrefix(),
+                bucketLocations.defaultSchemaLocationPrefix(),
+                bucketLocations.icebergCatalogName(),
                 env("ICEBERG_CATALOG_URI", "thrift://host.docker.internal:9083"),
-                icebergWarehouse,
+                bucketLocations.icebergWarehouse(),
                 envBool("ICEBERG_HIVE_LOCK_ENABLED", false),
                 envOptional("S3_ENDPOINT"),
                 env("AWS_REGION", env("S3_REGION", "us-east-1")),
@@ -217,7 +222,9 @@ final class Config {
                 envLong("COORDINATOR_UPLOAD_SESSION_TTL_MS", 60 * 60 * 1000L),
                 envLong("COORDINATOR_QUERY_REGISTRY_TTL_MS", 60 * 60 * 1000L),
                 envLong("COORDINATOR_QUERY_REGISTRY_CLEANUP_INTERVAL_MS", 5 * 60 * 1000L),
-                objectStoreUriPrefix,
+                bucketLocations.s3PresignedBucket(),
+                bucketLocations.s3TmpBucket(),
+                bucketLocations.objectStoreUriPrefix(),
                 envInt("COORDINATOR_DEFAULT_UPLOAD_STREAMS", 1),
                 envLong("COORDINATOR_DEFAULT_TARGET_FILE_SIZE_BYTES", 512L * 1024 * 1024),
                 envLong("COORDINATOR_DEFAULT_MAX_STREAM_BYTES", 10L * 1024 * 1024 * 1024),
@@ -248,6 +255,19 @@ final class Config {
 
     String objectUriForPrefix(String prefix) {
         return objectStoreUriPrefix + "/" + normalizePrefix(prefix);
+    }
+
+    String tmpObjectUriForPrefix(String prefix) {
+        return "s3a://" + s3TmpBucket + "/" + normalizePrefix(prefix);
+    }
+
+    String presignedObjectUriForPrefix(String prefix) {
+        return "s3a://" + s3PresignedBucket + "/" + normalizePrefix(prefix);
+    }
+
+    String objectUriForBucket(String bucket, String prefix) {
+        BucketName parsed = BucketName.parse(bucket, "bucket");
+        return "s3a://" + parsed.name + "/" + normalizePrefix(prefix);
     }
 
     String ctasLocation(String queryId) {
@@ -309,9 +329,93 @@ final class Config {
             value = value.substring(0, value.length() - 1);
         }
         if (value.isBlank()) {
-            throw new IllegalArgumentException("COORDINATOR_OBJECT_STORE_URI_PREFIX must not be empty");
+            throw new IllegalArgumentException("object-store URI prefix must not be empty");
         }
         return value;
+    }
+
+    private static BucketLocations bucketLocations(String trinoCatalog) {
+        Optional<String> presignedBucket = envOptional("S3_PRESIGNED_BUCKET").or(() -> envOptional("COORDINATOR_BUCKET"));
+        Optional<String> tmpBucket = envOptional("S3_TMP_BUCKET").or(() -> envOptional("COORDINATOR_TMP_BUCKET"));
+        if (presignedBucket.isPresent() || tmpBucket.isPresent()) {
+            if (presignedBucket.isEmpty() || tmpBucket.isEmpty()) {
+                throw new IllegalArgumentException(
+                        "S3_PRESIGNED_BUCKET and S3_TMP_BUCKET must be set together"
+                );
+            }
+            BucketName ctasBucket = BucketName.parse(presignedBucket.get(), "S3_PRESIGNED_BUCKET");
+            BucketName tableBucket = BucketName.parse(tmpBucket.get(), "S3_TMP_BUCKET");
+            return new BucketLocations(
+                    ctasBucket.name,
+                    tableBucket.name,
+                    ctasBucket.uriPrefix(),
+                    ctasBucket.uriPrefix(),
+                    tableBucket.uriPrefix(),
+                    trinoCatalog,
+                    tableBucket.uriPrefix()
+            );
+        }
+
+        String objectStoreUriPrefix = env("COORDINATOR_OBJECT_STORE_URI_PREFIX", "s3a://arrow-flight");
+        String ctasLocationPrefix = env("CTAS_TEMP_LOCATION_PREFIX", objectStoreUriPrefix + "/coordinator/ctas");
+        String icebergWarehouse = env("ICEBERG_WAREHOUSE", objectStoreUriPrefix + "/iceberg");
+        String defaultSchemaLocationPrefix = env("COORDINATOR_DEFAULT_SCHEMA_LOCATION_PREFIX", icebergWarehouse);
+        return new BucketLocations(
+                bucketNameFromObjectStoreUri(ctasLocationPrefix, "CTAS_TEMP_LOCATION_PREFIX"),
+                bucketNameFromObjectStoreUri(defaultSchemaLocationPrefix, "COORDINATOR_DEFAULT_SCHEMA_LOCATION_PREFIX"),
+                objectStoreUriPrefix,
+                ctasLocationPrefix,
+                defaultSchemaLocationPrefix,
+                env("ICEBERG_CATALOG_NAME", trinoCatalog),
+                icebergWarehouse
+        );
+    }
+
+    private record BucketLocations(
+            String s3PresignedBucket,
+            String s3TmpBucket,
+            String objectStoreUriPrefix,
+            String ctasLocationPrefix,
+            String defaultSchemaLocationPrefix,
+            String icebergCatalogName,
+            String icebergWarehouse
+    ) {
+    }
+
+    private record BucketName(String name) {
+        static BucketName parse(String raw, String envName) {
+            String value = raw == null ? "" : raw.trim();
+            if (value.isBlank()) {
+                throw new IllegalArgumentException(envName + " must be a plain bucket name");
+            }
+            if (value.startsWith("s3://") || value.startsWith("s3a://") || value.contains("/") || value.contains("\\")) {
+                throw new IllegalArgumentException(
+                        envName + " must be a plain bucket name without s3://, s3a://, or subdirectories"
+                );
+            }
+            return new BucketName(value);
+        }
+
+        String uriPrefix() {
+            return "s3a://" + name;
+        }
+    }
+
+    static String bucketNameFromObjectStoreUri(String raw, String envName) {
+        String value = raw == null ? "" : raw.trim();
+        if (value.startsWith("s3a://")) {
+            value = value.substring("s3a://".length());
+        } else if (value.startsWith("s3://")) {
+            value = value.substring("s3://".length());
+        }
+        String normalized = normalizePrefix(value);
+        String bucket = normalized.contains("/")
+                ? normalized.substring(0, normalized.indexOf('/'))
+                : normalized;
+        if (bucket.isBlank()) {
+            throw new IllegalArgumentException(envName + " must include a bucket name");
+        }
+        return bucket;
     }
 
     private static String normalizeUriScheme(String raw) {
@@ -340,10 +444,7 @@ final class Config {
     }
 
     private static long workerSelectionGraceMs() {
-        return Math.max(0L, envLong(
-                "COORDINATOR_WORKER_SELECTION_GRACE_MS",
-                envLong("COORDINATOR_WORKER_PICKUP_GRACE_MS", 0L)
-        ));
+        return Math.max(0L, envLong("COORDINATOR_WORKER_SELECTION_GRACE_MS", 0L));
     }
 
     private static int envInt(String key, int defaultValue) {
