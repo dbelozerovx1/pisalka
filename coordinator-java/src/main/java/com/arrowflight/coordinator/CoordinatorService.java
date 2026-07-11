@@ -63,6 +63,8 @@ final class CoordinatorService {
         body.put("metricsEnabled", config.coordinatorMetricsEnabled);
         body.put("metricsAddress", config.coordinatorMetricsAddress.toString());
         body.put("queryRegistryTtlMs", config.queryRegistryTtlMs);
+        body.put("uploadFlavors", List.of("small", "medium", "large"));
+        body.put("putReservationTtlMs", config.putReservationTtlMs);
         body.put("workerClientEndpointsRequired", config.workerClientEndpointsRequired);
         body.put("workerSelectionGraceMs", config.workerSelectionGraceMs);
         body.put("k8sWorkerDiscoveryEnabled", config.k8sWorkerDiscoveryEnabled);
@@ -131,6 +133,11 @@ final class CoordinatorService {
                 config.defaultPutMaxRecordBatchBytes
         );
         Optional<UploadSnapshot> existing = metadataStore.loadUploadIfExists(uploadId);
+        UploadFlavor flavor = request.containsKey("flavor")
+                ? UploadFlavor.fromRequest(request.get("flavor"))
+                : existing
+                        .map(snapshot -> UploadFlavor.fromRequest(snapshot.session().uploadFlavor()))
+                        .orElse(UploadFlavor.SMALL);
         if (existing.isPresent()) {
             String tableName = optionalClientTable(request, "tableName")
                     .map(ClientTable::name)
@@ -141,9 +148,9 @@ final class CoordinatorService {
                     ));
             return createUploadResponse(
                     existing.get(),
-                    request,
                     tableName,
                     mode,
+                    flavor,
                     targetFileSize,
                     maxStreamBytes,
                     maxRecordBatchBytes,
@@ -158,53 +165,53 @@ final class CoordinatorService {
         String tableName = target.tableName();
         String outputPrefix = tableDataLocation(target.tableLocation()).key();
 
-        int requestedStreams = Math.max(1, Math.min(
-                Json.intValue(request, "streams", config.defaultUploadStreams),
-                config.defaultMaxUploadStreams
-        ));
-        List<WorkerAssignment> workerAssignments = metadataStore.selectPutWorkers(requestedStreams);
-        int streams = workerAssignments.size();
         Instant expiresAt = Instant.now().plusMillis(Json.longValue(
                 request,
                 "ttlMs",
                 config.uploadSessionTtlMs
         ));
-
-        ArrayList<PlannedUploadStream> plannedStreams = new ArrayList<>();
-        for (int index = 0; index < streams; index++) {
-            WorkerAssignment worker = workerAssignments.get(index);
-            String streamId = "stream-%05d".formatted(index);
-            String attemptId = UUID.randomUUID().toString();
-            String descriptorPath = outputPrefix + "/flight-" + UUID.randomUUID() + ".parquet";
-            plannedStreams.add(new PlannedUploadStream(
-                    streamId,
-                    attemptId,
-                    worker.workerId(),
-                    worker.flightUri(),
-                    descriptorPath,
-                    Map.of()
-            ));
-        }
-
-        PlannedUploadSession session = new PlannedUploadSession(
-                uploadId,
-                operationId,
-                Optional.of(tableName),
-                mode.equals("overwrite") ? "PREPARING" : "PLANNED",
-                streams,
-                outputPrefix,
-                targetFileSize,
-                maxStreamBytes,
-                maxRecordBatchBytes,
-                mode,
-                expiresAt
-        );
-        if (!metadataStore.tryCreateUpload(session, plannedStreams)) {
+        if (!metadataStore.tryCreateUpload(uploadId, flavor, workerPlan -> {
+            List<WorkerAssignment> workerAssignments = workerPlan.assignments();
+            Instant requestedReservationExpiry = Instant.now().plusMillis(config.putReservationTtlMs);
+            Instant reservationExpiresAt = requestedReservationExpiry.isBefore(expiresAt)
+                    ? requestedReservationExpiry
+                    : expiresAt;
+            ArrayList<PlannedUploadStream> plannedStreams = new ArrayList<>();
+            for (int index = 0; index < workerAssignments.size(); index++) {
+                WorkerAssignment worker = workerAssignments.get(index);
+                plannedStreams.add(new PlannedUploadStream(
+                        "stream-%05d".formatted(index),
+                        UUID.randomUUID().toString(),
+                        worker.workerId(),
+                        worker.flightUri(),
+                        outputPrefix + "/flight-" + UUID.randomUUID() + ".parquet",
+                        reservationExpiresAt,
+                        Map.of()
+                ));
+            }
+            return new PlannedUpload(
+                    new PlannedUploadSession(
+                            uploadId,
+                            operationId,
+                            Optional.of(tableName),
+                            mode.equals("overwrite") ? "PREPARING" : "PLANNED",
+                            workerAssignments.size(),
+                            flavor.value(),
+                            outputPrefix,
+                            targetFileSize,
+                            maxStreamBytes,
+                            maxRecordBatchBytes,
+                            mode,
+                            expiresAt
+                    ),
+                    plannedStreams
+            );
+        })) {
             return createUploadResponse(
                     metadataStore.loadUpload(uploadId),
-                    request,
                     tableName,
                     mode,
+                    flavor,
                     targetFileSize,
                     maxStreamBytes,
                     maxRecordBatchBytes,
@@ -227,9 +234,9 @@ final class CoordinatorService {
 
         return createUploadResponse(
                 metadataStore.loadUpload(uploadId),
-                request,
                 tableName,
                 mode,
+                flavor,
                 targetFileSize,
                 maxStreamBytes,
                 maxRecordBatchBytes,
@@ -241,9 +248,9 @@ final class CoordinatorService {
 
     private LinkedHashMap<String, Object> createUploadResponse(
             UploadSnapshot snapshot,
-            Map<String, Object> request,
             String requestedTableName,
             String requestedMode,
+            UploadFlavor requestedFlavor,
             long requestedTargetFileSize,
             Optional<Long> requestedMaxStreamBytes,
             Optional<Long> requestedMaxRecordBatchBytes,
@@ -256,13 +263,14 @@ final class CoordinatorService {
                 session,
                 requestedTableName,
                 requestedMode,
+                requestedFlavor,
                 requestedTargetFileSize,
                 requestedMaxStreamBytes,
                 requestedMaxRecordBatchBytes
         );
         if (session.status().equals("PREPARING")) {
             LinkedHashMap<String, Object> body =
-                    baseCreateUploadResponse(session, snapshot, request, alreadyCreated, endpointRewrite);
+                    baseCreateUploadResponse(session, snapshot, alreadyCreated, endpointRewrite);
             body.put("status", "PREPARING");
             body.put("retryAfterMs", 500);
             body.put("tickets", List.of());
@@ -290,12 +298,23 @@ final class CoordinatorService {
                     "upload session " + session.uploadId() + " was aborted and cannot issue upload tickets"
             );
         }
+        boolean expiredPendingReservation = snapshot.streams().stream().anyMatch(stream ->
+                stream.status().equals("PENDING")
+                        && stream.reservationExpiresAt().isBefore(Instant.now())
+        );
+        if (expiredPendingReservation) {
+            throw new CoordinatorException(
+                    409,
+                    "upload plan " + session.uploadId()
+                            + " expired before all DoPut streams started; abort it and create a new uploadId"
+            );
+        }
 
         List<Map<String, Object>> ticketBodies = snapshot.streams().stream()
                 .map(stream -> uploadTicket(session, stream, endpointRewrite))
                 .toList();
         LinkedHashMap<String, Object> body =
-                baseCreateUploadResponse(session, snapshot, request, alreadyCreated, endpointRewrite);
+                baseCreateUploadResponse(session, snapshot, alreadyCreated, endpointRewrite);
         body.put("status", session.status());
         overwritePreparation.ifPresent(value -> body.put("overwritePreparation", value));
         body.put("tickets", ticketBodies);
@@ -305,7 +324,6 @@ final class CoordinatorService {
     private LinkedHashMap<String, Object> baseCreateUploadResponse(
             UploadSessionRecord session,
             UploadSnapshot snapshot,
-            Map<String, Object> request,
             boolean alreadyCreated,
             WorkerEndpointRewrite endpointRewrite
     ) {
@@ -314,7 +332,7 @@ final class CoordinatorService {
         body.put("operationId", session.operationId());
         session.tableName().ifPresent(value -> body.put("tableName", value));
         session.commitMode().ifPresent(value -> body.put("mode", value));
-        body.put("requestedStreams", Json.intValue(request, "streams", session.expectedStreams()));
+        body.put("requestedFlavor", session.uploadFlavor());
         body.put("grantedStreams", session.expectedStreams());
         body.put("expectedStreams", session.expectedStreams());
         body.put("stagingPrefix", session.stagingPrefix() + "/");
@@ -332,6 +350,7 @@ final class CoordinatorService {
             UploadSessionRecord session,
             String requestedTableName,
             String requestedMode,
+            UploadFlavor requestedFlavor,
             long requestedTargetFileSize,
             Optional<Long> requestedMaxStreamBytes,
             Optional<Long> requestedMaxRecordBatchBytes
@@ -350,6 +369,14 @@ final class CoordinatorService {
                     "create-upload retry conflicts with existing uploadId " + session.uploadId()
                             + ": mode was " + session.commitMode().get()
                             + " but request asked for " + requestedMode
+            );
+        }
+        if (!session.uploadFlavor().equals(requestedFlavor.value())) {
+            throw new CoordinatorException(
+                    409,
+                    "create-upload retry conflicts with existing uploadId " + session.uploadId()
+                            + ": flavor was " + session.uploadFlavor()
+                            + " but request asked for " + requestedFlavor.value()
             );
         }
         if (session.targetFileSize() != requestedTargetFileSize) {
@@ -401,6 +428,7 @@ final class CoordinatorService {
         ticketRequest.put("bucket", uploadBucket(session));
         ticketRequest.put("stagingPrefix", session.stagingPrefix());
         ticketRequest.put("path", stream.descriptorPath());
+        ticketRequest.put("startBeforeMs", stream.reservationExpiresAt().toEpochMilli());
         ticketRequest.put("targetFileSizeBytes", session.targetFileSize());
         session.maxStreamBytes().ifPresent(value -> ticketRequest.put("maxStreamBytes", value));
         session.maxRecordBatchBytes().ifPresent(value -> ticketRequest.put("maxRecordBatchBytes", value));
@@ -760,19 +788,6 @@ final class CoordinatorService {
                 "staging", stagingCleanup.toJson()
         ));
         return body;
-    }
-
-    Map<String, Object> putTicket(Map<String, Object> request) {
-        return putTicket(request, WorkerEndpointRewrite.NONE);
-    }
-
-    Map<String, Object> putTicket(Map<String, Object> request, WorkerEndpointRewrite endpointRewrite) {
-        requireAdminIfConfigured(request);
-        WorkerAssignment worker = metadataStore.selectPutWorkers(1).getFirst();
-        LinkedHashMap<String, Object> signedRequest = new LinkedHashMap<>(request);
-        signedRequest.put("workerId", worker.workerId());
-        signedRequest.put("flightUri", endpointRewrite.rewrite(worker.workerId(), worker.flightUri()));
-        return capabilitySigner.putPayload(signedRequest);
     }
 
     Map<String, Object> getTicket(Map<String, Object> request) {

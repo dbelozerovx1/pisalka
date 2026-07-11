@@ -54,6 +54,8 @@ async fn main() -> Result<()> {
         metrics_addr = %config.metrics.addr,
         read_slots = config.worker.max_active_read_streams,
         put_slots = config.worker.max_active_put_streams,
+        put_parallelism = config.parquet.put_parallelism,
+        put_writer_slots = config.parquet.max_active_put_writers,
         signed_capabilities_required = config.security.require_signed_capabilities,
         capability_worker_binding_required = config.security.require_capability_worker_binding,
         compression = %config.parquet.compression_name,

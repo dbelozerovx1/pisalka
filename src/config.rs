@@ -20,13 +20,6 @@ pub struct AppConfig {
 }
 
 #[derive(Debug, Clone)]
-pub struct BenchConfig {
-    pub uri: String,
-    pub max_message_size: usize,
-    pub flight_data_chunk_size: usize,
-}
-
-#[derive(Debug, Clone)]
 pub struct FlightTlsConfig {
     pub enabled: bool,
     pub cert_path: Option<String>,
@@ -57,6 +50,7 @@ pub struct ParquetTuning {
     pub multipart_part_size: usize,
     pub multipart_max_concurrency: usize,
     pub put_parallelism: usize,
+    pub max_active_put_writers: usize,
     pub put_queue_depth: usize,
 }
 
@@ -130,7 +124,7 @@ impl AppConfig {
             flight_addr,
             flight_tls: FlightTlsConfig::from_env()?,
             s3: S3Config::from_env(),
-            parquet: ParquetTuning::from_env()?,
+            parquet: ParquetTuning::from_env(&flavor)?,
             worker,
             resources,
             security,
@@ -166,16 +160,6 @@ impl WorkerFlavor {
         Ok(Self {
             cpu_millicores,
             memory_bytes,
-        })
-    }
-}
-
-impl BenchConfig {
-    pub fn from_env() -> Result<Self> {
-        Ok(Self {
-            uri: env_string("FLIGHT_URI", "grpc+tcp://127.0.0.1:50051"),
-            max_message_size: env_usize("FLIGHT_MAX_MESSAGE_SIZE", 256 * 1024 * 1024)?,
-            flight_data_chunk_size: env_usize("FLIGHT_DATA_CHUNK_SIZE", 16 * 1024 * 1024)?,
         })
     }
 }
@@ -246,8 +230,10 @@ impl S3Config {
 }
 
 impl ParquetTuning {
-    pub fn from_env() -> Result<Self> {
+    fn from_env(flavor: &WorkerFlavor) -> Result<Self> {
         let compression_name = env_string("PARQUET_COMPRESSION", "uncompressed");
+        let put_parallelism = env_count("PUT_PARALLELISM", 4)?.max(1);
+        let auto_active_writers = auto_put_writers(flavor.cpu_millicores, put_parallelism);
 
         Ok(Self {
             compression: parse_compression(&compression_name)?,
@@ -260,8 +246,10 @@ impl ParquetTuning {
             multipart_part_size: env_usize("S3_MULTIPART_PART_SIZE", 64 * 1024 * 1024)?
                 .max(5 * 1024 * 1024),
             multipart_max_concurrency: env_usize("S3_MULTIPART_MAX_CONCURRENCY", 16)?.max(1),
-            put_parallelism: env_usize("PUT_PARALLELISM", 4)?.max(1),
-            put_queue_depth: env_usize("PUT_QUEUE_DEPTH", 2)?.max(1),
+            put_parallelism,
+            max_active_put_writers: env_count_auto("PUT_MAX_ACTIVE_WRITERS", auto_active_writers)?
+                .max(put_parallelism),
+            put_queue_depth: env_count("PUT_QUEUE_DEPTH", 2)?.max(1),
         })
     }
 }
@@ -628,8 +616,10 @@ fn cpu_quota_to_millicores(quota: u64, period: u64) -> Option<u64> {
         return None;
     }
     Some(
-        (((quota as u128).saturating_mul(1000) + period as u128 - 1) / period as u128)
-            .min(u64::MAX as u128) as u64,
+        ((quota as u128)
+            .saturating_mul(1000)
+            .div_ceil(period as u128))
+        .min(u64::MAX as u128) as u64,
     )
 }
 
@@ -644,11 +634,22 @@ fn default_cpu_millicores() -> u64 {
 }
 
 fn auto_put_streams(cpu_millicores: u64) -> usize {
-    (((cpu_millicores as u128).saturating_mul(2) + 999) / 1000).clamp(1, 16) as usize
+    (cpu_millicores as u128)
+        .saturating_mul(2)
+        .div_ceil(1000)
+        .clamp(1, 16) as usize
+}
+
+fn auto_put_writers(cpu_millicores: u64, put_parallelism: usize) -> usize {
+    let cpu_writers = cpu_millicores.div_ceil(1000) as usize;
+    cpu_writers.max(put_parallelism).clamp(1, 32)
 }
 
 fn auto_read_streams(cpu_millicores: u64) -> usize {
-    (((cpu_millicores as u128).saturating_mul(4) + 999) / 1000).clamp(1, 32) as usize
+    (cpu_millicores as u128)
+        .saturating_mul(4)
+        .div_ceil(1000)
+        .clamp(1, 32) as usize
 }
 
 fn auto_reserved_slots(streams: usize) -> usize {
@@ -710,5 +711,13 @@ mod tests {
         assert_eq!(auto_read_streams(1000), 4);
         assert_eq!(auto_read_streams(4000), 16);
         assert_eq!(auto_read_streams(16_000), 32);
+    }
+
+    #[test]
+    fn global_writer_auto_limit_never_throttles_one_stream() {
+        assert_eq!(auto_put_writers(4_000, 4), 4);
+        assert_eq!(auto_put_writers(8_000, 4), 8);
+        assert_eq!(auto_put_writers(2_000, 4), 4);
+        assert_eq!(auto_put_writers(64_000, 4), 32);
     }
 }

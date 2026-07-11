@@ -54,6 +54,7 @@ use crate::{
         WorkerCapabilities, WorkerCapacity, WorkerLocality, WorkerResourcePool,
         WorkerResourceStatus, WorkerSchedulerStatus, WorkerSchedulingPolicy,
         WorkerSchedulingSignal, WorkerSchedulingTelemetry, WorkerState, WorkerStatus,
+        WorkerWriterCapacity,
     },
 };
 
@@ -65,6 +66,7 @@ pub struct WorkerFlightService {
     stores: Arc<ObjectStoreRegistry>,
     metadata_store: Option<Arc<MetadataStore>>,
     put_slots: Arc<Semaphore>,
+    put_writer_slots: Arc<Semaphore>,
     read_slots: Arc<Semaphore>,
     put_memory: ResourceLimiter,
     read_memory: ResourceLimiter,
@@ -83,6 +85,8 @@ impl WorkerFlightService {
         metrics: Arc<WorkerMetrics>,
     ) -> Self {
         let put_slots = Arc::new(Semaphore::new(config.worker.max_active_put_streams.max(1)));
+        let put_writer_slots =
+            Arc::new(Semaphore::new(config.parquet.max_active_put_writers.max(1)));
         let read_slots = Arc::new(Semaphore::new(config.worker.max_active_read_streams.max(1)));
         let put_memory = ResourceLimiter::new(config.resources.put_memory_bytes);
         let read_memory = ResourceLimiter::new(config.resources.read_memory_bytes);
@@ -92,6 +96,7 @@ impl WorkerFlightService {
             stores,
             metadata_store,
             put_slots,
+            put_writer_slots,
             read_slots,
             put_memory,
             read_memory,
@@ -126,6 +131,16 @@ impl WorkerFlightService {
                 .max_active_read_streams
                 .saturating_sub(active_read),
             slot_wait_ms: self.config.worker.read_slot_wait_ms,
+        };
+        let available_put_writers = self.put_writer_slots.available_permits();
+        let put_writers = WorkerWriterCapacity {
+            limit: self.config.parquet.max_active_put_writers,
+            active: self
+                .config
+                .parquet
+                .max_active_put_writers
+                .saturating_sub(available_put_writers),
+            available: available_put_writers,
         };
         let runtime = self.metrics.runtime_status();
         let resources = WorkerResourceStatus {
@@ -203,12 +218,14 @@ impl WorkerFlightService {
             },
             draining,
             put,
+            put_writers,
             read,
             resources,
             scheduler,
             runtime,
             capabilities: WorkerCapabilities {
                 put_parallelism: self.config.parquet.put_parallelism,
+                max_active_put_writers: self.config.parquet.max_active_put_writers,
                 put_queue_depth: self.config.parquet.put_queue_depth,
                 max_put_streams_per_upload: self.config.worker.max_put_streams_per_upload,
                 max_put_stream_bytes: self.config.worker.max_put_stream_bytes,
@@ -737,12 +754,11 @@ impl WorkerFlightService {
             let flight_stream = first_stream
                 .chain(incoming.map(|item| item.map_err(FlightError::from)))
                 .map(move |item| {
-                    item.map(|data| {
+                    item.inspect(|data| {
                         if profile_enabled {
                             stream_messages.fetch_add(1, Ordering::Relaxed);
                         }
-                        stream_bytes.fetch_add(flight_data_size(&data), Ordering::Relaxed);
-                        data
+                        stream_bytes.fetch_add(flight_data_size(data), Ordering::Relaxed);
                     })
                 });
             let mut batches =
@@ -905,6 +921,7 @@ impl WorkerFlightService {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn write_single_file<S>(
         &self,
         store: Arc<dyn ObjectStore>,
@@ -1067,6 +1084,7 @@ impl WorkerFlightService {
         Ok(summary)
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn write_sized_dataset<S>(
         &self,
         store: Arc<dyn ObjectStore>,
@@ -1106,6 +1124,7 @@ impl WorkerFlightService {
             &mut active_writers,
             &mut parts,
             max_part_writers,
+            self.put_writer_slots.clone(),
             store.clone(),
             self.config.parquet.clone(),
             &key,
@@ -1158,6 +1177,7 @@ impl WorkerFlightService {
                 &mut active_writers,
                 &mut parts,
                 max_part_writers,
+                self.put_writer_slots.clone(),
                 store.clone(),
                 self.config.parquet.clone(),
                 &key,
@@ -1760,10 +1780,7 @@ fn time_unit_name(unit: TimeUnit) -> &'static str {
 }
 
 fn status_into_flight_error(status: Status) -> FlightError {
-    FlightError::ExternalError(Box::new(std::io::Error::new(
-        std::io::ErrorKind::Other,
-        status.to_string(),
-    )))
+    FlightError::ExternalError(Box::new(std::io::Error::other(status.to_string())))
 }
 
 fn flight_data_size(data: &FlightData) -> u64 {
@@ -1881,6 +1898,7 @@ fn profile_from_parts(
             .max()
             .unwrap_or_default(),
         writer_task_idle_wait_ms_sum: parts.iter().map(|part| part.idle_wait_ms).sum(),
+        writer_task_slot_wait_ms_sum: parts.iter().map(|part| part.writer_slot_wait_ms).sum(),
         writer_task_write_ms_sum: parts.iter().map(|part| part.write_ms).sum(),
         writer_task_write_ms_max: parts
             .iter()
@@ -1915,9 +1933,13 @@ async fn write_dataset_part(
     part_index: usize,
     mut receiver: mpsc::Receiver<PartBatch>,
     profile_enabled: bool,
+    writer_slot_wait_ms: u128,
 ) -> Result<Option<DatasetPart>, String> {
     let started = profile_enabled.then(Instant::now);
-    let mut profile = PartProfile::default();
+    let mut profile = PartProfile {
+        writer_slot_wait_ms,
+        ..PartProfile::default()
+    };
     let wait_started = profile_enabled.then(Instant::now);
     let Some(first) = receiver.recv().await else {
         return Ok(None);
@@ -2001,6 +2023,7 @@ async fn write_dataset_part(
 }
 
 fn spawn_dataset_part_writer(
+    writer_slots: Arc<Semaphore>,
     store: Arc<dyn ObjectStore>,
     tuning: ParquetTuning,
     key: &str,
@@ -2013,6 +2036,14 @@ fn spawn_dataset_part_writer(
     let (sender, receiver) = mpsc::channel(tuning.put_queue_depth);
     let part_key = dataset_part_key(key, part_index);
     let handle = tokio::spawn(async move {
+        let wait_started = profile_enabled.then(Instant::now);
+        let _writer_permit = writer_slots
+            .acquire_owned()
+            .await
+            .map_err(|_| "worker Parquet writer scheduler stopped".to_owned())?;
+        let writer_slot_wait_ms = wait_started
+            .map(|started| started.elapsed().as_millis())
+            .unwrap_or_default();
         write_dataset_part(
             store,
             tuning,
@@ -2020,6 +2051,7 @@ fn spawn_dataset_part_writer(
             part_index,
             receiver,
             profile_enabled,
+            writer_slot_wait_ms,
         )
         .await
     });
@@ -2027,11 +2059,13 @@ fn spawn_dataset_part_writer(
     (sender, handle)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn ensure_part_writer(
     sender: &mut Option<mpsc::Sender<PartBatch>>,
     active_writers: &mut VecDeque<JoinHandle<Result<Option<DatasetPart>, String>>>,
     parts: &mut Vec<DatasetPart>,
     max_part_writers: usize,
+    writer_slots: Arc<Semaphore>,
     store: Arc<dyn ObjectStore>,
     tuning: ParquetTuning,
     key: &str,
@@ -2046,8 +2080,14 @@ async fn ensure_part_writer(
         collect_next_part(active_writers, parts).await?;
     }
 
-    let (next_sender, handle) =
-        spawn_dataset_part_writer(store, tuning, key, *next_part, profile_enabled);
+    let (next_sender, handle) = spawn_dataset_part_writer(
+        writer_slots,
+        store,
+        tuning,
+        key,
+        *next_part,
+        profile_enabled,
+    );
     *next_part += 1;
     active_writers.push_back(handle);
     *sender = Some(next_sender);

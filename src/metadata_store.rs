@@ -298,6 +298,14 @@ WHERE attempt_id = $1
     }
 
     pub async fn record_worker_heartbeat(&self, status: &WorkerStatus) -> Result<()> {
+        let put_capacity_streams = status
+            .put
+            .limit
+            .saturating_sub(status.scheduler.put.reserved_slots)
+            .min(
+                (status.resources.put.limit_bytes
+                    / status.resources.put.max_stream_memory_bytes.max(1)) as usize,
+            );
         self.client
             .execute(
                 r#"
@@ -307,6 +315,9 @@ INSERT INTO worker_registry (
     state,
     draining,
     put_recommended_streams,
+    put_capacity_streams,
+    put_available_streams,
+    put_max_streams_per_upload,
     put_utilization_per_mille,
     put_selection_score,
     put_admission_wait_ms_ewma,
@@ -319,13 +330,16 @@ INSERT INTO worker_registry (
     registry_ttl_ms,
     last_heartbeat_at
 ) VALUES (
-    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, now()
+    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, now()
 )
 ON CONFLICT (worker_id) DO UPDATE SET
     flight_uri = EXCLUDED.flight_uri,
     state = EXCLUDED.state,
     draining = EXCLUDED.draining,
     put_recommended_streams = EXCLUDED.put_recommended_streams,
+    put_capacity_streams = EXCLUDED.put_capacity_streams,
+    put_available_streams = EXCLUDED.put_available_streams,
+    put_max_streams_per_upload = EXCLUDED.put_max_streams_per_upload,
     put_utilization_per_mille = EXCLUDED.put_utilization_per_mille,
     put_selection_score = EXCLUDED.put_selection_score,
     put_admission_wait_ms_ewma = EXCLUDED.put_admission_wait_ms_ewma,
@@ -350,6 +364,9 @@ ON CONFLICT (worker_id) DO UPDATE SET
                     &status.state.as_str(),
                     &status.draining,
                     &usize_to_i32(status.scheduler.put.recommended_streams),
+                    &usize_to_i32(put_capacity_streams),
+                    &usize_to_i32(status.scheduler.put.soft_available_slots),
+                    &usize_to_i32(status.scheduler.put.max_streams_per_operation),
                     &i32::from(status.scheduler.put.utilization_per_mille),
                     &u64_to_i64(status.scheduler.put.selection_score),
                     &u64_to_i64(status.runtime.put.admission_wait_ms_ewma),

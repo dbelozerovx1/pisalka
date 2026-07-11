@@ -43,6 +43,15 @@ final class CapabilitySigner {
         String path = request.containsKey("path")
                 ? Config.normalizePath(String.valueOf(request.get("path")))
                 : Config.normalizePath(stagingPrefix + "/flight-" + java.util.UUID.randomUUID() + ".parquet");
+        long ttlMs = Json.longValue(request, "ttlMs", -1L);
+        if (ttlMs <= 0) {
+            throw new IllegalArgumentException("ttlMs is required for a DoPut capability");
+        }
+        int maxUploadStreams = Json.intValue(request, "maxUploadStreams", 0);
+        if (maxUploadStreams <= 0) {
+            throw new IllegalArgumentException("maxUploadStreams is required for a DoPut capability");
+        }
+        long expiresAtMs = now + ttlMs;
 
         if (!path.startsWith(stagingPrefix + "/")) {
             throw new IllegalArgumentException("path must be inside stagingPrefix");
@@ -57,12 +66,19 @@ final class CapabilitySigner {
         payload.put("stream_id", streamId);
         payload.put("worker_id", Json.requiredString(request, "workerId"));
         payload.put("issued_at_ms", now);
-        payload.put("expires_at_ms", now + Json.longValue(request, "ttlMs", config.putCapabilityTtlMs));
+        payload.put("expires_at_ms", expiresAtMs);
+        if (request.containsKey("startBeforeMs")) {
+            long startBeforeMs = Json.longValue(request, "startBeforeMs", now);
+            if (startBeforeMs > expiresAtMs) {
+                throw new IllegalArgumentException("startBeforeMs must not exceed capability expiry");
+            }
+            payload.put("start_before_ms", startBeforeMs);
+        }
         payload.put("allowed_output_prefix", stagingPrefix + "/");
         payload.put("staging_prefix", stagingPrefix + "/");
         payload.put("target_file_size", Json.longValue(request, "targetFileSizeBytes", config.defaultTargetFileSizeBytes));
         payload.put("max_stream_bytes", Json.longValue(request, "maxStreamBytes", config.defaultMaxStreamBytes));
-        payload.put("max_upload_streams", Json.intValue(request, "maxUploadStreams", config.defaultMaxUploadStreams));
+        payload.put("max_upload_streams", maxUploadStreams);
         payload.put("max_record_batch_bytes", Json.longValue(request, "maxRecordBatchBytes", config.defaultPutMaxRecordBatchBytes));
 
         LinkedHashMap<String, Object> response = new LinkedHashMap<>();
@@ -77,6 +93,9 @@ final class CapabilitySigner {
         response.put("streamId", streamId);
         response.put("stagingPrefix", stagingPrefix + "/");
         response.put("expiresAtMs", payload.get("expires_at_ms"));
+        if (payload.containsKey("start_before_ms")) {
+            response.put("startBeforeMs", payload.get("start_before_ms"));
+        }
         response.put("capability", envelope);
         response.put("appMetadata", Json.stringify(envelope));
         return response;

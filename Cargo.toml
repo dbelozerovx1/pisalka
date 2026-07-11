@@ -9,32 +9,20 @@ name = "flight-server"
 path = "src/main.rs"
 
 [[bin]]
-name = "gen-arrow"
-path = "benchmarks/tools/gen_arrow.rs"
+name = "e2e-generate"
+path = "e2e/tools/generate_arrow.rs"
 
 [[bin]]
-name = "bench-put"
-path = "benchmarks/tools/bench_put.rs"
+name = "e2e-write"
+path = "e2e/tools/write_table.rs"
 
 [[bin]]
-name = "bench-put-multi"
-path = "benchmarks/tools/bench_put_multi.rs"
+name = "e2e-read"
+path = "e2e/tools/read_table.rs"
 
 [[bin]]
-name = "bench-get"
-path = "benchmarks/tools/bench_get.rs"
-
-[[bin]]
-name = "bench-coordinator"
-path = "benchmarks/tools/bench_coordinator.rs"
-
-[[bin]]
-name = "coordinator-query"
-path = "benchmarks/tools/coordinator_query.rs"
-
-[[bin]]
-name = "coordinator-action"
-path = "benchmarks/tools/coordinator_action.rs"
+name = "e2e-create-schema"
+path = "e2e/tools/create_schema.rs"
 
 [dependencies]
 anyhow = "1"

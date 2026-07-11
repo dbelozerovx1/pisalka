@@ -6,11 +6,12 @@ use futures::TryStreamExt;
 use serde_json::{Map, Value};
 use tonic::transport::Channel;
 
-use arrow_flight_s3_mvp::config::BenchConfig;
-
+#[path = "common/client_config.rs"]
+mod client_config;
 #[path = "common/flight_uri.rs"]
 mod flight_uri;
 
+use client_config::E2eClientConfig;
 use flight_uri::tonic_uri;
 
 #[derive(Debug, Parser)]
@@ -18,11 +19,11 @@ struct Args {
     #[arg(long, env = "COORDINATOR_URI", default_value = "http://127.0.0.1:8088")]
     coordinator_uri: String,
 
-    #[arg(long, env = "COORDINATOR_ACTION")]
-    action: String,
+    #[arg(long)]
+    schema_name: String,
 
-    #[arg(long, env = "COORDINATOR_ACTION_BODY", default_value = "{}")]
-    body: String,
+    #[arg(long)]
+    location: Option<String>,
 
     #[arg(long, env = "TRINO_USER")]
     user: Option<String>,
@@ -37,8 +38,10 @@ struct Args {
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
     let args = Args::parse();
-    let bench_config = BenchConfig::from_env()?;
-    let mut body = parse_body(&args.body)?;
+    let client_config = E2eClientConfig::from_env()?;
+    let mut body = Map::new();
+    body.insert("schemaName".to_owned(), Value::String(args.schema_name));
+    insert_string(&mut body, "location", args.location);
     insert_string(&mut body, "user", args.user);
     insert_string(&mut body, "authorization", args.authorization);
     insert_string(&mut body, "adminToken", args.admin_token);
@@ -49,18 +52,18 @@ async fn main() -> Result<()> {
         .with_context(|| format!("failed to connect to coordinator {}", args.coordinator_uri))?;
     let mut client = FlightClient::new_from_inner(
         arrow_flight::flight_service_client::FlightServiceClient::new(channel)
-            .max_decoding_message_size(bench_config.max_message_size)
-            .max_encoding_message_size(bench_config.max_message_size),
+            .max_decoding_message_size(client_config.max_message_size)
+            .max_encoding_message_size(client_config.max_message_size),
     );
 
     let action = Action {
-        r#type: args.action.clone(),
+        r#type: "coordinator.create-schema".to_owned(),
         body: Bytes::from(serde_json::to_vec(&Value::Object(body))?),
     };
     let mut stream = client
         .do_action(action)
         .await
-        .with_context(|| format!("coordinator action {} failed", args.action))?;
+        .context("coordinator create-schema action failed")?;
     let mut count = 0usize;
     while let Some(result) = stream.try_next().await? {
         count += 1;
@@ -68,16 +71,8 @@ async fn main() -> Result<()> {
             serde_json::from_slice(&result).context("invalid JSON action response")?;
         println!("{}", serde_json::to_string_pretty(&value)?);
     }
-    anyhow::ensure!(count > 0, "coordinator action returned no results");
+    anyhow::ensure!(count > 0, "coordinator create-schema returned no result");
     Ok(())
-}
-
-fn parse_body(raw: &str) -> Result<Map<String, Value>> {
-    let value: Value = serde_json::from_str(raw).context("--body must be a JSON object")?;
-    match value {
-        Value::Object(map) => Ok(map),
-        _ => anyhow::bail!("--body must be a JSON object"),
-    }
 }
 
 fn insert_string(map: &mut Map<String, Value>, key: &str, value: Option<String>) {

@@ -64,6 +64,7 @@ struct CapabilityPayload {
     worker_id: Option<String>,
     worker_group: Option<String>,
     expires_at_ms: Option<u64>,
+    start_before_ms: Option<u64>,
     not_before_ms: Option<u64>,
     issued_at_ms: Option<u64>,
     max_upload_streams: Option<usize>,
@@ -90,6 +91,15 @@ pub(crate) fn verify_put_capability(
             "worker capability op {:?} cannot authorize DoPut",
             payload.op
         )));
+    }
+    let current_time_ms = now_ms()?;
+    if payload
+        .start_before_ms
+        .is_some_and(|start_before_ms| current_time_ms > start_before_ms)
+    {
+        return Err(Status::permission_denied(
+            "DoPut capability start reservation has expired; create a new upload",
+        ));
     }
 
     let allowed_output_prefix = payload
@@ -234,7 +244,6 @@ fn validate_time_bounds(
     if now_ms > expires_at_ms {
         return Err(Status::permission_denied("worker capability has expired"));
     }
-
     if let Some(issued_at_ms) = payload.issued_at_ms {
         let max_expires_at_ms = issued_at_ms.saturating_add(security.max_capability_ttl_ms.max(1));
         if expires_at_ms > max_expires_at_ms {
@@ -469,5 +478,27 @@ mod tests {
         let error = verify_get_capability(value, &worker(), &security())
             .expect_err("wrong worker binding must be rejected");
         assert_eq!(error.code(), tonic::Code::PermissionDenied);
+    }
+
+    #[test]
+    fn rejects_put_started_after_planning_reservation() {
+        let ticket = signed_envelope_for_test(
+            serde_json::json!({
+                "op": "put",
+                "worker_id": "worker-1",
+                "expires_at_ms": 4102444800000u64,
+                "start_before_ms": 1,
+                "allowed_output_prefix": "table/data",
+                "staging_prefix": "table/data",
+                "attempt_id": "attempt-expired"
+            }),
+            "secret",
+        );
+        let value = parse_capability_envelope(&ticket).unwrap();
+
+        let error = verify_put_capability(value, &worker(), &security())
+            .expect_err("expired planning reservation must be rejected");
+        assert_eq!(error.code(), tonic::Code::PermissionDenied);
+        assert!(error.message().contains("start reservation has expired"));
     }
 }

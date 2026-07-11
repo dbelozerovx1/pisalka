@@ -11,14 +11,14 @@ use serde_json::{Map, Value};
 use tokio::time::sleep;
 use tonic::transport::Channel;
 
-use arrow_flight_s3_mvp::{
-    config::BenchConfig,
-    util::{batch_memory_size, pretty_bytes, throughput},
-};
+use arrow_flight_s3_mvp::util::{batch_memory_size, pretty_bytes, throughput};
 
+#[path = "common/client_config.rs"]
+mod client_config;
 #[path = "common/flight_uri.rs"]
 mod flight_uri;
 
+use client_config::E2eClientConfig;
 use flight_uri::tonic_uri;
 
 #[derive(Debug, Parser)]
@@ -63,15 +63,15 @@ struct Args {
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
     let args = Args::parse();
-    let bench_config = BenchConfig::from_env()?;
+    let client_config = E2eClientConfig::from_env()?;
     let channel = Channel::from_shared(tonic_uri(&args.coordinator_uri)?)?
         .connect()
         .await
         .with_context(|| format!("failed to connect to coordinator {}", args.coordinator_uri))?;
     let mut client = FlightClient::new_from_inner(
         arrow_flight::flight_service_client::FlightServiceClient::new(channel)
-            .max_decoding_message_size(bench_config.max_message_size)
-            .max_encoding_message_size(bench_config.max_message_size),
+            .max_decoding_message_size(client_config.max_message_size)
+            .max_encoding_message_size(client_config.max_message_size),
     );
 
     let mut body = Map::new();
@@ -132,7 +132,7 @@ async fn main() -> Result<()> {
             "query {query_id} completed with unexpected status {status}"
         );
         let read_result = if args.read_results {
-            read_results(info, &args, &bench_config).await
+            read_results(info, &args, &client_config).await
         } else {
             Ok(())
         };
@@ -172,7 +172,7 @@ async fn drop_temp(client: &mut FlightClient, query_id: &str, args: &Args) -> Re
     Ok(())
 }
 
-async fn read_results(info: &FlightInfo, args: &Args, config: &BenchConfig) -> Result<()> {
+async fn read_results(info: &FlightInfo, args: &Args, config: &E2eClientConfig) -> Result<()> {
     let endpoint_limit = args
         .read_max_endpoints
         .unwrap_or(info.endpoint.len())
@@ -233,7 +233,7 @@ async fn read_results(info: &FlightInfo, args: &Args, config: &BenchConfig) -> R
 async fn read_endpoint(
     endpoint: &FlightEndpoint,
     index: usize,
-    config: &BenchConfig,
+    config: &E2eClientConfig,
     preview_limit: usize,
 ) -> Result<EndpointReadResult> {
     let ticket = endpoint

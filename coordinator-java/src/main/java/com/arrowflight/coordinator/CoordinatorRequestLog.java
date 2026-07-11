@@ -30,6 +30,7 @@ final class CoordinatorRequestLog {
         copyIds(body, response);
         copyOptional(body, "status", response);
         copyOptional(body, "mode", response);
+        copyOptional(body, "requestedFlavor", response);
         copyOptional(body, "grantedStreams", response);
         copyOptional(body, "endpointCount", response);
         CoordinatorLog.info("coordinator_request", body);

@@ -35,8 +35,7 @@ final class Config {
     final Optional<String> metadataDatabaseUrl;
     final boolean metadataMigrationsEnabled;
     final boolean metadataMigrationsBaselineOnMigrate;
-    final long capabilityTtlMs;
-    final long putCapabilityTtlMs;
+    final long putReservationTtlMs;
     final long getCapabilityTtlMs;
     final long uploadSessionTtlMs;
     final long queryRegistryTtlMs;
@@ -44,10 +43,8 @@ final class Config {
     final String s3PresignedBucket;
     final String s3TmpBucket;
     final String objectStoreUriPrefix;
-    final int defaultUploadStreams;
     final long defaultTargetFileSizeBytes;
     final long defaultMaxStreamBytes;
-    final int defaultMaxUploadStreams;
     final long defaultPutMaxRecordBatchBytes;
     final int defaultGetMaxBatchRows;
     final long defaultGetMaxRecordBatchBytes;
@@ -93,8 +90,7 @@ final class Config {
             Optional<String> metadataDatabaseUrl,
             boolean metadataMigrationsEnabled,
             boolean metadataMigrationsBaselineOnMigrate,
-            long capabilityTtlMs,
-            long putCapabilityTtlMs,
+            long putReservationTtlMs,
             long getCapabilityTtlMs,
             long uploadSessionTtlMs,
             long queryRegistryTtlMs,
@@ -102,10 +98,8 @@ final class Config {
             String s3PresignedBucket,
             String s3TmpBucket,
             String objectStoreUriPrefix,
-            int defaultUploadStreams,
             long defaultTargetFileSizeBytes,
             long defaultMaxStreamBytes,
-            int defaultMaxUploadStreams,
             long defaultPutMaxRecordBatchBytes,
             int defaultGetMaxBatchRows,
             long defaultGetMaxRecordBatchBytes,
@@ -150,8 +144,7 @@ final class Config {
         this.metadataDatabaseUrl = metadataDatabaseUrl;
         this.metadataMigrationsEnabled = metadataMigrationsEnabled;
         this.metadataMigrationsBaselineOnMigrate = metadataMigrationsBaselineOnMigrate;
-        this.capabilityTtlMs = capabilityTtlMs;
-        this.putCapabilityTtlMs = putCapabilityTtlMs;
+        this.putReservationTtlMs = putReservationTtlMs;
         this.getCapabilityTtlMs = getCapabilityTtlMs;
         this.uploadSessionTtlMs = uploadSessionTtlMs;
         this.queryRegistryTtlMs = queryRegistryTtlMs;
@@ -159,10 +152,8 @@ final class Config {
         this.s3PresignedBucket = s3PresignedBucket;
         this.s3TmpBucket = s3TmpBucket;
         this.objectStoreUriPrefix = normalizeObjectStoreUriPrefix(objectStoreUriPrefix);
-        this.defaultUploadStreams = defaultUploadStreams;
         this.defaultTargetFileSizeBytes = defaultTargetFileSizeBytes;
         this.defaultMaxStreamBytes = defaultMaxStreamBytes;
-        this.defaultMaxUploadStreams = defaultMaxUploadStreams;
         this.defaultPutMaxRecordBatchBytes = defaultPutMaxRecordBatchBytes;
         this.defaultGetMaxBatchRows = defaultGetMaxBatchRows;
         this.defaultGetMaxRecordBatchBytes = defaultGetMaxRecordBatchBytes;
@@ -182,7 +173,6 @@ final class Config {
     }
 
     static Config fromEnv() {
-        long capabilityTtlMs = envLong("COORDINATOR_CAPABILITY_TTL_MS", 15 * 60 * 1000L);
         boolean k8sWorkerDiscoveryEnabled = envBool("COORDINATOR_K8S_WORKER_DISCOVERY_ENABLED", false);
         String trinoCatalog = env("TRINO_CATALOG", "iceberg");
         String ctasSchema = env("CTAS_TEMP_SCHEMA", env("TRINO_SCHEMA", "arrow"));
@@ -216,8 +206,7 @@ final class Config {
                 envOptional("COORDINATOR_METADATA_DATABASE_URL").or(() -> envOptional("METADATA_DATABASE_URL")),
                 envBool("COORDINATOR_METADATA_MIGRATIONS_ENABLED", true),
                 envBool("COORDINATOR_METADATA_MIGRATIONS_BASELINE_ON_MIGRATE", true),
-                capabilityTtlMs,
-                envLong("COORDINATOR_PUT_CAPABILITY_TTL_MS", capabilityTtlMs),
+                envLong("COORDINATOR_PUT_RESERVATION_TTL_MS", 30_000L),
                 envLong("COORDINATOR_GET_CAPABILITY_TTL_MS", 5 * 60 * 1000L),
                 envLong("COORDINATOR_UPLOAD_SESSION_TTL_MS", 60 * 60 * 1000L),
                 envLong("COORDINATOR_QUERY_REGISTRY_TTL_MS", 60 * 60 * 1000L),
@@ -225,10 +214,8 @@ final class Config {
                 bucketLocations.s3PresignedBucket(),
                 bucketLocations.s3TmpBucket(),
                 bucketLocations.objectStoreUriPrefix(),
-                envInt("COORDINATOR_DEFAULT_UPLOAD_STREAMS", 1),
                 envLong("COORDINATOR_DEFAULT_TARGET_FILE_SIZE_BYTES", 512L * 1024 * 1024),
                 envLong("COORDINATOR_DEFAULT_MAX_STREAM_BYTES", 10L * 1024 * 1024 * 1024),
-                envInt("COORDINATOR_DEFAULT_MAX_UPLOAD_STREAMS", 4),
                 envLong("COORDINATOR_DEFAULT_PUT_MAX_RECORD_BATCH_BYTES", 256L * 1024 * 1024),
                 envInt("COORDINATOR_DEFAULT_GET_MAX_BATCH_ROWS", 65_536),
                 envLong("COORDINATOR_DEFAULT_GET_MAX_RECORD_BATCH_BYTES", 128L * 1024 * 1024),

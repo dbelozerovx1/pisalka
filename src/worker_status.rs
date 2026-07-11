@@ -8,6 +8,7 @@ pub struct WorkerStatus {
     pub state: WorkerState,
     pub draining: bool,
     pub put: WorkerCapacity,
+    pub put_writers: WorkerWriterCapacity,
     pub read: WorkerCapacity,
     pub resources: WorkerResourceStatus,
     pub scheduler: WorkerSchedulerStatus,
@@ -44,6 +45,13 @@ pub struct WorkerCapacity {
     pub active: usize,
     pub available: usize,
     pub slot_wait_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct WorkerWriterCapacity {
+    pub limit: usize,
+    pub active: usize,
+    pub available: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -131,6 +139,7 @@ pub struct ReadRuntimeStatus {
 #[derive(Debug, Clone, Serialize)]
 pub struct WorkerCapabilities {
     pub put_parallelism: usize,
+    pub max_active_put_writers: usize,
     pub put_queue_depth: usize,
     pub max_put_streams_per_upload: usize,
     pub max_put_stream_bytes: Option<u64>,

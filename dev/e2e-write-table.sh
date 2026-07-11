@@ -20,11 +20,11 @@ tickets, commits it into Iceberg, and verifies that Trino can read it.
 
 Useful env:
   E2E_SIZE=64mb
-  E2E_STREAMS=1
+  E2E_UPLOAD_FLAVOR=small|medium|large
   E2E_TARGET_FILE_SIZE=64mb
   E2E_COMMIT_MODE=overwrite|append
   E2E_INTEGER_KIND=signed|unsigned
-  E2E_INPUT=/bench-data/e2e-64mb.arrow
+  E2E_INPUT=/e2e-data/e2e-64mb.arrow
   E2E_REGENERATE=false
   E2E_START_STACK=true
   E2E_VERIFY_LIMIT=1
@@ -73,12 +73,12 @@ start_stack() {
     return 0
   fi
 
-  local up_args=(--profile bench up -d --build)
+  local up_args=(--profile e2e up -d --build)
   if bool_enabled "${E2E_FORCE_RECREATE:-false}"; then
     up_args+=(--force-recreate)
   fi
 
-  docker compose --profile bench build bench flight-server flight-server-2 coordinator
+  docker compose --profile e2e build e2e-client flight-server flight-server-2 coordinator
   docker compose "${up_args[@]}" \
     minio \
     minio-create-bucket \
@@ -98,9 +98,9 @@ ensure_input() {
   local payload_bytes="${PAYLOAD_BYTES:-64}"
 
   if bool_enabled "${E2E_REGENERATE:-false}" \
-    || ! docker compose run --rm --entrypoint sh bench -c "test -f '$input'" >/dev/null 2>&1; then
+    || ! docker compose run --rm --entrypoint sh e2e-client -c "test -f '$input'" >/dev/null 2>&1; then
     echo "generating_input=$input size=$size"
-    docker compose run --rm --entrypoint gen-arrow bench \
+    docker compose run --rm --entrypoint e2e-generate e2e-client \
       --target-size "$size" \
       --output "$input" \
       --rows-per-batch "$rows_per_batch" \
@@ -125,8 +125,8 @@ safe_table="$(printf '%s' "$table_name" | tr '[:upper:]' '[:lower:]' | tr -c 'a-
 timestamp="$(date +%Y%m%d-%H%M%S)"
 
 size="${E2E_SIZE:-64mb}"
-input="${E2E_INPUT:-/bench-data/e2e-${size}.arrow}"
-streams="${E2E_STREAMS:-1}"
+input="${E2E_INPUT:-/e2e-data/e2e-${size}.arrow}"
+flavor="${E2E_UPLOAD_FLAVOR:-small}"
 target_file_size="${E2E_TARGET_FILE_SIZE:-64mb}"
 commit_mode="${E2E_COMMIT_MODE:-overwrite}"
 operation_id="${E2E_OPERATION_ID:-e2e-write-${safe_table}-${timestamp}}"
@@ -137,11 +137,9 @@ ensure_input "$input" "$size"
 
 echo "target_table=$table_name"
 echo "ensuring_schema=$catalog.$schema"
-schema_action_body="$(printf '{"schemaName":"%s"}' "$schema")"
 schema_action_args=(
   --coordinator-uri "${E2E_COORDINATOR_URI:-http://coordinator:8088}"
-  --action coordinator.create-schema
-  --body "$schema_action_body"
+  --schema-name "$schema"
   --user "${TRINO_USER:-local}"
 )
 if [[ -n "${TRINO_AUTHORIZATION:-}" ]]; then
@@ -151,18 +149,17 @@ if [[ -n "${COORDINATOR_ADMIN_TOKEN:-}" ]]; then
   schema_action_args+=(--admin-token "$COORDINATOR_ADMIN_TOKEN")
 fi
 docker compose run --rm \
-  --entrypoint coordinator-action \
-  bench \
+  --entrypoint e2e-create-schema \
+  e2e-client \
   "${schema_action_args[@]}"
 
 args=(
   --input "$input"
   --coordinator-uri "${E2E_COORDINATOR_URI:-http://coordinator:8088}"
   --operation-id "$operation_id"
-  --streams "$streams"
+  --flavor "$flavor"
   --table-name "$table_name"
   --commit-mode "$commit_mode"
-  --read-back none
 )
 
 target_file_size_lc="$(printf '%s' "$target_file_size" | tr '[:upper:]' '[:lower:]')"
@@ -185,24 +182,10 @@ if [[ -n "${TRINO_AUTHORIZATION:-}" ]]; then
   args+=(--trino-authorization "$TRINO_AUTHORIZATION")
 fi
 
-echo "writing_table=true table=$table_name operation_id=$operation_id streams=$streams"
+echo "writing_table=true table=$table_name operation_id=$operation_id flavor=$flavor"
 docker compose run --rm \
-  -e "COORDINATOR_ADMIN_TOKEN=${COORDINATOR_ADMIN_TOKEN:-}" \
-  --entrypoint env bench \
-  -u COORDINATOR_OPERATION_ID \
-  -u COORDINATOR_UPLOAD_ID \
-  -u COORDINATOR_TABLE_NAME \
-  -u COORDINATOR_COMMIT_MODE \
-  -u PUT_MAX_STREAM_BYTES \
-  -u PUT_MAX_RECORD_BATCH_BYTES \
-  -u COORDINATOR_UPLOAD_TTL_MS \
-  -u READ_BACK \
-  -u READ_MAX_FILES \
-  -u GET_MAX_BATCH_ROWS \
-  -u GET_MAX_RECORD_BATCH_BYTES \
-  -u TRINO_USER \
-  -u TRINO_AUTHORIZATION \
-  bench-coordinator \
+  --entrypoint e2e-write \
+  e2e-client \
   "${args[@]}"
 
 echo "verifying_trino_table=true table=$trino_table"

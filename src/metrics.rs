@@ -228,6 +228,21 @@ impl WorkerMetrics {
         gauge(&mut out, "worker_put_slots_limit", status.put.limit);
         gauge(&mut out, "worker_put_slots_active", status.put.active);
         gauge(&mut out, "worker_put_slots_available", status.put.available);
+        gauge(
+            &mut out,
+            "worker_put_writers_limit",
+            status.put_writers.limit,
+        );
+        gauge(
+            &mut out,
+            "worker_put_writers_active",
+            status.put_writers.active,
+        );
+        gauge(
+            &mut out,
+            "worker_put_writers_available",
+            status.put_writers.available,
+        );
         gauge_u64(
             &mut out,
             "worker_put_slot_wait_milliseconds",

@@ -12,5 +12,5 @@ pub mod util;
 pub mod worker_status;
 
 pub use config::{
-    AppConfig, BenchConfig, MetadataConfig, MetricsConfig, ParquetTuning, S3Config, SecurityConfig,
+    AppConfig, MetadataConfig, MetricsConfig, ParquetTuning, S3Config, SecurityConfig,
 };

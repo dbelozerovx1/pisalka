@@ -17,6 +17,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Properties;
+import java.util.function.Function;
 
 import org.postgresql.util.PGobject;
 
@@ -94,11 +95,34 @@ final class CoordinatorMetadataStore {
         }
     }
 
-    boolean tryCreateUpload(PlannedUploadSession session, List<PlannedUploadStream> streams) {
+    boolean tryCreateUpload(
+            String uploadId,
+            UploadFlavor flavor,
+            Function<PutWorkerPlan, PlannedUpload> planner
+    ) {
         requireEnabled();
         try (Connection connection = connect()) {
             connection.setAutoCommit(false);
             try {
+                try (PreparedStatement statement = connection.prepareStatement(
+                        "SELECT pg_advisory_xact_lock(8842213377441)"
+                )) {
+                    statement.execute();
+                }
+                try (PreparedStatement statement = connection.prepareStatement(
+                        "SELECT 1 FROM coordinator_upload_sessions WHERE upload_id = ?"
+                )) {
+                    statement.setString(1, uploadId);
+                    try (ResultSet rows = statement.executeQuery()) {
+                        if (rows.next()) {
+                            connection.rollback();
+                            return false;
+                        }
+                    }
+                }
+
+                PlannedUpload upload = planner.apply(planPutWorkers(connection, flavor));
+                PlannedUploadSession session = upload.session();
                 int inserted;
                 try (PreparedStatement statement = connection.prepareStatement("""
                         INSERT INTO coordinator_upload_sessions (
@@ -112,9 +136,10 @@ final class CoordinatorMetadataStore {
                             max_stream_bytes,
                             max_record_batch_bytes,
                             commit_mode,
+                            upload_flavor,
                             expires_at,
                             updated_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, now())
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, now())
                         ON CONFLICT (upload_id) DO NOTHING
                         """)) {
                     statement.setString(1, session.uploadId());
@@ -127,7 +152,8 @@ final class CoordinatorMetadataStore {
                     setNullableLong(statement, 8, session.maxStreamBytes());
                     setNullableLong(statement, 9, session.maxRecordBatchBytes());
                     statement.setString(10, session.commitMode());
-                    statement.setTimestamp(11, Timestamp.from(session.expiresAt()));
+                    statement.setString(11, session.uploadFlavor());
+                    statement.setTimestamp(12, Timestamp.from(session.expiresAt()));
                     inserted = statement.executeUpdate();
                 }
 
@@ -143,16 +169,18 @@ final class CoordinatorMetadataStore {
                             attempt_id,
                             worker_id,
                             flight_uri,
-                            descriptor_path
-                        ) VALUES (?, ?, ?, ?, ?, ?)
+                            descriptor_path,
+                            reservation_expires_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?)
                         """)) {
-                    for (PlannedUploadStream stream : streams) {
+                    for (PlannedUploadStream stream : upload.streams()) {
                         statement.setString(1, session.uploadId());
                         statement.setString(2, stream.streamId());
                         statement.setString(3, stream.attemptId());
                         statement.setString(4, stream.workerId());
                         statement.setString(5, stream.flightUri());
                         statement.setString(6, stream.descriptorPath());
+                        statement.setTimestamp(7, Timestamp.from(stream.reservationExpiresAt()));
                         statement.addBatch();
                     }
                     statement.executeBatch();
@@ -160,7 +188,7 @@ final class CoordinatorMetadataStore {
 
                 connection.commit();
                 return true;
-            } catch (SQLException error) {
+            } catch (SQLException | RuntimeException error) {
                 connection.rollback();
                 throw error;
             }
@@ -193,45 +221,43 @@ final class CoordinatorMetadataStore {
         }
     }
 
-    List<WorkerAssignment> selectPutWorkers(int requestedStreams) {
-        requireEnabled();
-        try (Connection connection = connect()) {
-            List<WorkerRegistryEntry> workers = loadPutCandidates(connection);
-            ArrayList<WorkerAssignment> assignments = new ArrayList<>();
-            if (requestedStreams <= 0) {
-                return assignments;
-            }
+    private PutWorkerPlan planPutWorkers(Connection connection, UploadFlavor flavor) throws SQLException {
+        List<WorkerRegistryEntry> workers = loadPutCandidates(connection);
+        long totalCapacity = workers.stream().mapToLong(WorkerRegistryEntry::putCapacityStreams).sum();
+        long totalAvailable = workers.stream().mapToLong(WorkerRegistryEntry::remainingPutStreams).sum();
+        int clusterUtilizationPerMille = totalCapacity == 0
+                ? 1_000
+                : (int) Math.min(1_000L, 1_000L - Math.min(1_000L, totalAvailable * 1_000L / totalCapacity));
+        int targetStreams = flavor.targetStreams(clusterUtilizationPerMille);
+        ArrayList<WorkerAssignment> assignments = new ArrayList<>();
 
-            while (assignments.size() < requestedStreams) {
-                boolean progressed = false;
-                for (WorkerRegistryEntry worker : workers) {
-                    if (assignments.size() >= requestedStreams) {
-                        break;
-                    }
-                    if (worker.remainingPutStreams() <= 0) {
-                        continue;
-                    }
-                    assignments.add(worker.assignPut());
-                    progressed = true;
-                }
-                if (!progressed) {
+        while (assignments.size() < targetStreams) {
+            boolean progressed = false;
+            for (WorkerRegistryEntry worker : workers) {
+                if (assignments.size() >= targetStreams) {
                     break;
                 }
-            }
-
-            if (assignments.isEmpty()) {
-                if (config.workerClientEndpointsRequired) {
-                    throw new CoordinatorException(
-                            503,
-                            "no live data-plane worker has available DoPut capacity and a fresh client endpoint"
-                    );
+                if (!worker.canAssignPut()) {
+                    continue;
                 }
-                throw new CoordinatorException(503, "no live data-plane worker has available DoPut capacity");
+                assignments.add(worker.assignPut());
+                progressed = true;
             }
-            return assignments;
-        } catch (SQLException error) {
-            throw new IllegalStateException("failed to select DoPut workers from registry", error);
+            if (!progressed) {
+                break;
+            }
         }
+
+        if (assignments.isEmpty()) {
+            if (config.workerClientEndpointsRequired) {
+                throw new CoordinatorException(
+                        503,
+                        "no live data-plane worker has available DoPut capacity and a fresh client endpoint"
+                );
+            }
+            throw new CoordinatorException(503, "no live data-plane worker has available DoPut capacity");
+        }
+        return new PutWorkerPlan(assignments, clusterUtilizationPerMille);
     }
 
     WorkerAssignment selectReadWorker() {
@@ -616,7 +642,40 @@ final class CoordinatorMetadataStore {
     }
 
     void markPlanned(String uploadId) {
-        updateStatus(uploadId, "PLANNED", Optional.empty(), Optional.empty(), Optional.empty(), false);
+        requireEnabled();
+        try (Connection connection = connect()) {
+            connection.setAutoCommit(false);
+            try {
+                try (PreparedStatement statement = connection.prepareStatement("""
+                        UPDATE coordinator_upload_sessions
+                        SET status = 'PLANNED',
+                            error_message = NULL,
+                            updated_at = now()
+                        WHERE upload_id = ?
+                        """)) {
+                    statement.setString(1, uploadId);
+                    statement.executeUpdate();
+                }
+                try (PreparedStatement statement = connection.prepareStatement("""
+                        UPDATE coordinator_upload_streams
+                        SET reservation_expires_at = ?
+                        WHERE upload_id = ?
+                        """)) {
+                    statement.setTimestamp(
+                            1,
+                            Timestamp.from(Instant.now().plusMillis(config.putReservationTtlMs))
+                    );
+                    statement.setString(2, uploadId);
+                    statement.executeUpdate();
+                }
+                connection.commit();
+            } catch (SQLException error) {
+                connection.rollback();
+                throw error;
+            }
+        } catch (SQLException error) {
+            throw new IllegalStateException("failed to mark upload session planned", error);
+        }
     }
 
     boolean tryMarkCommitting(String uploadId, String tableName, String createTableSql) {
@@ -723,6 +782,7 @@ final class CoordinatorMetadataStore {
                        table_name,
                        status,
                        expected_streams,
+                       upload_flavor,
                        staging_prefix,
                        target_file_size,
                        max_stream_bytes,
@@ -752,6 +812,7 @@ final class CoordinatorMetadataStore {
                         Optional.ofNullable(rows.getString("table_name")),
                         rows.getString("status"),
                         rows.getInt("expected_streams"),
+                        rows.getString("upload_flavor"),
                         rows.getString("staging_prefix"),
                         rows.getLong("target_file_size"),
                         nullableLong(rows, "max_stream_bytes"),
@@ -777,7 +838,12 @@ final class CoordinatorMetadataStore {
                 ? """
                 SELECT registry.worker_id,
                        client.flight_uri,
-                       registry.put_recommended_streams,
+                       registry.put_capacity_streams,
+                       GREATEST(
+                           registry.put_available_streams - COALESCE(pending.reserved_streams, 0),
+                           0
+                       ) AS put_available_streams,
+                       registry.put_max_streams_per_upload,
                        registry.put_selection_score,
                        registry.put_utilization_per_mille,
                        registry.put_admission_wait_ms_ewma,
@@ -787,36 +853,75 @@ final class CoordinatorMetadataStore {
                 JOIN worker_client_endpoints client
                   ON client.worker_id = registry.worker_id
                  AND client.expires_at > now()
+                LEFT JOIN LATERAL (
+                    SELECT count(*) AS reserved_streams
+                    FROM coordinator_upload_streams planned
+                    JOIN coordinator_upload_sessions session
+                      ON session.upload_id = planned.upload_id
+                    LEFT JOIN worker_put_streams actual
+                      ON actual.attempt_id = planned.attempt_id
+                    WHERE planned.worker_id = registry.worker_id
+                      AND planned.reservation_expires_at > now()
+                      AND session.status IN ('PREPARING', 'PLANNED')
+                      AND (
+                          actual.attempt_id IS NULL
+                          OR (
+                              actual.status IN ('ADMITTED', 'WRITING')
+                              AND actual.updated_at > registry.last_heartbeat_at
+                          )
+                      )
+                ) pending ON true
                 WHERE registry.state = 'ACTIVE'
                   AND registry.draining = false
-                  AND registry.put_recommended_streams > 0
                   AND extract(epoch FROM (now() - registry.last_heartbeat_at)) * 1000 <= registry.registry_ttl_ms
                   AND extract(epoch FROM (now() - registry.first_seen_at)) * 1000 >= ?
                   AND extract(epoch FROM (now() - client.first_observed_at)) * 1000 >= ?
                 ORDER BY registry.put_selection_score DESC,
-                         registry.put_recommended_streams DESC,
+                         put_available_streams DESC,
                          registry.put_admission_wait_ms_ewma ASC,
                          registry.last_heartbeat_at DESC
                 """
                 : """
                 SELECT worker_id,
                        flight_uri,
-                       put_recommended_streams,
+                       put_capacity_streams,
+                       GREATEST(
+                           put_available_streams - COALESCE(pending.reserved_streams, 0),
+                           0
+                       ) AS put_available_streams,
+                       put_max_streams_per_upload,
                        put_selection_score,
                        put_utilization_per_mille,
                        put_admission_wait_ms_ewma,
                        put_throughput_bytes_per_sec_ewma,
                        last_heartbeat_at
-                FROM worker_registry
-                WHERE state = 'ACTIVE'
-                  AND draining = false
-                  AND put_recommended_streams > 0
-                  AND extract(epoch FROM (now() - last_heartbeat_at)) * 1000 <= registry_ttl_ms
-                  AND extract(epoch FROM (now() - first_seen_at)) * 1000 >= ?
-                ORDER BY put_selection_score DESC,
-                         put_recommended_streams DESC,
-                         put_admission_wait_ms_ewma ASC,
-                         last_heartbeat_at DESC
+                FROM worker_registry registry
+                LEFT JOIN LATERAL (
+                    SELECT count(*) AS reserved_streams
+                    FROM coordinator_upload_streams planned
+                    JOIN coordinator_upload_sessions session
+                      ON session.upload_id = planned.upload_id
+                    LEFT JOIN worker_put_streams actual
+                      ON actual.attempt_id = planned.attempt_id
+                    WHERE planned.worker_id = registry.worker_id
+                      AND planned.reservation_expires_at > now()
+                      AND session.status IN ('PREPARING', 'PLANNED')
+                      AND (
+                          actual.attempt_id IS NULL
+                          OR (
+                              actual.status IN ('ADMITTED', 'WRITING')
+                              AND actual.updated_at > registry.last_heartbeat_at
+                          )
+                      )
+                ) pending ON true
+                WHERE registry.state = 'ACTIVE'
+                  AND registry.draining = false
+                  AND extract(epoch FROM (now() - registry.last_heartbeat_at)) * 1000 <= registry.registry_ttl_ms
+                  AND extract(epoch FROM (now() - registry.first_seen_at)) * 1000 >= ?
+                ORDER BY registry.put_selection_score DESC,
+                         put_available_streams DESC,
+                         registry.put_admission_wait_ms_ewma ASC,
+                         registry.last_heartbeat_at DESC
                 """;
         try (PreparedStatement statement = connection.prepareStatement(sql)) {
             statement.setLong(1, config.workerSelectionGraceMs);
@@ -829,7 +934,9 @@ final class CoordinatorMetadataStore {
                     workers.add(new WorkerRegistryEntry(
                             rows.getString("worker_id"),
                             rows.getString("flight_uri"),
-                            rows.getInt("put_recommended_streams"),
+                            rows.getInt("put_capacity_streams"),
+                            rows.getInt("put_available_streams"),
+                            rows.getInt("put_max_streams_per_upload"),
                             rows.getLong("put_selection_score"),
                             rows.getInt("put_utilization_per_mille"),
                             rows.getLong("put_admission_wait_ms_ewma"),
@@ -848,6 +955,7 @@ final class CoordinatorMetadataStore {
                        planned.worker_id,
                        planned.flight_uri,
                        planned.descriptor_path,
+                       planned.reservation_expires_at,
                        COALESCE(actual.status, 'PENDING') AS worker_status,
                        actual.error_message,
                        actual.rows,
@@ -873,6 +981,7 @@ final class CoordinatorMetadataStore {
                             rows.getString("worker_id"),
                             rows.getString("flight_uri"),
                             rows.getString("descriptor_path"),
+                            rows.getTimestamp("reservation_expires_at").toInstant(),
                             rows.getString("worker_status"),
                             Optional.ofNullable(rows.getString("error_message")),
                             rows.getLong("rows"),
@@ -1100,6 +1209,7 @@ record PlannedUploadSession(
         Optional<String> tableName,
         String status,
         int expectedStreams,
+        String uploadFlavor,
         String stagingPrefix,
         long targetFileSize,
         Optional<Long> maxStreamBytes,
@@ -1115,7 +1225,20 @@ record PlannedUploadStream(
         String workerId,
         String flightUri,
         String descriptorPath,
+        Instant reservationExpiresAt,
         Map<String, Object> ticket
+) {
+}
+
+record PlannedUpload(
+        PlannedUploadSession session,
+        List<PlannedUploadStream> streams
+) {
+}
+
+record PutWorkerPlan(
+        List<WorkerAssignment> assignments,
+        int clusterUtilizationPerMille
 ) {
 }
 
@@ -1125,6 +1248,7 @@ record UploadSessionRecord(
         Optional<String> tableName,
         String status,
         int expectedStreams,
+        String uploadFlavor,
         String stagingPrefix,
         long targetFileSize,
         Optional<Long> maxStreamBytes,
@@ -1148,6 +1272,7 @@ record UploadSessionRecord(
         tableName.ifPresent(value -> body.put("tableName", value));
         body.put("status", status);
         body.put("expectedStreams", expectedStreams);
+        body.put("uploadFlavor", uploadFlavor);
         body.put("stagingPrefix", stagingPrefix);
         body.put("targetFileSizeBytes", targetFileSize);
         maxStreamBytes.ifPresent(value -> body.put("maxStreamBytes", value));
@@ -1182,6 +1307,7 @@ record UploadStreamState(
         String workerId,
         String flightUri,
         String descriptorPath,
+        Instant reservationExpiresAt,
         String status,
         Optional<String> errorMessage,
         long rows,
@@ -1199,6 +1325,7 @@ record UploadStreamState(
         body.put("workerId", workerId);
         body.put("flightUri", flightUri);
         body.put("descriptorPath", descriptorPath);
+        body.put("startBeforeMs", reservationExpiresAt.toEpochMilli());
         body.put("status", status);
         errorMessage.ifPresent(value -> body.put("errorMessage", value));
         body.put("rows", rows);
@@ -1263,7 +1390,10 @@ record UploadSnapshot(
 final class WorkerRegistryEntry {
     private final String workerId;
     private final String flightUri;
+    private final int putCapacityStreams;
     private int remainingPutStreams;
+    private final int maxPutStreamsPerUpload;
+    private int assignedPutStreams;
     private final long selectionScore;
     private final int utilizationPerMille;
     private final long admissionWaitMsEwma;
@@ -1272,7 +1402,9 @@ final class WorkerRegistryEntry {
     WorkerRegistryEntry(
             String workerId,
             String flightUri,
+            int putCapacityStreams,
             int remainingPutStreams,
+            int maxPutStreamsPerUpload,
             long selectionScore,
             int utilizationPerMille,
             long admissionWaitMsEwma,
@@ -1280,7 +1412,9 @@ final class WorkerRegistryEntry {
     ) {
         this.workerId = workerId;
         this.flightUri = flightUri;
+        this.putCapacityStreams = putCapacityStreams;
         this.remainingPutStreams = remainingPutStreams;
+        this.maxPutStreamsPerUpload = maxPutStreamsPerUpload;
         this.selectionScore = selectionScore;
         this.utilizationPerMille = utilizationPerMille;
         this.admissionWaitMsEwma = admissionWaitMsEwma;
@@ -1291,8 +1425,17 @@ final class WorkerRegistryEntry {
         return remainingPutStreams;
     }
 
+    int putCapacityStreams() {
+        return putCapacityStreams;
+    }
+
+    boolean canAssignPut() {
+        return remainingPutStreams > 0 && assignedPutStreams < maxPutStreamsPerUpload;
+    }
+
     WorkerAssignment assignPut() {
         remainingPutStreams--;
+        assignedPutStreams++;
         return new WorkerAssignment(
                 workerId,
                 flightUri,

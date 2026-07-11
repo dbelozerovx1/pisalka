@@ -144,20 +144,20 @@ mod tests {
     #[test]
     fn parses_legacy_raw_path_when_allowed() {
         let ticket = parse_read_ticket(
-            &Bytes::from_static(b"bench/file.parquet"),
+            &Bytes::from_static(b"test/file.parquet"),
             &worker(false),
             &security(false),
         )
         .unwrap();
 
-        assert_eq!(ticket.key, "bench/file.parquet");
+        assert_eq!(ticket.key, "test/file.parquet");
         assert_eq!(ticket.operation_id, None);
     }
 
     #[test]
     fn rejects_legacy_raw_path_when_structured_required() {
         let error = parse_read_ticket(
-            &Bytes::from_static(b"bench/file.parquet"),
+            &Bytes::from_static(b"test/file.parquet"),
             &worker(true),
             &security(false),
         )
@@ -170,21 +170,21 @@ mod tests {
     fn parses_structured_ticket() {
         let ticket = parse_read_ticket(
             &Bytes::from_static(
-                br#"{"path":"bench/file.parquet","operation_id":"read-1","expires_at_ms":4102444800000}"#,
+                br#"{"path":"test/file.parquet","operation_id":"read-1","expires_at_ms":4102444800000}"#,
             ),
             &worker(true),
             &security(false),
         )
         .unwrap();
 
-        assert_eq!(ticket.key, "bench/file.parquet");
+        assert_eq!(ticket.key, "test/file.parquet");
         assert_eq!(ticket.operation_id.as_deref(), Some("read-1"));
     }
 
     #[test]
     fn rejects_expired_structured_ticket() {
         let error = parse_read_ticket(
-            &Bytes::from_static(br#"{"path":"bench/file.parquet","expires_at_ms":1}"#),
+            &Bytes::from_static(br#"{"path":"test/file.parquet","expires_at_ms":1}"#),
             &worker(true),
             &security(false),
         )
@@ -200,7 +200,7 @@ mod tests {
                 "op": "get",
                 "worker_id": "worker-1",
                 "expires_at_ms": 4102444800000u64,
-                "path": "bench/file.parquet",
+                "path": "test/file.parquet",
                 "operation_id": "read-1",
                 "max_batch_rows": 1024,
                 "max_record_batch_bytes": 4096
@@ -209,7 +209,7 @@ mod tests {
         );
         let ticket = parse_read_ticket(&ticket, &worker(true), &security(true)).unwrap();
 
-        assert_eq!(ticket.key, "bench/file.parquet");
+        assert_eq!(ticket.key, "test/file.parquet");
         assert_eq!(ticket.operation_id.as_deref(), Some("read-1"));
         assert_eq!(ticket.max_batch_rows, Some(1024));
         assert_eq!(ticket.max_record_batch_bytes, Some(4096));
@@ -219,7 +219,7 @@ mod tests {
     fn rejects_unsigned_ticket_when_signed_capabilities_required() {
         let error = parse_read_ticket(
             &Bytes::from_static(
-                br#"{"path":"bench/file.parquet","operation_id":"read-1","expires_at_ms":4102444800000}"#,
+                br#"{"path":"test/file.parquet","operation_id":"read-1","expires_at_ms":4102444800000}"#,
             ),
             &worker(true),
             &security(true),

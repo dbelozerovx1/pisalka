@@ -124,7 +124,6 @@ final class CoordinatorFlightProducer implements FlightProducer {
                 case "coordinator.commit-upload", "coordinator.do-commit" -> coordinator.commitUpload(request);
                 case "coordinator.abort-upload" -> coordinator.abortUpload(request);
                 case "coordinator.drop-temp", "coordinator.drop_temp" -> coordinator.dropTemp(request);
-                case "coordinator.put-ticket" -> coordinator.putTicket(request, endpointRewrite);
                 case "coordinator.get-ticket" -> coordinator.getTicket(request, endpointRewrite);
                 default -> throw new CoordinatorException(400, "unknown coordinator action: " + action.getType());
             };
@@ -151,7 +150,6 @@ final class CoordinatorFlightProducer implements FlightProducer {
         listener.onNext(new ActionType("coordinator.do-commit", "Alias for coordinator.commit-upload"));
         listener.onNext(new ActionType("coordinator.abort-upload", "Mark an upload session aborted"));
         listener.onNext(new ActionType("coordinator.drop-temp", "Drop a coordinator-created CTAS temp table by query id"));
-        listener.onNext(new ActionType("coordinator.put-ticket", "Low-level signed DoPut ticket for internal/dev use"));
         listener.onNext(new ActionType("coordinator.get-ticket", "Low-level signed DoGet ticket for internal/dev use"));
         listener.onCompleted();
     }

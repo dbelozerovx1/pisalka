@@ -68,6 +68,7 @@ pub(crate) struct PutProfile {
     pub(crate) writer_task_elapsed_ms_sum: u128,
     pub(crate) writer_task_elapsed_ms_max: u128,
     pub(crate) writer_task_idle_wait_ms_sum: u128,
+    pub(crate) writer_task_slot_wait_ms_sum: u128,
     pub(crate) writer_task_write_ms_sum: u128,
     pub(crate) writer_task_write_ms_max: u128,
     pub(crate) writer_task_flush_ms_sum: u128,
@@ -80,6 +81,7 @@ pub(crate) struct PutProfile {
 pub(crate) struct PartProfile {
     pub(crate) elapsed_ms: u128,
     pub(crate) idle_wait_ms: u128,
+    pub(crate) writer_slot_wait_ms: u128,
     pub(crate) write_ms: u128,
     pub(crate) flush_ms: u128,
     pub(crate) close_ms: u128,
@@ -90,6 +92,7 @@ impl PartProfile {
     pub(crate) fn is_empty(&self) -> bool {
         self.elapsed_ms == 0
             && self.idle_wait_ms == 0
+            && self.writer_slot_wait_ms == 0
             && self.write_ms == 0
             && self.flush_ms == 0
             && self.close_ms == 0

@@ -8,8 +8,7 @@ use std::{
 use anyhow::{Context, Result};
 use arrow_array::RecordBatch;
 use arrow_flight::{
-    Action, FlightClient, FlightDescriptor, FlightEndpoint, Ticket,
-    encode::FlightDataEncoderBuilder, error::FlightError,
+    Action, FlightClient, FlightDescriptor, encode::FlightDataEncoderBuilder, error::FlightError,
 };
 use arrow_ipc::reader::StreamReader;
 use bytes::Bytes;
@@ -20,14 +19,14 @@ use serde_json::{Map, Value};
 use tokio::{sync::mpsc, task::JoinHandle};
 use tonic::transport::Channel;
 
-use arrow_flight_s3_mvp::{
-    config::BenchConfig,
-    util::{batch_memory_size, parse_size, pretty_bytes, throughput},
-};
+use arrow_flight_s3_mvp::util::{parse_size, pretty_bytes, throughput};
 
+#[path = "common/client_config.rs"]
+mod client_config;
 #[path = "common/flight_uri.rs"]
 mod flight_uri;
 
+use client_config::{E2eClientConfig, env_size};
 use flight_uri::tonic_uri;
 
 #[derive(Debug, Parser)]
@@ -64,7 +63,7 @@ struct Args {
         long,
         env = "COORDINATOR_COMMIT_MODE",
         value_enum,
-        default_value = "none"
+        default_value = "overwrite"
     )]
     commit_mode: CommitMode,
 
@@ -74,8 +73,8 @@ struct Args {
     #[arg(long, env = "TRINO_AUTHORIZATION")]
     trino_authorization: Option<String>,
 
-    #[arg(long, env = "UPLOAD_STREAMS", default_value_t = 1)]
-    streams: usize,
+    #[arg(long, env = "UPLOAD_FLAVOR", value_enum, default_value = "small")]
+    flavor: UploadFlavor,
 
     #[arg(
         long = "file-size",
@@ -95,36 +94,32 @@ struct Args {
 
     #[arg(long, env = "COORDINATOR_UPLOAD_TTL_MS")]
     upload_ttl_ms: Option<u64>,
-
-    #[arg(long, env = "READ_BACK", value_enum, default_value = "first")]
-    read_back: ReadBackMode,
-
-    #[arg(long, env = "READ_MAX_FILES")]
-    read_max_files: Option<usize>,
-
-    #[arg(long, env = "GET_MAX_BATCH_ROWS")]
-    get_max_batch_rows: Option<usize>,
-
-    #[arg(long, env = "GET_MAX_RECORD_BATCH_BYTES")]
-    get_max_record_batch_bytes: Option<String>,
-}
-
-#[derive(Debug, Clone, ValueEnum)]
-enum ReadBackMode {
-    None,
-    First,
-    All,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, ValueEnum)]
 enum CommitMode {
-    None,
     Append,
     Overwrite,
 }
 
+#[derive(Debug, Clone, ValueEnum)]
+enum UploadFlavor {
+    Small,
+    Medium,
+    Large,
+}
+
+impl UploadFlavor {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Small => "small",
+            Self::Medium => "medium",
+            Self::Large => "large",
+        }
+    }
+}
+
 struct CoordinatorClient {
-    uri: String,
     admin_token: Option<String>,
     client: FlightClient,
 }
@@ -137,7 +132,7 @@ struct CreateUploadResponse {
     #[serde(default)]
     table_name: Option<String>,
     status: String,
-    requested_streams: usize,
+    requested_flavor: String,
     granted_streams: usize,
     expected_streams: usize,
     staging_prefix: String,
@@ -151,11 +146,9 @@ struct UploadTicket {
     worker_id: String,
     flight_uri: String,
     descriptor_path: String,
-    operation_id: String,
     attempt_id: String,
     upload_id: String,
     stream_id: String,
-    staging_prefix: String,
     app_metadata: String,
 }
 
@@ -183,23 +176,11 @@ struct CommitUploadResponse {
 #[serde(rename_all = "camelCase")]
 struct WrittenFile {
     stream_id: String,
-    worker_id: String,
     part_index: i32,
     file_path: String,
     rows: u64,
     batches: u64,
-    flight_stream_bytes: u64,
     parquet_object_bytes: u64,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct GetTicketResponse {
-    worker_id: String,
-    flight_uri: String,
-    path: String,
-    operation_id: String,
-    ticket: String,
 }
 
 #[derive(Debug)]
@@ -219,26 +200,16 @@ struct StreamResult {
     put_results: Vec<String>,
 }
 
-#[derive(Debug)]
-struct GetRunSummary {
-    path: String,
-    worker_id: String,
-    flight_uri: String,
-    rows: usize,
-    batches: usize,
-    arrow_memory_bytes_estimate: u64,
-    elapsed_ms: u128,
-}
-
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
     let args = Args::parse();
-    let bench_config = BenchConfig::from_env()?;
+    let client_config = E2eClientConfig::from_env()?;
+    let flight_data_chunk_size = env_size("FLIGHT_DATA_CHUNK_SIZE", 16 * 1024 * 1024)?;
     let mut coordinator = CoordinatorClient::connect(
         args.coordinator_uri.clone(),
         args.coordinator_admin_token.clone(),
         args.coordinator_connect_timeout_seconds,
-        &bench_config,
+        &client_config,
     )
     .await?;
 
@@ -256,25 +227,16 @@ async fn main() -> Result<()> {
         "--max-record-batch-bytes",
         args.max_record_batch_bytes.as_deref(),
     )?;
-    let get_max_record_batch_bytes = parse_optional_size(
-        "--get-max-record-batch-bytes",
-        args.get_max_record_batch_bytes.as_deref(),
-    )?;
-
     let create_upload = coordinator
         .create_upload(CreateUploadRequest {
             operation_id: operation_id.clone(),
             upload_id: args.upload_id.clone(),
             table_name: args.table_name.clone(),
             schema: args.schema.clone(),
-            commit_mode: if args.commit_mode == CommitMode::None {
-                None
-            } else {
-                Some(args.commit_mode.clone())
-            },
+            commit_mode: Some(args.commit_mode.clone()),
             trino_user: args.trino_user.clone(),
             trino_authorization: args.trino_authorization.clone(),
-            streams: args.streams.max(1),
+            flavor: args.flavor.as_str().to_owned(),
             target_file_size,
             max_stream_bytes,
             max_record_batch_bytes,
@@ -302,7 +264,7 @@ async fn main() -> Result<()> {
     println!("operation_id={}", create_upload.operation_id);
     println!("upload_id={}", create_upload.upload_id);
     println!("upload_status={}", create_upload.status);
-    println!("requested_streams={}", create_upload.requested_streams);
+    println!("requested_flavor={}", create_upload.requested_flavor);
     println!("granted_streams={}", create_upload.granted_streams);
     println!("expected_streams={}", create_upload.expected_streams);
     println!("staging_prefix={}", create_upload.staging_prefix);
@@ -325,7 +287,8 @@ async fn main() -> Result<()> {
         &args.input,
         input_bytes,
         create_upload.tickets.clone(),
-        &bench_config,
+        &client_config,
+        flight_data_chunk_size,
         args.client_queue_depth.max(1),
     )
     .await;
@@ -362,35 +325,31 @@ async fn main() -> Result<()> {
         }
     }
 
-    let written_files = if args.commit_mode != CommitMode::None {
-        let commit = coordinator
-            .commit_upload(
-                &create_upload.upload_id,
-                &args.commit_mode,
-                create_upload.table_name.clone().or(args.table_name.clone()),
-                args.trino_user.clone(),
-                args.trino_authorization.clone(),
-            )
-            .await?;
-        println!("commit_upload_id={}", commit.upload_id);
-        println!("commit_status={}", commit.status);
-        println!("commit_table_name={}", commit.table_name);
-        println!("commit_mode={}", commit.mode);
-        println!("commit_snapshot_id={}", commit.snapshot_id);
-        println!("commit_record_count={}", commit.record_count);
-        println!(
-            "commit_parquet_object_bytes={}",
-            commit.parquet_object_bytes
-        );
-        println!("commit_already_committed={}", commit.already_committed);
-        println!(
-            "commit_summary={}",
-            serde_json::to_string(&commit.commit_summary)?
-        );
-        commit.files
-    } else {
-        files_from_put_results(&upload_summary)?
-    };
+    let commit = coordinator
+        .commit_upload(
+            &create_upload.upload_id,
+            &args.commit_mode,
+            create_upload.table_name.clone().or(args.table_name.clone()),
+            args.trino_user.clone(),
+            args.trino_authorization.clone(),
+        )
+        .await?;
+    println!("commit_upload_id={}", commit.upload_id);
+    println!("commit_status={}", commit.status);
+    println!("commit_table_name={}", commit.table_name);
+    println!("commit_mode={}", commit.mode);
+    println!("commit_snapshot_id={}", commit.snapshot_id);
+    println!("commit_record_count={}", commit.record_count);
+    println!(
+        "commit_parquet_object_bytes={}",
+        commit.parquet_object_bytes
+    );
+    println!("commit_already_committed={}", commit.already_committed);
+    println!(
+        "commit_summary={}",
+        serde_json::to_string(&commit.commit_summary)?
+    );
+    let written_files = commit.files;
 
     println!("written_files={}", written_files.len());
     for file in &written_files {
@@ -405,64 +364,6 @@ async fn main() -> Result<()> {
         );
     }
 
-    let read_files = files_to_read(&written_files, &args.read_back, args.read_max_files);
-    if read_files.is_empty() {
-        println!("read_back=none");
-        return Ok(());
-    }
-
-    let mut read_summaries = Vec::with_capacity(read_files.len());
-    let read_started = Instant::now();
-    for (index, file) in read_files.into_iter().enumerate() {
-        let get_ticket = coordinator
-            .get_ticket(
-                format!("{}-read-{index}", create_upload.operation_id),
-                file.file_path.clone(),
-                args.get_max_batch_rows,
-                get_max_record_batch_bytes,
-            )
-            .await?;
-        println!(
-            "get_ticket path={} worker={} uri={}",
-            get_ticket.path, get_ticket.worker_id, get_ticket.flight_uri
-        );
-        read_summaries.push(run_get(get_ticket, &bench_config).await?);
-    }
-    let read_elapsed = read_started.elapsed();
-    let read_rows: usize = read_summaries.iter().map(|summary| summary.rows).sum();
-    let read_batches: usize = read_summaries.iter().map(|summary| summary.batches).sum();
-    let read_bytes: u64 = read_summaries
-        .iter()
-        .map(|summary| summary.arrow_memory_bytes_estimate)
-        .sum();
-
-    println!("read_back={:?}", args.read_back);
-    println!("read_files={}", read_summaries.len());
-    println!("read_rows={read_rows}");
-    println!("read_batches={read_batches}");
-    println!("read_arrow_memory_bytes_estimate={read_bytes}");
-    println!(
-        "read_arrow_memory_size_estimate={}",
-        pretty_bytes(read_bytes)
-    );
-    println!("read_elapsed_ms={}", read_elapsed.as_millis());
-    println!(
-        "read_aggregate_throughput={}",
-        throughput(read_bytes, read_elapsed)
-    );
-    for summary in read_summaries {
-        println!(
-            "read_file={} worker={} uri={} rows={} batches={} arrow_bytes={} elapsed_ms={}",
-            summary.path,
-            summary.worker_id,
-            summary.flight_uri,
-            summary.rows,
-            summary.batches,
-            summary.arrow_memory_bytes_estimate,
-            summary.elapsed_ms
-        );
-    }
-
     Ok(())
 }
 
@@ -471,7 +372,7 @@ impl CoordinatorClient {
         uri: String,
         admin_token: Option<String>,
         timeout_seconds: u64,
-        config: &BenchConfig,
+        config: &E2eClientConfig,
     ) -> Result<Self> {
         let channel = tokio::time::timeout(
             Duration::from_secs(timeout_seconds.max(1)),
@@ -485,7 +386,6 @@ impl CoordinatorClient {
                 .max_encoding_message_size(config.max_message_size),
         );
         Ok(Self {
-            uri,
             admin_token,
             client,
         })
@@ -500,10 +400,7 @@ impl CoordinatorClient {
             "operationId".to_owned(),
             Value::String(request.operation_id),
         );
-        body.insert(
-            "streams".to_owned(),
-            Value::Number(serde_json::Number::from(request.streams)),
-        );
+        body.insert("flavor".to_owned(), Value::String(request.flavor));
         insert_string(&mut body, "uploadId", request.upload_id);
         insert_string(&mut body, "tableName", request.table_name);
         insert_string(&mut body, "schema", request.schema);
@@ -512,7 +409,6 @@ impl CoordinatorClient {
                 "mode".to_owned(),
                 Value::String(
                     match mode {
-                        CommitMode::None => "append",
                         CommitMode::Append => "append",
                         CommitMode::Overwrite => "overwrite",
                     }
@@ -543,7 +439,6 @@ impl CoordinatorClient {
         authorization: Option<String>,
     ) -> Result<CommitUploadResponse> {
         let mode = match mode {
-            CommitMode::None => anyhow::bail!("commit_upload called with CommitMode::None"),
             CommitMode::Append => "append",
             CommitMode::Overwrite => "overwrite",
         };
@@ -561,37 +456,6 @@ impl CoordinatorClient {
         body.insert("uploadId".to_owned(), Value::String(upload_id.to_owned()));
         body.insert("reason".to_owned(), Value::String(reason.to_owned()));
         self.action_json("coordinator.abort-upload", body).await
-    }
-
-    async fn get_ticket(
-        &mut self,
-        operation_id: String,
-        path: String,
-        max_batch_rows: Option<usize>,
-        max_record_batch_bytes: Option<u64>,
-    ) -> Result<GetTicketResponse> {
-        let mut body = Map::new();
-        body.insert("type".to_owned(), Value::String("read".to_owned()));
-        body.insert("operationId".to_owned(), Value::String(operation_id));
-        body.insert("path".to_owned(), Value::String(path.clone()));
-        if let Some(token) = self.admin_token.as_deref() {
-            body.insert("adminToken".to_owned(), Value::String(token.to_owned()));
-        }
-        if let Some(max_batch_rows) = max_batch_rows {
-            body.insert(
-                "maxBatchRows".to_owned(),
-                Value::Number(serde_json::Number::from(max_batch_rows)),
-            );
-        }
-        insert_u64(&mut body, "maxRecordBatchBytes", max_record_batch_bytes);
-
-        let descriptor = FlightDescriptor::new_cmd(json_bytes(Value::Object(body)));
-        let flight_info = self.client.get_flight_info(descriptor).await?;
-        let endpoint = flight_info
-            .endpoint
-            .first()
-            .context("coordinator GetFlightInfo read response did not include endpoints")?;
-        self.endpoint_ticket(endpoint, path)
     }
 
     async fn action_json<T: DeserializeOwned>(
@@ -618,59 +482,6 @@ impl CoordinatorClient {
         serde_json::from_slice(&response)
             .with_context(|| format!("failed to parse coordinator action {action_type} response"))
     }
-
-    fn endpoint_ticket(
-        &self,
-        endpoint: &FlightEndpoint,
-        fallback_path: String,
-    ) -> Result<GetTicketResponse> {
-        let ticket = endpoint
-            .ticket
-            .as_ref()
-            .context("FlightEndpoint did not contain a ticket")?;
-        let ticket_body = String::from_utf8(ticket.ticket.to_vec())
-            .context("FlightEndpoint ticket was not UTF-8 JSON")?;
-        let metadata: Value = if endpoint.app_metadata.is_empty() {
-            Value::Object(Map::new())
-        } else {
-            serde_json::from_slice(&endpoint.app_metadata)
-                .context("FlightEndpoint app_metadata was not JSON")?
-        };
-        let worker_id = metadata
-            .get("workerId")
-            .and_then(Value::as_str)
-            .unwrap_or("unknown-worker")
-            .to_owned();
-        let flight_uri = endpoint
-            .location
-            .first()
-            .map(|location| location.uri.clone())
-            .or_else(|| {
-                metadata
-                    .get("flightUri")
-                    .and_then(Value::as_str)
-                    .map(ToOwned::to_owned)
-            })
-            .unwrap_or_else(|| self.uri.clone());
-        let path = metadata
-            .get("path")
-            .and_then(Value::as_str)
-            .unwrap_or(&fallback_path)
-            .to_owned();
-        let operation_id = metadata
-            .get("operationId")
-            .and_then(Value::as_str)
-            .unwrap_or("read")
-            .to_owned();
-
-        Ok(GetTicketResponse {
-            worker_id,
-            flight_uri,
-            path,
-            operation_id,
-            ticket: ticket_body,
-        })
-    }
 }
 
 struct CreateUploadRequest {
@@ -681,7 +492,7 @@ struct CreateUploadRequest {
     commit_mode: Option<CommitMode>,
     trino_user: Option<String>,
     trino_authorization: Option<String>,
-    streams: usize,
+    flavor: String,
     target_file_size: Option<u64>,
     max_stream_bytes: Option<u64>,
     max_record_batch_bytes: Option<u64>,
@@ -692,7 +503,8 @@ async fn run_upload(
     input: &PathBuf,
     input_bytes: u64,
     tickets: Vec<UploadTicket>,
-    config: &BenchConfig,
+    config: &E2eClientConfig,
+    flight_data_chunk_size: usize,
     client_queue_depth: usize,
 ) -> Result<UploadRunSummary> {
     anyhow::ensure!(
@@ -708,7 +520,7 @@ async fn run_upload(
     for stream_index in 0..requested_streams {
         let Some(batch) = reader.next().transpose()? else {
             anyhow::bail!(
-                "coordinator returned {requested_streams} upload tickets but input only has {stream_index} Arrow batches; request fewer streams or generate smaller batches"
+                "coordinator returned {requested_streams} upload tickets but input only has {stream_index} Arrow batches; use a smaller upload flavor or generate smaller batches"
             );
         };
         first_batches.push(batch);
@@ -716,7 +528,7 @@ async fn run_upload(
 
     let stream_config = Arc::new(StreamUploadConfig {
         max_message_size: config.max_message_size,
-        flight_data_chunk_size: config.flight_data_chunk_size,
+        flight_data_chunk_size,
     });
 
     let mut senders = Vec::with_capacity(requested_streams);
@@ -838,148 +650,6 @@ async fn run_put_stream(
         elapsed_ms: started.elapsed().as_millis(),
         put_results,
     })
-}
-
-async fn run_get(ticket: GetTicketResponse, config: &BenchConfig) -> Result<GetRunSummary> {
-    let channel = Channel::from_shared(tonic_uri(&ticket.flight_uri)?)?
-        .connect()
-        .await?;
-    let mut client = FlightClient::new_from_inner(
-        arrow_flight::flight_service_client::FlightServiceClient::new(channel)
-            .max_decoding_message_size(config.max_message_size)
-            .max_encoding_message_size(config.max_message_size),
-    );
-
-    let started = Instant::now();
-    let get_context = format!(
-        "worker={} uri={} path={} operationId={}",
-        ticket.worker_id, ticket.flight_uri, ticket.path, ticket.operation_id
-    );
-    let mut stream = client
-        .do_get(Ticket {
-            ticket: Bytes::from(ticket.ticket.clone()),
-        })
-        .await
-        .with_context(|| format!("DoGet failed to start; {get_context}"))?;
-
-    let mut rows = 0usize;
-    let mut batches = 0usize;
-    let mut arrow_memory_bytes_estimate = 0u64;
-    while let Some(batch) = stream
-        .try_next()
-        .await
-        .with_context(|| format!("DoGet stream failed; {get_context}"))?
-    {
-        rows += batch.num_rows();
-        batches += 1;
-        arrow_memory_bytes_estimate += batch_memory_size(&batch);
-    }
-
-    Ok(GetRunSummary {
-        path: ticket.path,
-        worker_id: ticket.worker_id,
-        flight_uri: ticket.flight_uri,
-        rows,
-        batches,
-        arrow_memory_bytes_estimate,
-        elapsed_ms: started.elapsed().as_millis(),
-    })
-}
-
-fn files_from_put_results(summary: &UploadRunSummary) -> Result<Vec<WrittenFile>> {
-    let mut files = Vec::new();
-    for stream in &summary.stream_results {
-        for raw in &stream.put_results {
-            if raw.trim().is_empty() {
-                continue;
-            }
-            let value: Value = serde_json::from_str(raw).with_context(|| {
-                format!("failed to parse DoPut result for {}", stream.stream_id)
-            })?;
-            if let Some(raw_files) = value.get("files").and_then(Value::as_array) {
-                for (index, raw_file) in raw_files.iter().enumerate() {
-                    files.push(written_file_from_put_result(stream, raw_file, index as i32));
-                }
-            } else if value.get("key").is_some()
-                || value.get("path").is_some()
-                || value.get("filePath").is_some()
-            {
-                files.push(written_file_from_put_result(stream, &value, 0));
-            }
-        }
-    }
-    files.sort_by(|left, right| {
-        left.stream_id
-            .cmp(&right.stream_id)
-            .then(left.part_index.cmp(&right.part_index))
-            .then(left.file_path.cmp(&right.file_path))
-    });
-    Ok(files)
-}
-
-fn written_file_from_put_result(
-    stream: &StreamResult,
-    value: &Value,
-    default_part_index: i32,
-) -> WrittenFile {
-    let file_path = json_string(value, "filePath")
-        .or_else(|| json_string(value, "file_path"))
-        .or_else(|| json_string(value, "key"))
-        .or_else(|| json_string(value, "path"))
-        .unwrap_or_else(|| stream.key.clone());
-    WrittenFile {
-        stream_id: json_string(value, "streamId").unwrap_or_else(|| stream.stream_id.clone()),
-        worker_id: json_string(value, "workerId").unwrap_or_else(|| stream.worker_id.clone()),
-        part_index: json_i32(value, "partIndex")
-            .or_else(|| json_i32(value, "part_index"))
-            .unwrap_or(default_part_index),
-        file_path,
-        rows: json_u64(value, "rows").unwrap_or(0),
-        batches: json_u64(value, "batches").unwrap_or(0),
-        flight_stream_bytes: json_u64(value, "flightStreamBytes")
-            .or_else(|| json_u64(value, "flight_stream_bytes"))
-            .unwrap_or(0),
-        parquet_object_bytes: json_u64(value, "parquetObjectBytes")
-            .or_else(|| json_u64(value, "parquet_object_bytes"))
-            .or_else(|| json_u64(value, "bytes"))
-            .unwrap_or(0),
-    }
-}
-
-fn files_to_read(
-    files: &[WrittenFile],
-    read_back: &ReadBackMode,
-    read_max_files: Option<usize>,
-) -> Vec<WrittenFile> {
-    let limit = match read_back {
-        ReadBackMode::None => 0,
-        ReadBackMode::First => 1,
-        ReadBackMode::All => read_max_files.unwrap_or(files.len()),
-    };
-
-    files.iter().take(limit).cloned().collect()
-}
-
-fn json_string(value: &Value, key: &str) -> Option<String> {
-    value
-        .get(key)
-        .and_then(Value::as_str)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned)
-}
-
-fn json_u64(value: &Value, key: &str) -> Option<u64> {
-    value.get(key).and_then(|value| {
-        value
-            .as_u64()
-            .or_else(|| value.as_i64().map(|v| v.max(0) as u64))
-    })
-}
-
-fn json_i32(value: &Value, key: &str) -> Option<i32> {
-    value
-        .get(key)
-        .and_then(|value| value.as_i64().map(|value| value as i32))
 }
 
 fn parse_optional_size(name: &str, value: Option<&str>) -> Result<Option<u64>> {

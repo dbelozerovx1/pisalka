@@ -72,12 +72,12 @@ start_stack() {
     return 0
   fi
 
-  local up_args=(--profile bench up -d --build)
+  local up_args=(--profile e2e up -d --build)
   if bool_enabled "${E2E_FORCE_RECREATE:-false}"; then
     up_args+=(--force-recreate)
   fi
 
-  docker compose --profile bench build bench flight-server flight-server-2 coordinator
+  docker compose --profile e2e build e2e-client flight-server flight-server-2 coordinator
   docker compose "${up_args[@]}" \
     minio \
     minio-create-bucket \
@@ -125,11 +125,9 @@ if [[ -n "$target_table" ]]; then
   target_schema="$(table_part "$target_table" schema)"
   echo "ctas_table=$target_table"
   echo "ensuring_schema=$target_catalog.$target_schema"
-  schema_action_body="$(printf '{"schemaName":"%s"}' "$target_schema")"
   schema_action_args=(
     --coordinator-uri "${E2E_COORDINATOR_URI:-http://coordinator:8088}"
-    --action coordinator.create-schema
-    --body "$schema_action_body"
+    --schema-name "$target_schema"
     --user "${TRINO_USER:-local}"
   )
   if [[ -n "${TRINO_AUTHORIZATION:-}" ]]; then
@@ -139,8 +137,8 @@ if [[ -n "$target_table" ]]; then
     schema_action_args+=(--admin-token "$COORDINATOR_ADMIN_TOKEN")
   fi
   docker compose run --rm \
-    --entrypoint coordinator-action \
-    bench \
+    --entrypoint e2e-create-schema \
+    e2e-client \
     "${schema_action_args[@]}"
 else
   echo "ctas_table=<coordinator-generated-from-query-id>"
@@ -178,17 +176,6 @@ if [[ -n "${E2E_MAX_POLLS:-}" ]]; then
 fi
 
 docker compose run --rm \
-  --entrypoint env bench \
-  -u COORDINATOR_QUERY_SQL \
-  -u COORDINATOR_TARGET_TABLE \
-  -u COORDINATOR_SCHEMA \
-  -u COORDINATOR_POLL_INTERVAL_MS \
-  -u COORDINATOR_MAX_POLLS \
-  -u COORDINATOR_READ_RESULTS \
-  -u COORDINATOR_READ_MAX_ENDPOINTS \
-  -u COORDINATOR_PREVIEW_ROWS \
-  -u COORDINATOR_DROP_TEMP \
-  -u TRINO_USER \
-  -u TRINO_AUTHORIZATION \
-  coordinator-query \
+  --entrypoint e2e-read \
+  e2e-client \
   "${args[@]}"

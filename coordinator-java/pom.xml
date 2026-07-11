@@ -19,6 +19,7 @@
         <fabric8.version>6.13.4</fabric8.version>
         <flyway.version>10.22.0</flyway.version>
         <jackson.version>2.18.3</jackson.version>
+        <junit.version>5.11.4</junit.version>
     </properties>
 
     <dependencies>
@@ -48,6 +49,12 @@
             <groupId>org.postgresql</groupId>
             <artifactId>postgresql</artifactId>
             <version>42.7.7</version>
+        </dependency>
+        <dependency>
+            <groupId>org.junit.jupiter</groupId>
+            <artifactId>junit-jupiter</artifactId>
+            <version>${junit.version}</version>
+            <scope>test</scope>
         </dependency>
         <dependency>
             <groupId>org.flywaydb</groupId>
@@ -143,6 +150,10 @@
                 <configuration>
                     <release>${maven.compiler.release}</release>
                 </configuration>
+            </plugin>
+            <plugin>
+                <artifactId>maven-surefire-plugin</artifactId>
+                <version>3.5.2</version>
             </plugin>
             <plugin>
                 <artifactId>maven-jar-plugin</artifactId>
