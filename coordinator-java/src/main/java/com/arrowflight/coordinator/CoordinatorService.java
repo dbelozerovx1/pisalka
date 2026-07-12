@@ -63,6 +63,8 @@ final class CoordinatorService {
         body.put("metricsEnabled", config.coordinatorMetricsEnabled);
         body.put("metricsAddress", config.coordinatorMetricsAddress.toString());
         body.put("queryRegistryTtlMs", config.queryRegistryTtlMs);
+        body.put("uploadSessionTtlMs", config.uploadSessionTtlMs);
+        body.put("uploadCleanupIntervalMs", config.uploadCleanupIntervalMs);
         body.put("uploadFlavors", List.of("small", "medium", "large"));
         body.put("putReservationTtlMs", config.putReservationTtlMs);
         body.put("workerClientEndpointsRequired", config.workerClientEndpointsRequired);
@@ -73,6 +75,55 @@ final class CoordinatorService {
         body.put("workerClientUriScheme", config.workerClientUriScheme);
         body.put("tempCleanupAction", "coordinator.drop-temp");
         return body;
+    }
+
+    int cleanupExpiredUploads() {
+        if (!metadataStore.enabled() || config.uploadCleanupIntervalMs <= 0) {
+            return 0;
+        }
+        Instant now = Instant.now();
+        long claimLeaseMs = Math.max(5 * 60_000L, config.uploadCleanupIntervalMs * 2);
+        Instant staleCleanupBefore = now.minusMillis(claimLeaseMs);
+        int cleaned = 0;
+        for (int index = 0; index < 100; index++) {
+            Optional<String> claimed = metadataStore.tryClaimExpiredUpload(now, staleCleanupBefore);
+            if (claimed.isEmpty()) {
+                break;
+            }
+            String uploadId = claimed.get();
+            try {
+                UploadSnapshot snapshot = metadataStore.loadUpload(uploadId);
+                CleanupResult cleanup = objectStoreCleaner.deleteUploadObjects(
+                        snapshot,
+                        uploadBucket(snapshot.session())
+                );
+                if (!cleanup.succeeded()) {
+                    String message = "expired upload staged-file cleanup failed: "
+                            + cleanup.errorMessage().orElse("unknown object-store error");
+                    metadataStore.markCleanupFailed(uploadId, message);
+                    CoordinatorLog.warn("expired_upload_cleanup_failed", Map.of(
+                            "uploadId", uploadId,
+                            "cleanup", cleanup.toJson()
+                    ));
+                    continue;
+                }
+                metadataStore.markExpired(uploadId, "upload expired before commit; staged files cleaned");
+                cleaned++;
+                CoordinatorLog.info("expired_upload_cleaned", Map.of(
+                        "uploadId", uploadId,
+                        "operationId", snapshot.session().operationId(),
+                        "cleanup", cleanup.toJson()
+                ));
+            } catch (RuntimeException error) {
+                try {
+                    metadataStore.markCleanupFailed(uploadId, "expired upload cleanup failed: " + error.getMessage());
+                } catch (RuntimeException statusError) {
+                    error.addSuppressed(statusError);
+                }
+                CoordinatorLog.error("expired_upload_cleanup_failed", Map.of("uploadId", uploadId), error);
+            }
+        }
+        return cleaned;
     }
 
     Map<String, Object> createSchema(Map<String, Object> request) {
@@ -163,7 +214,8 @@ final class CoordinatorService {
         ClientTable table = requiredClientTable(request, "tableName");
         IcebergTableTarget target = icebergCommitter.resolveTableTarget(table, mode);
         String tableName = target.tableName();
-        String outputPrefix = tableDataLocation(target.tableLocation()).key();
+        ObjectLocation dataLocation = tableDataLocation(target.tableLocation());
+        String outputPrefix = dataLocation.key();
 
         Instant expiresAt = Instant.now().plusMillis(Json.longValue(
                 request,
@@ -198,6 +250,7 @@ final class CoordinatorService {
                             workerAssignments.size(),
                             flavor.value(),
                             outputPrefix,
+                            dataLocation.bucket(),
                             targetFileSize,
                             maxStreamBytes,
                             maxRecordBatchBytes,
@@ -296,6 +349,12 @@ final class CoordinatorService {
             throw new CoordinatorException(
                     409,
                     "upload session " + session.uploadId() + " was aborted and cannot issue upload tickets"
+            );
+        }
+        if (isCleanupTerminalStatus(session.status())) {
+            throw new CoordinatorException(
+                    409,
+                    "upload session " + session.uploadId() + " expired without commit and its staged files are being or were cleaned"
             );
         }
         boolean expiredPendingReservation = snapshot.streams().stream().anyMatch(stream ->
@@ -469,6 +528,13 @@ final class CoordinatorService {
             throw new CoordinatorException(
                     409,
                     "upload session " + uploadId + " is not available for commit; status=" + snapshot.session().status()
+            );
+        }
+        if (isCleanupTerminalStatus(snapshot.session().status())
+                || Instant.now().isAfter(snapshot.session().expiresAt())) {
+            throw new CoordinatorException(
+                    409,
+                    "upload session " + uploadId + " expired before commit; staged files are scheduled for cleanup"
             );
         }
 
@@ -670,6 +736,9 @@ final class CoordinatorService {
     }
 
     private String uploadBucket(UploadSessionRecord session) {
+        if (session.uploadBucket().isPresent()) {
+            return session.uploadBucket().get();
+        }
         String tableName = session.tableName()
                 .or(session::commitTableName)
                 .orElseThrow(() -> new CoordinatorException(
@@ -679,6 +748,10 @@ final class CoordinatorService {
         String mode = session.commitMode().orElse("append");
         IcebergTableTarget target = icebergCommitter.resolveTableTarget(persistedClientTable(tableName), mode);
         return tableDataLocation(target.tableLocation()).bucket();
+    }
+
+    private static boolean isCleanupTerminalStatus(String status) {
+        return status.equals("CLEANING") || status.equals("CLEANUP_FAILED") || status.equals("EXPIRED");
     }
 
     private LinkedHashMap<String, Object> uploadPlanResponse(UploadReadyPlan plan) {

@@ -132,6 +132,7 @@ final class CoordinatorMetadataStore {
                             status,
                             expected_streams,
                             staging_prefix,
+                            upload_bucket,
                             target_file_size,
                             max_stream_bytes,
                             max_record_batch_bytes,
@@ -139,7 +140,7 @@ final class CoordinatorMetadataStore {
                             upload_flavor,
                             expires_at,
                             updated_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, now())
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, now())
                         ON CONFLICT (upload_id) DO NOTHING
                         """)) {
                     statement.setString(1, session.uploadId());
@@ -148,12 +149,13 @@ final class CoordinatorMetadataStore {
                     statement.setString(4, session.status());
                     statement.setInt(5, session.expectedStreams());
                     statement.setString(6, session.stagingPrefix());
-                    statement.setLong(7, session.targetFileSize());
-                    setNullableLong(statement, 8, session.maxStreamBytes());
-                    setNullableLong(statement, 9, session.maxRecordBatchBytes());
-                    statement.setString(10, session.commitMode());
-                    statement.setString(11, session.uploadFlavor());
-                    statement.setTimestamp(12, Timestamp.from(session.expiresAt()));
+                    statement.setString(7, session.uploadBucket());
+                    statement.setLong(8, session.targetFileSize());
+                    setNullableLong(statement, 9, session.maxStreamBytes());
+                    setNullableLong(statement, 10, session.maxRecordBatchBytes());
+                    statement.setString(11, session.commitMode());
+                    statement.setString(12, session.uploadFlavor());
+                    statement.setTimestamp(13, Timestamp.from(session.expiresAt()));
                     inserted = statement.executeUpdate();
                 }
 
@@ -641,6 +643,99 @@ final class CoordinatorMetadataStore {
         }
     }
 
+    Optional<String> tryClaimExpiredUpload(Instant now, Instant staleCleanupBefore) {
+        requireEnabled();
+        try (Connection connection = connect()) {
+            connection.setAutoCommit(false);
+            try (PreparedStatement statement = connection.prepareStatement("""
+                    WITH candidate AS (
+                        SELECT session.upload_id
+                        FROM coordinator_upload_sessions session
+                        WHERE session.expires_at < ?
+                          AND (
+                              session.status IN ('PREPARING', 'PLANNED', 'FAILED', 'ABORTED')
+                              OR (session.status = 'CLEANING' AND session.updated_at < ?)
+                              OR (
+                                  session.status = 'CLEANUP_FAILED'
+                                  AND session.upload_bucket IS NOT NULL
+                                  AND session.updated_at < ?
+                              )
+                          )
+                          AND NOT EXISTS (
+                              SELECT 1
+                              FROM coordinator_upload_streams planned
+                              JOIN worker_put_streams actual
+                                ON actual.attempt_id = planned.attempt_id
+                              JOIN worker_registry registry
+                                ON registry.worker_id = planned.worker_id
+                              WHERE planned.upload_id = session.upload_id
+                                AND actual.status IN ('ADMITTED', 'WRITING')
+                                AND extract(epoch FROM (now() - registry.last_heartbeat_at)) * 1000
+                                    <= registry.registry_ttl_ms
+                          )
+                        ORDER BY session.expires_at, session.upload_id
+                        FOR UPDATE SKIP LOCKED
+                        LIMIT 1
+                    )
+                    UPDATE coordinator_upload_sessions session
+                    SET status = 'CLEANING',
+                        error_message = 'upload expired before commit; cleaning staged files',
+                        updated_at = now()
+                    FROM candidate
+                    WHERE session.upload_id = candidate.upload_id
+                    RETURNING session.upload_id
+                    """)) {
+                statement.setTimestamp(1, Timestamp.from(now));
+                statement.setTimestamp(2, Timestamp.from(staleCleanupBefore));
+                statement.setTimestamp(3, Timestamp.from(staleCleanupBefore));
+                try (ResultSet rows = statement.executeQuery()) {
+                    Optional<String> uploadId = rows.next()
+                            ? Optional.of(rows.getString("upload_id"))
+                            : Optional.empty();
+                    connection.commit();
+                    return uploadId;
+                }
+            } catch (SQLException error) {
+                connection.rollback();
+                throw error;
+            }
+        } catch (SQLException error) {
+            throw new IllegalStateException("failed to claim expired upload for cleanup", error);
+        }
+    }
+
+    void markExpired(String uploadId, String message) {
+        updateCleanupStatus(uploadId, "EXPIRED", message, true);
+    }
+
+    void markCleanupFailed(String uploadId, String message) {
+        updateCleanupStatus(uploadId, "CLEANUP_FAILED", message, false);
+    }
+
+    private void updateCleanupStatus(String uploadId, String status, String message, boolean completed) {
+        requireEnabled();
+        try (Connection connection = connect();
+             PreparedStatement statement = connection.prepareStatement("""
+                     UPDATE coordinator_upload_sessions
+                     SET status = ?,
+                         error_message = ?,
+                         updated_at = now(),
+                         completed_at = CASE WHEN ? THEN COALESCE(completed_at, now()) ELSE completed_at END
+                     WHERE upload_id = ?
+                       AND status = 'CLEANING'
+                     """)) {
+            statement.setString(1, status);
+            statement.setString(2, message);
+            statement.setBoolean(3, completed);
+            statement.setString(4, uploadId);
+            if (statement.executeUpdate() == 0) {
+                throw new IllegalStateException("expired upload cleanup claim was lost for " + uploadId);
+            }
+        } catch (SQLException error) {
+            throw new IllegalStateException("failed to update expired upload cleanup status", error);
+        }
+    }
+
     void markPlanned(String uploadId) {
         requireEnabled();
         try (Connection connection = connect()) {
@@ -689,7 +784,8 @@ final class CoordinatorMetadataStore {
                          error_message = NULL,
                          updated_at = now()
                      WHERE upload_id = ?
-                       AND status NOT IN ('COMMITTED', 'COMMITTING', 'ABORTED')
+                       AND status IN ('PREPARING', 'PLANNED', 'FAILED')
+                       AND expires_at > now()
                      """)) {
             statement.setString(1, tableName);
             statement.setString(2, createTableSql);
@@ -784,6 +880,7 @@ final class CoordinatorMetadataStore {
                        expected_streams,
                        upload_flavor,
                        staging_prefix,
+                       upload_bucket,
                        target_file_size,
                        max_stream_bytes,
                        max_record_batch_bytes,
@@ -814,6 +911,7 @@ final class CoordinatorMetadataStore {
                         rows.getInt("expected_streams"),
                         rows.getString("upload_flavor"),
                         rows.getString("staging_prefix"),
+                        Optional.ofNullable(rows.getString("upload_bucket")),
                         rows.getLong("target_file_size"),
                         nullableLong(rows, "max_stream_bytes"),
                         nullableLong(rows, "max_record_batch_bytes"),
@@ -1211,6 +1309,7 @@ record PlannedUploadSession(
         int expectedStreams,
         String uploadFlavor,
         String stagingPrefix,
+        String uploadBucket,
         long targetFileSize,
         Optional<Long> maxStreamBytes,
         Optional<Long> maxRecordBatchBytes,
@@ -1250,6 +1349,7 @@ record UploadSessionRecord(
         int expectedStreams,
         String uploadFlavor,
         String stagingPrefix,
+        Optional<String> uploadBucket,
         long targetFileSize,
         Optional<Long> maxStreamBytes,
         Optional<Long> maxRecordBatchBytes,
@@ -1274,6 +1374,7 @@ record UploadSessionRecord(
         body.put("expectedStreams", expectedStreams);
         body.put("uploadFlavor", uploadFlavor);
         body.put("stagingPrefix", stagingPrefix);
+        uploadBucket.ifPresent(value -> body.put("uploadBucket", value));
         body.put("targetFileSizeBytes", targetFileSize);
         maxStreamBytes.ifPresent(value -> body.put("maxStreamBytes", value));
         maxRecordBatchBytes.ifPresent(value -> body.put("maxRecordBatchBytes", value));

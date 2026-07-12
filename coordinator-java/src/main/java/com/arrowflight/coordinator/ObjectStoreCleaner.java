@@ -8,6 +8,7 @@ import java.util.Optional;
 import java.util.Set;
 
 import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.fs.FileStatus;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
 
@@ -22,13 +23,16 @@ final class ObjectStoreCleaner {
 
     CleanupResult deleteUploadObjects(UploadSnapshot snapshot, String bucket) {
         LinkedHashSet<String> keys = new LinkedHashSet<>();
+        LinkedHashSet<String> descriptors = new LinkedHashSet<>();
         for (UploadStreamState stream : snapshot.streams()) {
-            keys.add(Config.normalizePath(stream.descriptorPath()));
+            String descriptor = Config.normalizePath(stream.descriptorPath());
+            keys.add(descriptor);
+            descriptors.add(descriptor);
         }
         for (UploadFile file : snapshot.files()) {
             keys.add(Config.normalizePath(file.filePath()));
         }
-        return deleteObjects(bucket, snapshot.session().stagingPrefix(), keys);
+        return deleteObjects(bucket, snapshot.session().stagingPrefix(), keys, descriptors);
     }
 
     CleanupResult deleteCtasStaging(String queryId) {
@@ -59,12 +63,21 @@ final class ObjectStoreCleaner {
         }
     }
 
-    private CleanupResult deleteObjects(String bucket, String rawPrefix, Set<String> keys) {
+    private CleanupResult deleteObjects(
+            String bucket,
+            String rawPrefix,
+            Set<String> knownKeys,
+            Set<String> descriptorKeys
+    ) {
         String prefix = Config.normalizePrefix(rawPrefix);
         String uri = config.objectUriForBucket(bucket, prefix);
         boolean existed = false;
         int deletedObjects = 0;
         ArrayList<String> errors = new ArrayList<>();
+        LinkedHashSet<String> keys = new LinkedHashSet<>(knownKeys);
+        for (String descriptor : descriptorKeys) {
+            discoverDescriptorObjects(bucket, descriptor, keys, errors);
+        }
         for (String key : keys) {
             String objectUri = config.objectUriForBucket(bucket, key);
             try {
@@ -88,6 +101,44 @@ final class ObjectStoreCleaner {
                 deletedObjects,
                 errors.isEmpty() ? Optional.empty() : Optional.of(String.join("; ", errors.stream().limit(8).toList()))
         );
+    }
+
+    private void discoverDescriptorObjects(
+            String bucket,
+            String descriptor,
+            Set<String> keys,
+            ArrayList<String> errors
+    ) {
+        int slash = descriptor.lastIndexOf('/');
+        String parent = slash < 0 ? "" : descriptor.substring(0, slash);
+        String fileName = slash < 0 ? descriptor : descriptor.substring(slash + 1);
+        String stem = fileName.endsWith(".parquet")
+                ? fileName.substring(0, fileName.length() - ".parquet".length())
+                : fileName;
+        if (parent.isBlank() || stem.isBlank()) {
+            return;
+        }
+        String globUri = config.objectUriForBucket(bucket, parent) + "/" + stem + "*.parquet";
+        try {
+            Path glob = new Path(globUri);
+            FileSystem fs = glob.getFileSystem(hadoopConf);
+            FileStatus[] matches = fs.globStatus(glob);
+            if (matches == null) {
+                return;
+            }
+            for (FileStatus match : matches) {
+                if (!match.isFile()) {
+                    continue;
+                }
+                String candidate = match.getPath().getName();
+                if (candidate.equals(fileName)
+                        || (candidate.startsWith(stem + "-part-") && candidate.endsWith(".parquet"))) {
+                    keys.add(parent + "/" + candidate);
+                }
+            }
+        } catch (Exception error) {
+            errors.add(descriptor + " discovery: " + error.getMessage());
+        }
     }
 }
 

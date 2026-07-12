@@ -38,6 +38,7 @@ final class Config {
     final long putReservationTtlMs;
     final long getCapabilityTtlMs;
     final long uploadSessionTtlMs;
+    final long uploadCleanupIntervalMs;
     final long queryRegistryTtlMs;
     final long queryRegistryCleanupIntervalMs;
     final String s3PresignedBucket;
@@ -93,6 +94,7 @@ final class Config {
             long putReservationTtlMs,
             long getCapabilityTtlMs,
             long uploadSessionTtlMs,
+            long uploadCleanupIntervalMs,
             long queryRegistryTtlMs,
             long queryRegistryCleanupIntervalMs,
             String s3PresignedBucket,
@@ -147,6 +149,7 @@ final class Config {
         this.putReservationTtlMs = putReservationTtlMs;
         this.getCapabilityTtlMs = getCapabilityTtlMs;
         this.uploadSessionTtlMs = uploadSessionTtlMs;
+        this.uploadCleanupIntervalMs = uploadCleanupIntervalMs;
         this.queryRegistryTtlMs = queryRegistryTtlMs;
         this.queryRegistryCleanupIntervalMs = queryRegistryCleanupIntervalMs;
         this.s3PresignedBucket = s3PresignedBucket;
@@ -209,6 +212,7 @@ final class Config {
                 envLong("COORDINATOR_PUT_RESERVATION_TTL_MS", 30_000L),
                 envLong("COORDINATOR_GET_CAPABILITY_TTL_MS", 5 * 60 * 1000L),
                 envLong("COORDINATOR_UPLOAD_SESSION_TTL_MS", 60 * 60 * 1000L),
+                envLong("COORDINATOR_UPLOAD_CLEANUP_INTERVAL_MS", 60_000L),
                 envLong("COORDINATOR_QUERY_REGISTRY_TTL_MS", 60 * 60 * 1000L),
                 envLong("COORDINATOR_QUERY_REGISTRY_CLEANUP_INTERVAL_MS", 5 * 60 * 1000L),
                 bucketLocations.s3PresignedBucket(),
