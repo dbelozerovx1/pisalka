@@ -165,7 +165,7 @@ services:
       PUT_FIRST_BATCH_TIMEOUT_MS: "${PUT_FIRST_BATCH_TIMEOUT_MS:-10000}"
       PUT_MAX_STREAM_BYTES: "${PUT_MAX_STREAM_BYTES:-}"
       PUT_REQUIRE_STAGING_PREFIX: "${PUT_REQUIRE_STAGING_PREFIX:-true}"
-      METADATA_DATABASE_URL: "${METADATA_DATABASE_URL:-postgres://flight:flight@metadata-db:5432/flight_metadata}"
+      METADATA_DATABASE_URL: "${METADATA_DATABASE_URL:-postgres://flight:flight@metadata-db:5432/flight_metadata?sslmode=disable}"
       PUT_PARALLELISM: "${PUT_PARALLELISM:-4}"
       PUT_MAX_ACTIVE_WRITERS: "${PUT_MAX_ACTIVE_WRITERS:-auto}"
       PUT_QUEUE_DEPTH: "${PUT_QUEUE_DEPTH:-2}"

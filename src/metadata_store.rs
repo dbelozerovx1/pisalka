@@ -1,7 +1,8 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use serde_json::Value;
-use tokio_postgres::{Client, NoTls};
-use tracing::error;
+use tokio_postgres::Client;
+use tokio_postgres_rustls::MakeRustlsConnect;
+use tracing::{error, warn};
 
 use crate::{config::MetadataConfig, worker_status::WorkerStatus};
 
@@ -43,7 +44,15 @@ impl MetadataStore {
             return Ok(None);
         };
 
-        let (client, connection) = tokio_postgres::connect(database_url, NoTls)
+        let (tls, certificate_errors) = MakeRustlsConnect::with_native_certs()
+            .map_err(|errors| anyhow!("failed to load system CA certificates: {errors:?}"))?;
+        if !certificate_errors.is_empty() {
+            warn!(
+                error_count = certificate_errors.len(),
+                "some system CA certificates could not be loaded"
+            );
+        }
+        let (client, connection) = tokio_postgres::connect(database_url, tls)
             .await
             .context("failed to connect metadata database")?;
         tokio::spawn(async move {
