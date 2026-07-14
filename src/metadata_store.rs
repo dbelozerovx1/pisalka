@@ -48,6 +48,8 @@ impl MetadataStore {
             .map_err(|errors| anyhow!("failed to load system CA certificates: {errors:?}"))?;
         if !certificate_errors.is_empty() {
             warn!(
+                event = "worker_ca_store_partial_load",
+                phase = "startup",
                 error_count = certificate_errors.len(),
                 "some system CA certificates could not be loaded"
             );
@@ -57,7 +59,12 @@ impl MetadataStore {
             .context("failed to connect metadata database")?;
         tokio::spawn(async move {
             if let Err(error) = connection.await {
-                error!(error = %error, "metadata database connection failed");
+                error!(
+                    event = "worker_metadata_connection_failed",
+                    phase = "connection",
+                    error = %error,
+                    "metadata database connection failed"
+                );
             }
         });
 

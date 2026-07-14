@@ -40,13 +40,14 @@ async fn main() -> Result<()> {
         .max_encoding_message_size(config.flight_max_message_size);
 
     info!(
+        event = "worker_starting",
         addr = %config.flight_addr,
         s3_endpoint = %config.s3.endpoint,
         s3_presigned_bucket = %config.s3.presigned_bucket,
         s3_tmp_bucket = %config.s3.tmp_bucket,
         legacy_default_bucket = config.s3.legacy_default_bucket.as_deref().unwrap_or(""),
         metadata_db = config.metadata.database_url.is_some(),
-        worker_id = %config.worker.worker_id,
+        workerId = %config.worker.worker_id,
         worker_flight_uri = %config.worker.flight_uri,
         flight_tls_enabled = config.flight_tls.enabled,
         flight_tls_cert_path = config.flight_tls.cert_path.as_deref().unwrap_or(""),
@@ -121,7 +122,9 @@ fn spawn_worker_registry_heartbeat(
             let status = service.worker_status();
             if let Err(error) = metadata_store.record_worker_heartbeat(&status).await {
                 error!(
-                    worker_id = %status.worker_id,
+                    event = "worker_heartbeat_failed",
+                    phase = "registry_heartbeat",
+                    workerId = %status.worker_id,
                     error = %error,
                     "failed to publish worker heartbeat"
                 );

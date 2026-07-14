@@ -7,10 +7,120 @@ use std::{
 };
 
 use serde_json::{Map, Number, Value};
+use tonic::{Code, Status, metadata::MetadataValue};
 use tracing::{
     Event, Subscriber,
     field::{Field, Visit},
 };
+
+pub const ERROR_ID_METADATA: &str = "x-error-id";
+pub const OPERATION_ID_METADATA: &str = "x-operation-id";
+pub const UPLOAD_ID_METADATA: &str = "x-upload-id";
+pub const STREAM_ID_METADATA: &str = "x-stream-id";
+pub const ATTEMPT_ID_METADATA: &str = "x-attempt-id";
+
+#[derive(Clone, Debug, Default)]
+pub struct WorkerRequestContext {
+    pub worker_id: String,
+    pub bucket: String,
+    pub key: String,
+    pub operation_id: Option<String>,
+    pub upload_id: Option<String>,
+    pub stream_id: Option<String>,
+    pub attempt_id: Option<String>,
+}
+
+pub fn enrich_worker_status(status: Status, context: &WorkerRequestContext) -> Status {
+    if status.metadata().get(ERROR_ID_METADATA).is_some() {
+        return status;
+    }
+
+    let error_id = format!(
+        "worker-err-{}",
+        uuid::Uuid::new_v4().to_string().replace('-', "")
+    );
+    let mut metadata = status.metadata().clone();
+    insert_status_metadata(&mut metadata, ERROR_ID_METADATA, &error_id);
+    insert_optional_status_metadata(
+        &mut metadata,
+        OPERATION_ID_METADATA,
+        context.operation_id.as_deref(),
+    );
+    insert_optional_status_metadata(
+        &mut metadata,
+        UPLOAD_ID_METADATA,
+        context.upload_id.as_deref(),
+    );
+    insert_optional_status_metadata(
+        &mut metadata,
+        STREAM_ID_METADATA,
+        context.stream_id.as_deref(),
+    );
+    insert_optional_status_metadata(
+        &mut metadata,
+        ATTEMPT_ID_METADATA,
+        context.attempt_id.as_deref(),
+    );
+
+    let mut message = format!("errorId={error_id}");
+    append_status_id(&mut message, "operationId", context.operation_id.as_deref());
+    append_status_id(&mut message, "uploadId", context.upload_id.as_deref());
+    append_status_id(&mut message, "streamId", context.stream_id.as_deref());
+    append_status_id(&mut message, "attemptId", context.attempt_id.as_deref());
+    message.push_str(": ");
+    message.push_str(status.message());
+
+    Status::with_details_and_metadata(
+        status.code(),
+        message,
+        bytes::Bytes::copy_from_slice(status.details()),
+        metadata,
+    )
+}
+
+pub fn status_metadata<'a>(status: &'a Status, name: &str) -> &'a str {
+    status
+        .metadata()
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("")
+}
+
+pub fn worker_error_class(status: &Status) -> &'static str {
+    match status.code() {
+        Code::Unknown | Code::Internal | Code::Unavailable | Code::DataLoss => "internal",
+        _ => "request",
+    }
+}
+
+fn insert_optional_status_metadata(
+    metadata: &mut tonic::metadata::MetadataMap,
+    name: &'static str,
+    value: Option<&str>,
+) {
+    if let Some(value) = value.filter(|value| !value.is_empty()) {
+        insert_status_metadata(metadata, name, value);
+    }
+}
+
+fn insert_status_metadata(
+    metadata: &mut tonic::metadata::MetadataMap,
+    name: &'static str,
+    value: &str,
+) {
+    if let Ok(value) = MetadataValue::try_from(value) {
+        metadata.insert(name, value);
+    }
+}
+
+fn append_status_id(message: &mut String, name: &str, value: Option<&str>) {
+    if let Some(value) = value.filter(|value| !value.is_empty()) {
+        message.push(' ');
+        message.push_str(name);
+        message.push('=');
+        message.push_str(value);
+    }
+}
 use tracing_subscriber::{
     EnvFilter,
     fmt::{
@@ -162,4 +272,47 @@ fn unix_timestamp_millis() -> String {
         .map(|duration| duration.as_millis())
         .unwrap_or_default();
     millis.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn worker_error_status_carries_structured_correlation_metadata() {
+        let status = enrich_worker_status(
+            Status::invalid_argument("bad ticket"),
+            &WorkerRequestContext {
+                operation_id: Some("read-123".to_owned()),
+                upload_id: Some("upload-123".to_owned()),
+                stream_id: Some("stream-2".to_owned()),
+                attempt_id: Some("attempt-2".to_owned()),
+                ..WorkerRequestContext::default()
+            },
+        );
+
+        assert!(status_metadata(&status, ERROR_ID_METADATA).starts_with("worker-err-"));
+        assert_eq!(status_metadata(&status, OPERATION_ID_METADATA), "read-123");
+        assert_eq!(status_metadata(&status, UPLOAD_ID_METADATA), "upload-123");
+        assert_eq!(status_metadata(&status, STREAM_ID_METADATA), "stream-2");
+        assert_eq!(status_metadata(&status, ATTEMPT_ID_METADATA), "attempt-2");
+        assert!(status.message().contains("operationId=read-123"));
+        assert_eq!(worker_error_class(&status), "request");
+    }
+
+    #[test]
+    fn worker_error_status_is_not_wrapped_twice() {
+        let first = enrich_worker_status(
+            Status::internal("storage failed"),
+            &WorkerRequestContext::default(),
+        );
+        let error_id = status_metadata(&first, ERROR_ID_METADATA).to_owned();
+        let message = first.message().to_owned();
+
+        let second = enrich_worker_status(first, &WorkerRequestContext::default());
+
+        assert_eq!(status_metadata(&second, ERROR_ID_METADATA), error_id);
+        assert_eq!(second.message(), message);
+        assert_eq!(worker_error_class(&second), "internal");
+    }
 }

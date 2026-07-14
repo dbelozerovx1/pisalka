@@ -41,6 +41,11 @@ use crate::{
         verify_put_capability,
     },
     config::{AppConfig, ParquetTuning},
+    logging::{
+        ATTEMPT_ID_METADATA, ERROR_ID_METADATA, OPERATION_ID_METADATA, STREAM_ID_METADATA,
+        UPLOAD_ID_METADATA, WorkerRequestContext, enrich_worker_status, status_metadata,
+        worker_error_class,
+    },
     metadata_store::{MetadataStore, PutFileRecord, PutStreamCompleteRecord, PutStreamStartRecord},
     metrics::{MeasuredReadStream, WorkerMetrics},
     put_model::{
@@ -600,6 +605,7 @@ impl WorkerFlightService {
         if timeout_ms > 0 {
             let metadata_store = metadata_store.clone();
             let attempt_id = record.attempt_id.clone();
+            let worker_id = self.config.worker.worker_id.clone();
             tokio::spawn(async move {
                 sleep(Duration::from_millis(timeout_ms)).await;
                 let error_message =
@@ -609,12 +615,18 @@ impl WorkerFlightService {
                     .await
                 {
                     Ok(1) => info!(
-                        attempt_id = %attempt_id,
+                        event = "worker_put_first_batch_timeout",
+                        phase = "await_first_batch",
+                        workerId = %worker_id,
+                        attemptId = %attempt_id,
                         "marked stale admitted DoPut stream as failed"
                     ),
                     Ok(_) => {}
                     Err(error) => error!(
-                        attempt_id = %attempt_id,
+                        event = "worker_metadata_update_failed",
+                        phase = "mark_first_batch_timeout",
+                        workerId = %worker_id,
+                        attemptId = %attempt_id,
                         error = %error,
                         "failed to mark stale admitted DoPut stream as failed"
                     ),
@@ -692,7 +704,10 @@ impl WorkerFlightService {
             .await
         {
             error!(
-                attempt_id = %attempt_id,
+                event = "worker_metadata_update_failed",
+                phase = "record_put_failure",
+                workerId = %self.config.worker.worker_id,
+                attemptId = %attempt_id,
                 error = %error,
                 "failed to persist DoPut failure status"
             );
@@ -732,9 +747,15 @@ impl WorkerFlightService {
         self.record_put_admitted(&start_record).await?;
 
         let attempt_id = worker_summary.attempt_id.clone();
-        let error_operation_id = put_context.operation_id.clone();
-        let error_upload_id = put_context.upload_id.clone();
-        let error_stream_id = put_context.stream_id.clone();
+        let error_context = WorkerRequestContext {
+            worker_id: self.config.worker.worker_id.clone(),
+            bucket: put_context.bucket.clone(),
+            key: key.clone(),
+            operation_id: put_context.operation_id.clone(),
+            upload_id: put_context.upload_id.clone(),
+            stream_id: put_context.stream_id.clone(),
+            attempt_id: Some(attempt_id.clone()),
+        };
         let cleanup_bucket = put_context.bucket.clone();
         let cleanup_key = key.clone();
         let cleanup_target_file_size = put_context.target_file_size;
@@ -836,18 +857,13 @@ impl WorkerFlightService {
                 Ok(summary)
             }
             Err(status) => {
-                let status = status_with_worker_context(
-                    status,
-                    error_operation_id.as_deref(),
-                    error_upload_id.as_deref(),
-                    error_stream_id.as_deref(),
-                    Some(&attempt_id),
-                );
+                let status = enrich_worker_status(status, &error_context);
                 self.record_put_failed(&attempt_id, &status).await;
                 self.cleanup_failed_put_objects(
                     &cleanup_bucket,
                     &cleanup_key,
                     cleanup_target_file_size,
+                    &error_context,
                 )
                 .await;
                 Err(status)
@@ -860,11 +876,19 @@ impl WorkerFlightService {
         bucket: &str,
         key: &str,
         target_file_size: Option<usize>,
+        context: &WorkerRequestContext,
     ) {
         let store = match self.stores.store_for_bucket(bucket) {
             Ok(store) => store,
             Err(error) => {
                 warn!(
+                    event = "worker_put_cleanup_failed",
+                    phase = "open_bucket",
+                    workerId = %self.config.worker.worker_id,
+                    operationId = context.operation_id.as_deref().unwrap_or(""),
+                    uploadId = context.upload_id.as_deref().unwrap_or(""),
+                    streamId = context.stream_id.as_deref().unwrap_or(""),
+                    attemptId = context.attempt_id.as_deref().unwrap_or(""),
                     bucket,
                     key,
                     error = %error,
@@ -875,8 +899,26 @@ impl WorkerFlightService {
         };
         let path = path_from_key(key);
         match store.delete(&path).await {
-            Ok(()) => debug!(bucket, key = %key, "deleted failed DoPut object"),
+            Ok(()) => debug!(
+                event = "worker_put_cleanup_step_completed",
+                phase = "delete_object",
+                workerId = %self.config.worker.worker_id,
+                operationId = context.operation_id.as_deref().unwrap_or(""),
+                uploadId = context.upload_id.as_deref().unwrap_or(""),
+                streamId = context.stream_id.as_deref().unwrap_or(""),
+                attemptId = context.attempt_id.as_deref().unwrap_or(""),
+                bucket,
+                key = %key,
+                "deleted failed DoPut object"
+            ),
             Err(error) => warn!(
+                event = "worker_put_cleanup_failed",
+                phase = "delete_object",
+                workerId = %self.config.worker.worker_id,
+                operationId = context.operation_id.as_deref().unwrap_or(""),
+                uploadId = context.upload_id.as_deref().unwrap_or(""),
+                streamId = context.stream_id.as_deref().unwrap_or(""),
+                attemptId = context.attempt_id.as_deref().unwrap_or(""),
                 bucket,
                 key = %key,
                 error = %error,
@@ -896,6 +938,13 @@ impl WorkerFlightService {
                 Ok(meta) => match store.delete(&meta.location).await {
                     Ok(()) => deleted += 1,
                     Err(error) => warn!(
+                        event = "worker_put_cleanup_failed",
+                        phase = "delete_part",
+                        workerId = %self.config.worker.worker_id,
+                        operationId = context.operation_id.as_deref().unwrap_or(""),
+                        uploadId = context.upload_id.as_deref().unwrap_or(""),
+                        streamId = context.stream_id.as_deref().unwrap_or(""),
+                        attemptId = context.attempt_id.as_deref().unwrap_or(""),
                         path = %meta.location,
                         error = %error,
                         "failed DoPut part cleanup skipped or failed"
@@ -903,6 +952,13 @@ impl WorkerFlightService {
                 },
                 Err(error) => {
                     warn!(
+                        event = "worker_put_cleanup_failed",
+                        phase = "list_parts",
+                        workerId = %self.config.worker.worker_id,
+                        operationId = context.operation_id.as_deref().unwrap_or(""),
+                        uploadId = context.upload_id.as_deref().unwrap_or(""),
+                        streamId = context.stream_id.as_deref().unwrap_or(""),
+                        attemptId = context.attempt_id.as_deref().unwrap_or(""),
                         prefix = %prefix,
                         error = %error,
                         "failed DoPut part cleanup listing failed"
@@ -913,6 +969,13 @@ impl WorkerFlightService {
         }
         if deleted > 0 {
             debug!(
+                event = "worker_put_cleanup_step_completed",
+                phase = "delete_parts",
+                workerId = %self.config.worker.worker_id,
+                operationId = context.operation_id.as_deref().unwrap_or(""),
+                uploadId = context.upload_id.as_deref().unwrap_or(""),
+                streamId = context.stream_id.as_deref().unwrap_or(""),
+                attemptId = context.attempt_id.as_deref().unwrap_or(""),
                 key = %key,
                 prefix = %prefix,
                 deleted,
@@ -1062,11 +1125,14 @@ impl WorkerFlightService {
         };
 
         debug!(
+            event = "worker_parquet_write_completed",
+            phase = "write",
             key = %summary.key,
-            worker_id = %summary.worker.worker_id,
-            attempt_id = %summary.worker.attempt_id,
-            upload_id = ?summary.worker.upload_id,
-            stream_id = ?summary.worker.stream_id,
+            workerId = %summary.worker.worker_id,
+            operationId = summary.worker.operation_id.as_deref().unwrap_or(""),
+            attemptId = %summary.worker.attempt_id,
+            uploadId = summary.worker.upload_id.as_deref().unwrap_or(""),
+            streamId = summary.worker.stream_id.as_deref().unwrap_or(""),
             admission_wait_ms = summary.worker.admission_wait_ms,
             active_put_streams_at_admit = summary.worker.active_put_streams_at_admit,
             mode = %summary.mode,
@@ -1270,11 +1336,14 @@ impl WorkerFlightService {
         };
 
         debug!(
+            event = "worker_parquet_write_completed",
+            phase = "write",
             key = %summary.key,
-            worker_id = %summary.worker.worker_id,
-            attempt_id = %summary.worker.attempt_id,
-            upload_id = ?summary.worker.upload_id,
-            stream_id = ?summary.worker.stream_id,
+            workerId = %summary.worker.worker_id,
+            operationId = summary.worker.operation_id.as_deref().unwrap_or(""),
+            attemptId = %summary.worker.attempt_id,
+            uploadId = summary.worker.upload_id.as_deref().unwrap_or(""),
+            streamId = summary.worker.stream_id.as_deref().unwrap_or(""),
             admission_wait_ms = summary.worker.admission_wait_ms,
             active_put_streams_at_admit = summary.worker.active_put_streams_at_admit,
             mode = %summary.mode,
@@ -1351,20 +1420,64 @@ impl FlightService for WorkerFlightService {
         let started = Instant::now();
         self.metrics.record_get_started();
 
+        let ticket = match parse_read_ticket(
+            &request.into_inner().ticket,
+            &self.config.worker,
+            &self.config.security,
+        ) {
+            Ok(ticket) => ticket,
+            Err(status) => {
+                let context = WorkerRequestContext {
+                    worker_id: self.config.worker.worker_id.clone(),
+                    ..WorkerRequestContext::default()
+                };
+                let status = enrich_worker_status(status, &context);
+                self.metrics.record_get_failed(started.elapsed());
+                error!(
+                    event = "worker_request_failed",
+                    outcome = "error",
+                    phase = "ticket",
+                    method = "DoGet",
+                    workerId = %self.config.worker.worker_id,
+                    errorId = status_metadata(&status, ERROR_ID_METADATA),
+                    operationId = status_metadata(&status, OPERATION_ID_METADATA),
+                    grpcCode = ?status.code(),
+                    errorClass = worker_error_class(&status),
+                    reason = %status.message(),
+                    elapsedMs = u128_to_u64(started.elapsed().as_millis()),
+                    "DoGet ticket validation failed"
+                );
+                return Err(status);
+            }
+        };
+        let bucket = ticket
+            .bucket
+            .clone()
+            .unwrap_or_else(|| self.stores.default_bucket().to_owned());
+        let key = ticket.key.clone();
+        let log_context = WorkerRequestContext {
+            worker_id: self.config.worker.worker_id.clone(),
+            bucket: bucket.clone(),
+            key: key.clone(),
+            operation_id: ticket.operation_id.clone(),
+            ..WorkerRequestContext::default()
+        };
+        debug!(
+            event = "worker_request_started",
+            phase = "setup",
+            method = "DoGet",
+            workerId = %log_context.worker_id,
+            operationId = log_context.operation_id.as_deref().unwrap_or(""),
+            bucket = %bucket,
+            key = %key,
+            "DoGet started"
+        );
+
         let result = async {
-            let ticket = parse_read_ticket(
-                &request.into_inner().ticket,
-                &self.config.worker,
-                &self.config.security,
-            )?;
-            let bucket = ticket
-                .bucket
-                .unwrap_or_else(|| self.stores.default_bucket().to_owned());
             let store = self
                 .stores
                 .store_for_bucket(&bucket)
                 .map_err(|err| Status::permission_denied(err.to_string()))?;
-            let key = ticket.key;
 
             let path = path_from_key(&key);
             let read_admission = self.admit_read().await?;
@@ -1408,12 +1521,20 @@ impl FlightService for WorkerFlightService {
                 .with_max_flight_data_size(self.config.flight_data_chunk_size)
                 .build(parquet_stream)
                 .map(|result| result.map_err(status_from_flight_error));
-            let measured_stream =
-                MeasuredReadStream::new(flight_stream, self.metrics.clone(), started, meta.size);
+            let measured_stream = MeasuredReadStream::new(
+                flight_stream,
+                self.metrics.clone(),
+                started,
+                meta.size,
+                log_context.clone(),
+            );
 
             debug!(
+                event = "worker_get_stream_started",
+                phase = "stream",
                 key = %key,
-                operation_id = ?ticket.operation_id,
+                workerId = %log_context.worker_id,
+                operationId = log_context.operation_id.as_deref().unwrap_or(""),
                 bytes = meta.size,
                 active_read_streams_at_admit = read_admission.active_read_streams_at_admit,
                 "DoGet streaming parquet object"
@@ -1425,11 +1546,30 @@ impl FlightService for WorkerFlightService {
         }
         .await;
 
-        if result.is_err() {
-            self.metrics.record_get_failed(started.elapsed());
+        match result {
+            Ok(response) => Ok(response),
+            Err(status) => {
+                let status = enrich_worker_status(status, &log_context);
+                self.metrics.record_get_failed(started.elapsed());
+                error!(
+                    event = "worker_request_failed",
+                    outcome = "error",
+                    phase = "setup",
+                    method = "DoGet",
+                    workerId = %log_context.worker_id,
+                    errorId = status_metadata(&status, ERROR_ID_METADATA),
+                    operationId = status_metadata(&status, OPERATION_ID_METADATA),
+                    bucket = %log_context.bucket,
+                    key = %log_context.key,
+                    grpcCode = ?status.code(),
+                    errorClass = worker_error_class(&status),
+                    reason = %status.message(),
+                    elapsedMs = u128_to_u64(started.elapsed().as_millis()),
+                    "DoGet setup failed"
+                );
+                Err(status)
+            }
         }
-
-        result
     }
 
     async fn do_put(
@@ -1448,15 +1588,49 @@ impl FlightService for WorkerFlightService {
                     app_metadata: Bytes::from(metadata),
                 };
 
+                info!(
+                    event = "worker_request_completed",
+                    outcome = "success",
+                    phase = "completed",
+                    method = "DoPut",
+                    workerId = %summary.worker.worker_id,
+                    operationId = summary.worker.operation_id.as_deref().unwrap_or(""),
+                    uploadId = summary.worker.upload_id.as_deref().unwrap_or(""),
+                    streamId = summary.worker.stream_id.as_deref().unwrap_or(""),
+                    attemptId = %summary.worker.attempt_id,
+                    bucket = %summary.worker.bucket,
+                    key = %summary.key,
+                    rows = summary.rows,
+                    batches = summary.batches,
+                    files = summary.parts,
+                    flightStreamBytes = summary.flight_stream_bytes,
+                    parquetObjectBytes = summary.parquet_object_bytes.unwrap_or_default(),
+                    elapsedMs = u128_to_u64(started.elapsed().as_millis()),
+                    "DoPut completed"
+                );
+
                 Ok(Response::new(Box::pin(stream::once(
                     async move { Ok(result) },
                 ))))
             }
             Err(status) => {
+                let status = enrich_worker_status(status, &WorkerRequestContext::default());
                 self.metrics.record_put_failed(started.elapsed());
                 error!(
-                    elapsed_ms = started.elapsed().as_millis(),
-                    error = %status,
+                    event = "worker_request_failed",
+                    outcome = "error",
+                    phase = "request",
+                    method = "DoPut",
+                    workerId = %self.config.worker.worker_id,
+                    errorId = status_metadata(&status, ERROR_ID_METADATA),
+                    operationId = status_metadata(&status, OPERATION_ID_METADATA),
+                    uploadId = status_metadata(&status, UPLOAD_ID_METADATA),
+                    streamId = status_metadata(&status, STREAM_ID_METADATA),
+                    attemptId = status_metadata(&status, ATTEMPT_ID_METADATA),
+                    grpcCode = ?status.code(),
+                    errorClass = worker_error_class(&status),
+                    reason = %status.message(),
+                    elapsedMs = u128_to_u64(started.elapsed().as_millis()),
                     "DoPut failed"
                 );
                 Err(status)
@@ -2221,35 +2395,16 @@ fn status_with_worker_context(
     stream_id: Option<&str>,
     attempt_id: Option<&str>,
 ) -> Status {
-    if status.message().starts_with("errorId=worker-err-") {
-        return status;
-    }
-
-    let code = status.code();
-    let message = status.message().to_owned();
-    let mut out = format!(
-        "errorId=worker-err-{}",
-        uuid::Uuid::new_v4().to_string().replace('-', "")
-    );
-    if let Some(operation_id) = operation_id.filter(|value| !value.is_empty()) {
-        out.push_str(" operationId=");
-        out.push_str(operation_id);
-    }
-    if let Some(upload_id) = upload_id.filter(|value| !value.is_empty()) {
-        out.push_str(" uploadId=");
-        out.push_str(upload_id);
-    }
-    if let Some(stream_id) = stream_id.filter(|value| !value.is_empty()) {
-        out.push_str(" streamId=");
-        out.push_str(stream_id);
-    }
-    if let Some(attempt_id) = attempt_id.filter(|value| !value.is_empty()) {
-        out.push_str(" attemptId=");
-        out.push_str(attempt_id);
-    }
-    out.push_str(": ");
-    out.push_str(&message);
-    Status::new(code, out)
+    enrich_worker_status(
+        status,
+        &WorkerRequestContext {
+            operation_id: operation_id.map(str::to_owned),
+            upload_id: upload_id.map(str::to_owned),
+            stream_id: stream_id.map(str::to_owned),
+            attempt_id: attempt_id.map(str::to_owned),
+            ..WorkerRequestContext::default()
+        },
+    )
 }
 
 pub fn status_from_context(error: anyhow::Error) -> Status {

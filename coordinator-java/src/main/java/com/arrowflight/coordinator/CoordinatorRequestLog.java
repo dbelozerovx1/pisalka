@@ -19,13 +19,24 @@ final class CoordinatorRequestLog {
     private CoordinatorRequestLog() {
     }
 
-    static void success(String method, String action, Map<String, Object> request, Map<String, Object> response) {
-        LinkedHashMap<String, Object> body = new LinkedHashMap<>();
+    static void started(String method, String action, Map<String, Object> request) {
+        LinkedHashMap<String, Object> body = base(method, action);
+        body.put("phase", "started");
+        copyIds(body, request);
+        CoordinatorLog.info("coordinator_request_started", body);
+    }
+
+    static void success(
+            String method,
+            String action,
+            Map<String, Object> request,
+            Map<String, Object> response,
+            long elapsedMs
+    ) {
+        LinkedHashMap<String, Object> body = base(method, action);
         body.put("outcome", "success");
-        body.put("method", method);
-        if (action != null && !action.isBlank()) {
-            body.put("action", action);
-        }
+        body.put("phase", "completed");
+        body.put("elapsedMs", elapsedMs);
         copyIds(body, request);
         copyIds(body, response);
         copyOptional(body, "status", response);
@@ -33,7 +44,16 @@ final class CoordinatorRequestLog {
         copyOptional(body, "requestedFlavor", response);
         copyOptional(body, "grantedStreams", response);
         copyOptional(body, "endpointCount", response);
-        CoordinatorLog.info("coordinator_request", body);
+        CoordinatorLog.info("coordinator_request_completed", body);
+    }
+
+    private static LinkedHashMap<String, Object> base(String method, String action) {
+        LinkedHashMap<String, Object> body = new LinkedHashMap<>();
+        body.put("method", method);
+        if (action != null && !action.isBlank()) {
+            body.put("action", action);
+        }
+        return body;
     }
 
     static void copyIds(LinkedHashMap<String, Object> target, Map<String, Object> source) {

@@ -19,6 +19,10 @@ use tracing::{error, info};
 
 use crate::{
     config::MetricsConfig,
+    logging::{
+        ERROR_ID_METADATA, OPERATION_ID_METADATA, WorkerRequestContext, enrich_worker_status,
+        status_metadata, worker_error_class,
+    },
     put_model::PutSummary,
     worker_status::{
         PutRuntimeStatus, ReadRuntimeStatus, WorkerRuntimeStatus, WorkerState, WorkerStatus,
@@ -553,16 +557,24 @@ pub struct MeasuredReadStream<S> {
     metrics: Arc<WorkerMetrics>,
     started: Instant,
     object_bytes: u64,
+    context: WorkerRequestContext,
     completed: bool,
 }
 
 impl<S> MeasuredReadStream<S> {
-    pub fn new(inner: S, metrics: Arc<WorkerMetrics>, started: Instant, object_bytes: u64) -> Self {
+    pub fn new(
+        inner: S,
+        metrics: Arc<WorkerMetrics>,
+        started: Instant,
+        object_bytes: u64,
+        context: WorkerRequestContext,
+    ) -> Self {
         Self {
             inner,
             metrics,
             started,
             object_bytes,
+            context,
             completed: false,
         }
     }
@@ -581,6 +593,19 @@ where
                     self.completed = true;
                     self.metrics
                         .record_get_succeeded(self.started.elapsed(), self.object_bytes);
+                    info!(
+                        event = "worker_request_completed",
+                        outcome = "success",
+                        phase = "completed",
+                        method = "DoGet",
+                        workerId = %self.context.worker_id,
+                        operationId = self.context.operation_id.as_deref().unwrap_or(""),
+                        bucket = %self.context.bucket,
+                        key = %self.context.key,
+                        objectBytes = self.object_bytes,
+                        elapsedMs = duration_millis(self.started.elapsed()),
+                        "DoGet completed"
+                    );
                 }
                 Poll::Ready(None)
             }
@@ -589,6 +614,23 @@ where
                     self.completed = true;
                     self.metrics.record_get_failed(self.started.elapsed());
                 }
+                let status = enrich_worker_status(status, &self.context);
+                error!(
+                    event = "worker_request_failed",
+                    outcome = "error",
+                    phase = "stream",
+                    method = "DoGet",
+                    workerId = %self.context.worker_id,
+                    errorId = status_metadata(&status, ERROR_ID_METADATA),
+                    operationId = status_metadata(&status, OPERATION_ID_METADATA),
+                    bucket = %self.context.bucket,
+                    key = %self.context.key,
+                    grpcCode = ?status.code(),
+                    errorClass = worker_error_class(&status),
+                    reason = %status.message(),
+                    elapsedMs = duration_millis(self.started.elapsed()),
+                    "DoGet stream failed"
+                );
                 Poll::Ready(Some(Err(status)))
             }
             other => other,
@@ -600,8 +642,25 @@ impl<S> Drop for MeasuredReadStream<S> {
     fn drop(&mut self) {
         if !self.completed {
             self.metrics.record_get_cancelled(self.started.elapsed());
+            info!(
+                event = "worker_request_completed",
+                outcome = "cancelled",
+                phase = "stream",
+                method = "DoGet",
+                workerId = %self.context.worker_id,
+                operationId = self.context.operation_id.as_deref().unwrap_or(""),
+                bucket = %self.context.bucket,
+                key = %self.context.key,
+                objectBytes = self.object_bytes,
+                elapsedMs = duration_millis(self.started.elapsed()),
+                "DoGet cancelled before stream completion"
+            );
         }
     }
+}
+
+fn duration_millis(duration: Duration) -> u64 {
+    duration.as_millis().min(u64::MAX as u128) as u64
 }
 
 pub fn spawn_metrics_server(
@@ -618,17 +677,32 @@ pub fn spawn_metrics_server(
         let listener = match TcpListener::bind(config.addr).await {
             Ok(listener) => listener,
             Err(error) => {
-                error!(addr = %config.addr, error = %error, "failed to bind metrics endpoint");
+                error!(
+                    event = "worker_metrics_bind_failed",
+                    phase = "startup",
+                    addr = %config.addr,
+                    error = %error,
+                    "failed to bind metrics endpoint"
+                );
                 return;
             }
         };
-        info!(addr = %config.addr, "metrics endpoint listening");
+        info!(
+            event = "worker_metrics_started",
+            addr = %config.addr,
+            "metrics endpoint listening"
+        );
 
         loop {
             let (mut socket, _) = match listener.accept().await {
                 Ok(connection) => connection,
                 Err(error) => {
-                    error!(error = %error, "failed to accept metrics connection");
+                    error!(
+                        event = "worker_metrics_accept_failed",
+                        phase = "accept",
+                        error = %error,
+                        "failed to accept metrics connection"
+                    );
                     continue;
                 }
             };

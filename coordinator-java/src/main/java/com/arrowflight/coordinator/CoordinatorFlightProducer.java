@@ -49,23 +49,28 @@ final class CoordinatorFlightProducer implements FlightProducer {
 
     @Override
     public FlightInfo getFlightInfo(CallContext context, FlightDescriptor descriptor) {
+        long startedNanos = System.nanoTime();
         Map<String, Object> request = Map.of();
         try {
+            request = ensureRequestId(requestWithHeaders(context, request));
             request = ensureRequestId(requestWithHeaders(context, descriptorRequest(descriptor)));
-            FlightPlan plan = withRequestId(coordinator.startFlight(request, endpointRewrite(context)), request);
-            FlightInfo response = flightInfo(plan, false);
-            CoordinatorRequestLog.success("GetFlightInfo", null, request, Map.of(
-                    "queryId", plan.queryId(),
-                    "status", plan.status(),
-                    "requestId", request.get("requestId"),
-                    "endpointCount", plan.endpoints().size()
-            ));
-            metrics.recordSuccess("GetFlightInfo", null);
-            return response;
+            try (CoordinatorLog.Scope ignored = CoordinatorLog.withContext(request)) {
+                CoordinatorRequestLog.started("GetFlightInfo", null, request);
+                FlightPlan plan = withRequestId(coordinator.startFlight(request, endpointRewrite(context)), request);
+                FlightInfo response = flightInfo(plan, false);
+                CoordinatorRequestLog.success("GetFlightInfo", null, request, Map.of(
+                        "queryId", plan.queryId(),
+                        "status", plan.status(),
+                        "requestId", request.get("requestId"),
+                        "endpointCount", plan.endpoints().size()
+                ), elapsedMs(startedNanos));
+                metrics.recordSuccess("GetFlightInfo", null);
+                return response;
+            }
         } catch (RuntimeException error) {
             throw CoordinatorErrorFormatter.toFlight(
                     error,
-                    CoordinatorErrorFormatter.ErrorContext.method("GetFlightInfo", request),
+                    CoordinatorErrorFormatter.ErrorContext.method("GetFlightInfo", request, elapsedMs(startedNanos)),
                     metrics
             );
         }
@@ -73,32 +78,37 @@ final class CoordinatorFlightProducer implements FlightProducer {
 
     @Override
     public PollInfo pollFlightInfo(CallContext context, FlightDescriptor descriptor) {
+        long startedNanos = System.nanoTime();
         Map<String, Object> request = Map.of();
         try {
+            request = ensureRequestId(requestWithHeaders(context, request));
             request = ensureRequestId(requestWithHeaders(context, descriptorRequest(descriptor)));
-            PollResult result = coordinator.pollFlight(request, endpointRewrite(context));
-            FlightPlan plan = withRequestId(result.plan(), request);
-            FlightDescriptor nextDescriptor = result.complete()
-                    ? null
-                    : FlightDescriptor.command(jsonBytes(Map.of("type", "poll", "queryId", plan.queryId())));
-            PollInfo response = new PollInfo(
-                    flightInfo(plan, result.complete()),
-                    nextDescriptor,
-                    result.progress().orElse(null),
-                    result.complete() ? null : result.expiresAt()
-            );
-            CoordinatorRequestLog.success("PollFlightInfo", null, request, Map.of(
-                    "queryId", plan.queryId(),
-                    "status", plan.status(),
-                    "requestId", request.get("requestId"),
-                    "endpointCount", plan.endpoints().size()
-            ));
-            metrics.recordSuccess("PollFlightInfo", null);
-            return response;
+            try (CoordinatorLog.Scope ignored = CoordinatorLog.withContext(request)) {
+                CoordinatorRequestLog.started("PollFlightInfo", null, request);
+                PollResult result = coordinator.pollFlight(request, endpointRewrite(context));
+                FlightPlan plan = withRequestId(result.plan(), request);
+                FlightDescriptor nextDescriptor = result.complete()
+                        ? null
+                        : FlightDescriptor.command(jsonBytes(Map.of("type", "poll", "queryId", plan.queryId())));
+                PollInfo response = new PollInfo(
+                        flightInfo(plan, result.complete()),
+                        nextDescriptor,
+                        result.progress().orElse(null),
+                        result.complete() ? null : result.expiresAt()
+                );
+                CoordinatorRequestLog.success("PollFlightInfo", null, request, Map.of(
+                        "queryId", plan.queryId(),
+                        "status", plan.status(),
+                        "requestId", request.get("requestId"),
+                        "endpointCount", plan.endpoints().size()
+                ), elapsedMs(startedNanos));
+                metrics.recordSuccess("PollFlightInfo", null);
+                return response;
+            }
         } catch (RuntimeException error) {
             throw CoordinatorErrorFormatter.toFlight(
                     error,
-                    CoordinatorErrorFormatter.ErrorContext.method("PollFlightInfo", request),
+                    CoordinatorErrorFormatter.ErrorContext.method("PollFlightInfo", request, elapsedMs(startedNanos)),
                     metrics
             );
         }
@@ -113,29 +123,34 @@ final class CoordinatorFlightProducer implements FlightProducer {
 
     @Override
     public void doAction(CallContext context, Action action, StreamListener<Result> listener) {
+        long startedNanos = System.nanoTime();
         Map<String, Object> request = Map.of();
         try {
+            request = ensureRequestId(requestWithHeaders(context, request));
             request = ensureRequestId(requestWithHeaders(context, actionBody(action)));
-            WorkerEndpointRewrite endpointRewrite = endpointRewrite(context);
-            Map<String, Object> response = switch (action.getType()) {
-                case "coordinator.config" -> coordinator.configJson();
-                case "coordinator.create-schema", "coordinator.create_schema" -> coordinator.createSchema(request);
-                case "coordinator.create-upload" -> coordinator.createUpload(request, endpointRewrite);
-                case "coordinator.commit-upload", "coordinator.do-commit" -> coordinator.commitUpload(request);
-                case "coordinator.abort-upload" -> coordinator.abortUpload(request);
-                case "coordinator.drop-temp", "coordinator.drop_temp" -> coordinator.dropTemp(request);
-                case "coordinator.get-ticket" -> coordinator.getTicket(request, endpointRewrite);
-                default -> throw new CoordinatorException(400, "unknown coordinator action: " + action.getType());
-            };
-            response = withRequestContext(response, request);
-            listener.onNext(new Result(jsonBytes(response)));
-            listener.onCompleted();
-            CoordinatorRequestLog.success("DoAction", action.getType(), request, response);
-            metrics.recordSuccess("DoAction", action.getType());
+            try (CoordinatorLog.Scope ignored = CoordinatorLog.withContext(request)) {
+                CoordinatorRequestLog.started("DoAction", action.getType(), request);
+                WorkerEndpointRewrite endpointRewrite = endpointRewrite(context);
+                Map<String, Object> response = switch (action.getType()) {
+                    case "coordinator.config" -> coordinator.configJson();
+                    case "coordinator.create-schema", "coordinator.create_schema" -> coordinator.createSchema(request);
+                    case "coordinator.create-upload" -> coordinator.createUpload(request, endpointRewrite);
+                    case "coordinator.commit-upload", "coordinator.do-commit" -> coordinator.commitUpload(request);
+                    case "coordinator.abort-upload" -> coordinator.abortUpload(request);
+                    case "coordinator.drop-temp", "coordinator.drop_temp" -> coordinator.dropTemp(request);
+                    case "coordinator.get-ticket" -> coordinator.getTicket(request, endpointRewrite);
+                    default -> throw new CoordinatorException(400, "unknown coordinator action: " + action.getType());
+                };
+                response = withRequestContext(response, request);
+                listener.onNext(new Result(jsonBytes(response)));
+                listener.onCompleted();
+                CoordinatorRequestLog.success("DoAction", action.getType(), request, response, elapsedMs(startedNanos));
+                metrics.recordSuccess("DoAction", action.getType());
+            }
         } catch (RuntimeException error) {
             listener.onError(CoordinatorErrorFormatter.toFlight(
                     error,
-                    CoordinatorErrorFormatter.ErrorContext.action(action.getType(), request),
+                    CoordinatorErrorFormatter.ErrorContext.action(action.getType(), request, elapsedMs(startedNanos)),
                     metrics
             ));
         }
@@ -277,5 +292,9 @@ final class CoordinatorFlightProducer implements FlightProducer {
                 plan.totalBytes(),
                 plan.expiresAt()
         );
+    }
+
+    private long elapsedMs(long startedNanos) {
+        return Math.max(0L, (System.nanoTime() - startedNanos) / 1_000_000L);
     }
 }

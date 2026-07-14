@@ -196,23 +196,27 @@ final class CoordinatorErrorFormatter {
         body.put("code", envelope.code());
         body.put("method", envelope.context().method());
         envelope.context().action().ifPresent(value -> body.put("action", value));
+        body.put("outcome", "error");
+        body.put("phase", "failed");
+        body.put("elapsedMs", envelope.context().elapsedMs());
         body.putAll(envelope.context().ids());
         body.put("message", normalize(error.getMessage()));
         body.put("userMessage", envelope.message());
-        CoordinatorLog.error("coordinator_error", body, envelope.includeCause() ? error : null);
+        CoordinatorLog.error("coordinator_request_failed", body, envelope.includeCause() ? error : null);
     }
 
     record ErrorContext(
             String method,
             Optional<String> action,
-            Map<String, Object> request
+            Map<String, Object> request,
+            long elapsedMs
     ) {
-        static ErrorContext method(String method, Map<String, Object> request) {
-            return new ErrorContext(method, Optional.empty(), request);
+        static ErrorContext method(String method, Map<String, Object> request, long elapsedMs) {
+            return new ErrorContext(method, Optional.empty(), request, elapsedMs);
         }
 
-        static ErrorContext action(String action, Map<String, Object> request) {
-            return new ErrorContext("DoAction", Optional.of(action), request);
+        static ErrorContext action(String action, Map<String, Object> request, long elapsedMs) {
+            return new ErrorContext("DoAction", Optional.of(action), request, elapsedMs);
         }
 
         LinkedHashMap<String, String> ids() {

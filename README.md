@@ -141,7 +141,17 @@ The coordinator owns Flyway migrations. Workers only read and update runtime met
 
 Workers expose Prometheus metrics and publish live resource capacity into `worker_registry`. The coordinator exposes metrics plus `GET /workers` and `GET /worker-endpoints` on port `9091`.
 
-Every client-visible error includes an `errorId`. Use it with `requestId`, `operationId`, `uploadId`, or `queryId` to correlate coordinator and worker logs.
+Every log is structured JSON and includes `env`, `group`, `system`, and `namespace`. Client request lifecycle events use stable `*_request_started`, `*_request_completed`, and `*_request_failed` names with a `phase`, `outcome`, and `elapsedMs`.
+
+Correlation identifiers have distinct scopes:
+
+- `requestId`: one coordinator Flight RPC; accepted from `x-request-id` or generated and returned to the client.
+- `operationId`: the complete upload or read operation; signed into worker capabilities and shared by coordinator and worker logs.
+- `uploadId`, `attemptId`, and `streamId`: progressively narrower upload scopes.
+- `queryId`: the durable read/CTAS query and polling scope.
+- `errorId`: one failure, returned to the client and emitted in the matching failure log.
+
+Start an investigation with `errorId` for a failure, then use `operationId` or `queryId` to reconstruct the full cross-service lifecycle.
 
 ## Developer Verification
 
