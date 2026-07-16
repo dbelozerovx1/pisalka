@@ -74,6 +74,7 @@ pub struct WorkerConfig {
     pub require_structured_tickets: bool,
     pub registry_heartbeat_interval_ms: u64,
     pub registry_ttl_ms: u64,
+    pub shutdown_grace_ms: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -294,6 +295,7 @@ impl WorkerConfig {
             registry_heartbeat_interval_ms: env_count("WORKER_HEARTBEAT_INTERVAL_MS", 5_000)?
                 as u64,
             registry_ttl_ms: env_count("WORKER_REGISTRY_TTL_MS", 15_000)? as u64,
+            shutdown_grace_ms: env_count("WORKER_SHUTDOWN_GRACE_MS", 300_000)? as u64,
         })
     }
 }

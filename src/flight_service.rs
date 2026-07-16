@@ -113,6 +113,10 @@ impl WorkerFlightService {
         }
     }
 
+    pub fn begin_draining(&self) -> bool {
+        !self.draining.swap(true, Ordering::AcqRel)
+    }
+
     pub fn worker_status(&self) -> WorkerStatus {
         let active_put = self.active_put_streams.load(Ordering::Relaxed);
         let active_read = self.active_read_streams.load(Ordering::Relaxed);
@@ -417,12 +421,7 @@ impl WorkerFlightService {
         &self,
         context: &PutContext,
     ) -> Result<(PutAdmission, WorkerPutSummary), Status> {
-        if self.draining.load(Ordering::Relaxed) {
-            self.metrics.record_put_rejected();
-            return Err(Status::unavailable(
-                "worker is draining and rejects new DoPut streams",
-            ));
-        }
+        self.ensure_put_accepting()?;
 
         let wait_started = Instant::now();
         let permit = if self.config.worker.put_slot_wait_ms == 0 {
@@ -468,6 +467,7 @@ impl WorkerFlightService {
                 return Err(status);
             }
         };
+        self.ensure_put_accepting()?;
 
         let upload_active_streams_at_admit = if let (Some(upload_id), Some(upload_stream_limit)) =
             (context.upload_id.as_ref(), context.upload_stream_limit)
@@ -522,12 +522,7 @@ impl WorkerFlightService {
     }
 
     async fn admit_read(&self) -> Result<ReadAdmission, Status> {
-        if self.draining.load(Ordering::Relaxed) {
-            self.metrics.record_get_rejected();
-            return Err(Status::unavailable(
-                "worker is draining and rejects new DoGet streams",
-            ));
-        }
+        self.ensure_read_accepting()?;
 
         let wait_started = Instant::now();
         let permit = if self.config.worker.read_slot_wait_ms == 0 {
@@ -572,6 +567,7 @@ impl WorkerFlightService {
                 return Err(status);
             }
         };
+        self.ensure_read_accepting()?;
 
         let active_read_streams_at_admit =
             self.active_read_streams.fetch_add(1, Ordering::Relaxed) + 1;
@@ -584,6 +580,26 @@ impl WorkerFlightService {
             active_read_streams: self.active_read_streams.clone(),
             active_read_streams_at_admit,
         })
+    }
+
+    fn ensure_put_accepting(&self) -> Result<(), Status> {
+        if self.draining.load(Ordering::Acquire) {
+            self.metrics.record_put_rejected();
+            return Err(Status::unavailable(
+                "worker is draining and rejects new DoPut streams",
+            ));
+        }
+        Ok(())
+    }
+
+    fn ensure_read_accepting(&self) -> Result<(), Status> {
+        if self.draining.load(Ordering::Acquire) {
+            self.metrics.record_get_rejected();
+            return Err(Status::unavailable(
+                "worker is draining and rejects new DoGet streams",
+            ));
+        }
+        Ok(())
     }
 
     fn put_start_record(&self, context: &PutContext) -> PutStreamStartRecord {

@@ -723,6 +723,12 @@ pub fn spawn_metrics_server(
                         "200 OK",
                         metrics.render_prometheus(&status_provider()).into_bytes(),
                     )
+                } else if path == "/readyz" {
+                    if status_provider().draining {
+                        ("503 Service Unavailable", b"draining\n".to_vec())
+                    } else {
+                        ("200 OK", b"ready\n".to_vec())
+                    }
                 } else if path == "/healthz" {
                     ("200 OK", b"ok\n".to_vec())
                 } else {

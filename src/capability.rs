@@ -411,6 +411,7 @@ mod tests {
             require_structured_tickets: true,
             registry_heartbeat_interval_ms: 5_000,
             registry_ttl_ms: 15_000,
+            shutdown_grace_ms: 300_000,
         }
     }
 

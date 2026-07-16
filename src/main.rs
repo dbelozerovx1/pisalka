@@ -1,6 +1,6 @@
 use std::{fs, sync::Arc, time::Duration};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use arrow_flight::flight_service_server::FlightServiceServer;
 use arrow_flight_s3_mvp::{
     config::{AppConfig, FlightTlsConfig},
@@ -10,9 +10,18 @@ use arrow_flight_s3_mvp::{
     metrics::{WorkerMetrics, spawn_metrics_server},
     util::ObjectStoreRegistry,
 };
-use tokio::time::sleep;
+use tokio::{
+    sync::oneshot,
+    time::{Instant, sleep, sleep_until},
+};
 use tonic::transport::{Identity, Server, ServerTlsConfig};
-use tracing::{error, info};
+use tracing::{error, info, warn};
+
+#[derive(Debug, Clone, Copy)]
+struct ShutdownContext {
+    signal: &'static str,
+    started: Instant,
+}
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
@@ -35,7 +44,7 @@ async fn main() -> Result<()> {
         let service = service.clone();
         move || service.worker_status()
     });
-    let flight_service = FlightServiceServer::new(service)
+    let flight_service = FlightServiceServer::new(service.clone())
         .max_decoding_message_size(config.flight_max_message_size)
         .max_encoding_message_size(config.flight_max_message_size);
 
@@ -71,16 +80,179 @@ async fn main() -> Result<()> {
             .context("failed to configure Flight server TLS")?;
     }
 
-    server
-        .add_service(flight_service)
-        .serve_with_shutdown(config.flight_addr, shutdown_signal())
-        .await?;
+    let (shutdown_started_tx, shutdown_started_rx) = oneshot::channel();
+    let serve = server.add_service(flight_service).serve_with_shutdown(
+        config.flight_addr,
+        shutdown_signal(
+            service.clone(),
+            metadata_store,
+            config.worker.shutdown_grace_ms,
+            shutdown_started_tx,
+        ),
+    );
+    tokio::pin!(serve);
+
+    let shutdown = tokio::select! {
+        result = &mut serve => {
+            result.context("Flight server stopped before receiving a shutdown signal")?;
+            warn!(
+                event = "worker_server_stopped",
+                phase = "serve",
+                outcome = "unexpected",
+                workerId = %config.worker.worker_id,
+                "Flight server stopped without a process shutdown signal"
+            );
+            return Ok(());
+        }
+        result = shutdown_started_rx => {
+            result.context("worker shutdown signal monitor stopped unexpectedly")?
+        }
+    };
+
+    let deadline =
+        sleep_until(shutdown.started + Duration::from_millis(config.worker.shutdown_grace_ms));
+    tokio::pin!(deadline);
+
+    tokio::select! {
+        result = &mut serve => {
+            result.context("Flight server failed during graceful shutdown")?;
+            let status = service.worker_status();
+            info!(
+                event = "worker_shutdown_completed",
+                phase = "stopped",
+                outcome = "success",
+                signal = shutdown.signal,
+                workerId = %status.worker_id,
+                activePutStreams = status.put.active,
+                activeReadStreams = status.read.active,
+                elapsedMs = elapsed_millis(shutdown.started),
+                "worker graceful shutdown completed"
+            );
+        }
+        _ = &mut deadline => {
+            let status = service.worker_status();
+            error!(
+                event = "worker_shutdown_timed_out",
+                phase = "drain",
+                outcome = "timeout",
+                signal = shutdown.signal,
+                workerId = %status.worker_id,
+                activePutStreams = status.put.active,
+                activeReadStreams = status.read.active,
+                graceMs = config.worker.shutdown_grace_ms,
+                elapsedMs = elapsed_millis(shutdown.started),
+                "worker graceful shutdown timed out"
+            );
+            return Err(anyhow!(
+                "worker shutdown exceeded {}ms grace period with {} active DoPut and {} active DoGet streams",
+                config.worker.shutdown_grace_ms,
+                status.put.active,
+                status.read.active
+            ));
+        }
+    }
 
     Ok(())
 }
 
-async fn shutdown_signal() {
-    let _ = tokio::signal::ctrl_c().await;
+async fn shutdown_signal(
+    service: WorkerFlightService,
+    metadata_store: Option<Arc<MetadataStore>>,
+    grace_ms: u64,
+    started_tx: oneshot::Sender<ShutdownContext>,
+) {
+    let signal = wait_for_shutdown_signal().await;
+    let started = Instant::now();
+    service.begin_draining();
+    let status = service.worker_status();
+
+    info!(
+        event = "worker_shutdown_started",
+        phase = "draining",
+        outcome = "in_progress",
+        signal,
+        workerId = %status.worker_id,
+        activePutStreams = status.put.active,
+        activeReadStreams = status.read.active,
+        graceMs = grace_ms,
+        "worker received shutdown signal and started draining"
+    );
+
+    let _ = started_tx.send(ShutdownContext { signal, started });
+
+    if let Some(metadata_store) = metadata_store {
+        match metadata_store.record_worker_heartbeat(&status).await {
+            Ok(()) => info!(
+                event = "worker_shutdown_state_published",
+                phase = "registry",
+                workerId = %status.worker_id,
+                signal,
+                "published draining worker state"
+            ),
+            Err(error) => error!(
+                event = "worker_shutdown_state_publish_failed",
+                phase = "registry",
+                workerId = %status.worker_id,
+                signal,
+                error = %error,
+                "failed to publish draining worker state"
+            ),
+        }
+    }
+}
+
+#[cfg(unix)]
+async fn wait_for_shutdown_signal() -> &'static str {
+    use tokio::signal::unix::{SignalKind, signal};
+
+    let mut terminate = match signal(SignalKind::terminate()) {
+        Ok(signal) => signal,
+        Err(error) => {
+            error!(
+                event = "worker_signal_registration_failed",
+                phase = "startup",
+                signal = "SIGTERM",
+                error = %error,
+                "failed to register SIGTERM handler"
+            );
+            let _ = tokio::signal::ctrl_c().await;
+            return "sigint";
+        }
+    };
+
+    tokio::select! {
+        result = tokio::signal::ctrl_c() => {
+            if let Err(error) = result {
+                error!(
+                    event = "worker_signal_wait_failed",
+                    phase = "serve",
+                    signal = "SIGINT",
+                    error = %error,
+                    "failed while waiting for SIGINT"
+                );
+            }
+            "sigint"
+        }
+        _ = terminate.recv() => "sigterm",
+    }
+}
+
+#[cfg(not(unix))]
+async fn wait_for_shutdown_signal() -> &'static str {
+    if let Err(error) = tokio::signal::ctrl_c().await {
+        error!(
+            event = "worker_signal_wait_failed",
+            phase = "serve",
+            signal = "CTRL_C",
+            error = %error,
+            "failed while waiting for Ctrl+C"
+        );
+    }
+    "ctrl_c"
+}
+
+fn elapsed_millis(started: Instant) -> u64 {
+    started.elapsed().as_millis().min(u64::MAX as u128) as u64
 }
 
 fn load_tls_identity(config: &FlightTlsConfig) -> Result<Option<Identity>> {
