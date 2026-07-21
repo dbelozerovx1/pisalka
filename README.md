@@ -141,6 +141,8 @@ The coordinator owns Flyway migrations. Workers only read and update runtime met
 
 Workers expose Prometheus metrics and publish live resource capacity into `worker_registry`. The coordinator exposes metrics plus `GET /workers` and `GET /worker-endpoints` on port `9091`.
 
+Worker registry lifecycle is `ACTIVE` -> `DRAINING` during graceful shutdown -> `STALE` after heartbeat TTL. The coordinator removes stale rows after the configured retention period; stale and draining workers are never selected for new reads or writes.
+
 Every log is structured JSON and includes `env`, `group`, `system`, and `namespace`. Client request lifecycle events use stable `*_request_started`, `*_request_completed`, and `*_request_failed` names with a `phase`, `outcome`, and `elapsedMs`.
 
 Correlation identifiers have distinct scopes:

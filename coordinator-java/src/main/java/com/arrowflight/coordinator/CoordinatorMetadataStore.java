@@ -643,6 +643,46 @@ final class CoordinatorMetadataStore {
         }
     }
 
+    WorkerRegistryCleanupResult cleanupStaleWorkers(long retentionMs) {
+        requireEnabled();
+        try (Connection connection = connect()) {
+            connection.setAutoCommit(false);
+            try {
+                int markedStale;
+                try (PreparedStatement statement = connection.prepareStatement("""
+                        UPDATE worker_registry
+                        SET state = 'STALE',
+                            put_recommended_streams = 0,
+                            put_available_streams = 0,
+                            put_selection_score = 0,
+                            read_recommended_streams = 0,
+                            read_selection_score = 0
+                        WHERE extract(epoch FROM (now() - last_heartbeat_at)) * 1000 > registry_ttl_ms
+                          AND state <> 'STALE'
+                        """)) {
+                    markedStale = statement.executeUpdate();
+                }
+
+                int deleted;
+                try (PreparedStatement statement = connection.prepareStatement("""
+                        DELETE FROM worker_registry
+                        WHERE extract(epoch FROM (now() - last_heartbeat_at)) * 1000
+                            > registry_ttl_ms + ?
+                        """)) {
+                    statement.setLong(1, retentionMs);
+                    deleted = statement.executeUpdate();
+                }
+                connection.commit();
+                return new WorkerRegistryCleanupResult(markedStale, deleted);
+            } catch (SQLException error) {
+                connection.rollback();
+                throw error;
+            }
+        } catch (SQLException error) {
+            throw new IllegalStateException("failed to cleanup stale worker registry rows", error);
+        }
+    }
+
     Optional<String> tryClaimExpiredUpload(Instant now, Instant staleCleanupBefore) {
         requireEnabled();
         try (Connection connection = connect()) {
@@ -1615,6 +1655,9 @@ record WorkerClientEndpoint(
         Instant expiresAt,
         Optional<String> errorMessage
 ) {
+}
+
+record WorkerRegistryCleanupResult(int markedStale, int deleted) {
 }
 
 record JdbcTarget(String jdbcUrl, Properties properties) {

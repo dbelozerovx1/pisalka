@@ -54,6 +54,8 @@ final class Config {
     final boolean workerClientEndpointsRequired;
     final long workerClientEndpointTtlMs;
     final long workerSelectionGraceMs;
+    final long workerRegistryCleanupIntervalMs;
+    final long workerRegistryRetentionMs;
     final boolean k8sWorkerDiscoveryEnabled;
     final String k8sNamespace;
     final String k8sWorkerServiceSelector;
@@ -110,6 +112,8 @@ final class Config {
             boolean workerClientEndpointsRequired,
             long workerClientEndpointTtlMs,
             long workerSelectionGraceMs,
+            long workerRegistryCleanupIntervalMs,
+            long workerRegistryRetentionMs,
             boolean k8sWorkerDiscoveryEnabled,
             String k8sNamespace,
             String k8sWorkerServiceSelector,
@@ -165,6 +169,8 @@ final class Config {
         this.workerClientEndpointsRequired = workerClientEndpointsRequired;
         this.workerClientEndpointTtlMs = workerClientEndpointTtlMs;
         this.workerSelectionGraceMs = workerSelectionGraceMs;
+        this.workerRegistryCleanupIntervalMs = workerRegistryCleanupIntervalMs;
+        this.workerRegistryRetentionMs = workerRegistryRetentionMs;
         this.k8sWorkerDiscoveryEnabled = k8sWorkerDiscoveryEnabled;
         this.k8sNamespace = k8sNamespace;
         this.k8sWorkerServiceSelector = k8sWorkerServiceSelector;
@@ -228,6 +234,8 @@ final class Config {
                 envBool("COORDINATOR_WORKER_CLIENT_ENDPOINTS_REQUIRED", k8sWorkerDiscoveryEnabled),
                 envLong("COORDINATOR_WORKER_CLIENT_ENDPOINT_TTL_MS", 2 * 60 * 1000L),
                 workerSelectionGraceMs(),
+                envLong("COORDINATOR_WORKER_REGISTRY_CLEANUP_INTERVAL_MS", 60_000L),
+                Math.max(0L, envLong("COORDINATOR_WORKER_REGISTRY_RETENTION_MS", 5 * 60 * 1000L)),
                 k8sWorkerDiscoveryEnabled,
                 env("COORDINATOR_K8S_NAMESPACE", env("POD_NAMESPACE", "default")),
                 env("COORDINATOR_K8S_WORKER_SERVICE_SELECTOR", "role=flight-worker-client-endpoint"),

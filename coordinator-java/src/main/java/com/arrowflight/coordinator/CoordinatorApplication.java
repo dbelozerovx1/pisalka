@@ -25,6 +25,10 @@ public final class CoordinatorApplication {
 
         try (WorkerEndpointDiscovery ignoredDiscovery = WorkerEndpointDiscovery.start(config, coordinator.metadataStore());
              UploadCleanupService ignoredCleanup = UploadCleanupService.start(config, coordinator);
+             WorkerRegistryCleanupService ignoredWorkerCleanup = WorkerRegistryCleanupService.start(
+                     config,
+                     coordinator.metadataStore()
+             );
              CoordinatorMetricsServer ignored = CoordinatorMetricsServer.start(config, metrics, coordinator.metadataStore());
              BufferAllocator allocator = new RootAllocator();
              FlightServer server = FlightServer.builder(allocator, location, producer)
