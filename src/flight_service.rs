@@ -64,6 +64,7 @@ use crate::{
 };
 
 type ResponseStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send + 'static>>;
+const PUT_CAPABILITY_HEADER: &str = "x-flight-capability";
 
 #[derive(Clone)]
 pub struct WorkerFlightService {
@@ -735,6 +736,20 @@ impl WorkerFlightService {
         request: Request<Streaming<FlightData>>,
     ) -> Result<PutSummary, Status> {
         let request_started = Instant::now();
+        let capability_header = request
+            .metadata()
+            .get(PUT_CAPABILITY_HEADER)
+            .map(|value| {
+                value
+                    .to_str()
+                    .map(|value| Bytes::copy_from_slice(value.as_bytes()))
+                    .map_err(|_| {
+                        Status::invalid_argument(format!(
+                            "{PUT_CAPABILITY_HEADER} must contain an ASCII capability envelope"
+                        ))
+                    })
+            })
+            .transpose()?;
         let mut incoming = request.into_inner();
         let first_message_started = Some(Instant::now());
         let first = incoming
@@ -746,7 +761,8 @@ impl WorkerFlightService {
             .unwrap_or_default();
 
         let key = descriptor_to_object_key(first.flight_descriptor.as_ref());
-        let put_options = parse_put_options(&first.app_metadata)?;
+        let put_options =
+            parse_put_options_with_header(&first.app_metadata, capability_header.as_ref())?;
         let put_context = self
             .build_put_context(&key, &put_options)
             .map_err(|status| status_with_put_options(status, &put_options))?;
@@ -1715,6 +1731,26 @@ fn parse_put_options(app_metadata: &Bytes) -> Result<PutOptions, Status> {
 
     serde_json::from_slice(app_metadata).map_err(|err| {
         Status::invalid_argument(format!("invalid DoPut app_metadata options: {err}"))
+    })
+}
+
+fn parse_put_options_with_header(
+    app_metadata: &Bytes,
+    capability_header: Option<&Bytes>,
+) -> Result<PutOptions, Status> {
+    if !app_metadata.is_empty() || capability_header.is_none() {
+        return parse_put_options(app_metadata);
+    }
+
+    let capability_header = capability_header.expect("checked above");
+    let capability = parse_capability_envelope(capability_header).ok_or_else(|| {
+        Status::invalid_argument(format!(
+            "{PUT_CAPABILITY_HEADER} must contain a signed capability envelope"
+        ))
+    })?;
+    Ok(PutOptions {
+        capability: Some(capability),
+        ..PutOptions::default()
     })
 }
 
