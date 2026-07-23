@@ -10,7 +10,7 @@ import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicLong;
 
-final class CoordinatorService {
+final class CoordinatorService implements AutoCloseable {
     private static final String PHASE_CTAS = "ctas";
     private static final String PHASE_FILES = "files";
     private static final String PHASE_READY = "ready";
@@ -38,6 +38,11 @@ final class CoordinatorService {
 
     CoordinatorMetadataStore metadataStore() {
         return metadataStore;
+    }
+
+    @Override
+    public void close() {
+        objectStoreCleaner.close();
     }
 
     Map<String, Object> configJson() {

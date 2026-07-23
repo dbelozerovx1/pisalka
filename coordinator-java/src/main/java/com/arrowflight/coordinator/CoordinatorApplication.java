@@ -23,25 +23,29 @@ public final class CoordinatorApplication {
                 config.listenAddress.getPort()
         );
 
-        try (WorkerEndpointDiscovery ignoredDiscovery = WorkerEndpointDiscovery.start(config, coordinator.metadataStore());
-             UploadCleanupService ignoredCleanup = UploadCleanupService.start(config, coordinator);
-             WorkerRegistryCleanupService ignoredWorkerCleanup = WorkerRegistryCleanupService.start(
-                     config,
-                     coordinator.metadataStore()
-             );
-             CoordinatorMetricsServer ignored = CoordinatorMetricsServer.start(config, metrics, coordinator.metadataStore());
-             BufferAllocator allocator = new RootAllocator();
-             FlightServer server = FlightServer.builder(allocator, location, producer)
-                     .middleware(BaseHostnameMiddleware.KEY, BaseHostnameMiddleware.factory())
-                     .maxInboundMessageSize(config.flightMaxMessageSize)
-                     .build()
-                     .start()) {
-            CoordinatorLog.info("coordinator_started", Map.of(
-                    "location", server.getLocation().toString(),
-                    "trinoUri", config.trinoUri.toString(),
-                    "metadataDb", coordinator.metadataEnabled()
-            ));
-            server.awaitTermination();
+        try {
+            try (WorkerEndpointDiscovery ignoredDiscovery = WorkerEndpointDiscovery.start(config, coordinator.metadataStore());
+                 UploadCleanupService ignoredCleanup = UploadCleanupService.start(config, coordinator);
+                 WorkerRegistryCleanupService ignoredWorkerCleanup = WorkerRegistryCleanupService.start(
+                         config,
+                         coordinator.metadataStore()
+                 );
+                 CoordinatorMetricsServer ignored = CoordinatorMetricsServer.start(config, metrics, coordinator.metadataStore());
+                 BufferAllocator allocator = new RootAllocator();
+                 FlightServer server = FlightServer.builder(allocator, location, producer)
+                         .middleware(BaseHostnameMiddleware.KEY, BaseHostnameMiddleware.factory())
+                         .maxInboundMessageSize(config.flightMaxMessageSize)
+                         .build()
+                         .start()) {
+                CoordinatorLog.info("coordinator_started", Map.of(
+                        "location", server.getLocation().toString(),
+                        "trinoUri", config.trinoUri.toString(),
+                        "metadataDb", coordinator.metadataEnabled()
+                ));
+                server.awaitTermination();
+            }
+        } finally {
+            coordinator.close();
         }
     }
 }
